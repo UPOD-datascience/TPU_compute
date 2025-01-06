@@ -4,6 +4,8 @@ import os
 import argparse
 import json
 import re
+from google.cloud import storage
+
 
 def clean_text(text):
     '''
@@ -23,27 +25,56 @@ def clean_text(text):
 # Function to read JSONL file and extract text data
 def read_jsonl(file_path):
     texts = []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
+    if file_path.startswith("gs://"):
+        client = storage.Client()
+        bucket_name = file_path.split("/")[2]
+        blob_name = "/".join(file_path.split("/")[3:])
+        bucket = client.get_bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        content = blob.download_as_text(encoding='utf-8')
+        for line in content.splitlines():
             data = json.loads(line)
             if data is not None:
                 texts.append(data['text'])  # Adjust the key based on your JSON structure
+    else:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                data = json.loads(line)
+                if data is not None:
+                    texts.append(data['text'])  # Adjust the key based on your JSON structure
     return texts
 
 # Function to read TXT file and extract text data
 def read_txt(file_path):
     texts = []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        texts = f.readlines()
+    if file_path.startswith("gs://"):
+        client = storage.Client()
+        bucket_name = file_path.split("/")[2]
+        blob_name = "/".join(file_path.split("/")[3:])
+        bucket = client.get_bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        content = blob.download_as_text(encoding='utf-8')
+        texts = content.splitlines()
+    else:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            texts = f.readlines()
     return texts
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--corpus_dir", type=str, required=True)
+    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default='~/tokenizer', required=True)
     args = parser.parse_args()
 
-    # Paths to your corpus text files
-    corpus_files = [os.path.join(args.corpus_dir, f) for f in os.listdir(args.corpus_dir)]
+    if args.data_dir.startswith("gs://"):
+        client = storage.Client()
+        bucket_name = args.data_dir.split("/")[2]
+        prefix = "/".join(args.data_dir.split("/")[3:])
+        bucket = client.get_bucket(bucket_name)
+        blobs = bucket.list_blobs(prefix=prefix)
+        corpus_files = [f"gs://{bucket_name}/{blob.name}" for blob in blobs if blob.name.endswith(('.jsonl', '.txt'))]
+    else:
+        corpus_files = [os.path.join(args.data_dir, f) for f in os.listdir(args.data_dir)]
 
 
     # Combine texts from all corpus files
@@ -64,7 +95,7 @@ def main():
     ])
 
     # Save the tokenizer files
-    save_dir = "./mytokenizer"
+    save_dir = args.output_dir
     os.makedirs(save_dir, exist_ok=True)
     tokenizer.save_model(save_dir)
 

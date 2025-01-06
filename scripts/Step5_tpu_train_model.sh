@@ -1,9 +1,15 @@
+#!/bin/bash
+set -o allexport
+source ../.env
+set +o allexport
+
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
   --command="PJRT_DEVICE=TPU python3 ~/models/train_deberta.py  \
-  --data_dir=gs://t2t_data \
+  --data_dir=gs://${DATA_BUCKET} \
+  --tokenizer_dir=~/tokenizer \
   --batch_size=128 \
   --base_learning_rate=0.0001 \
   --decay_type=cosine \

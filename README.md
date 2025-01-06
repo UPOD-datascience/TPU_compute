@@ -18,7 +18,6 @@ TPU_compute
       start_tpu.sh
       install_prerequisites.sh
       load_data.sh
-      load_credentials.sh
     models\
       train_tokenizer.py
       train_bitnet.py
