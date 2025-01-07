@@ -1,47 +1,28 @@
-# run_mlm.py
+# run_mlm_tpu.py
 import argparse
-import os
-
 import torch
-from torch.utils.data import DataLoader
+import torch_xla
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
 
 from transformers import (
     DebertaConfig,
     DebertaForMaskedLM,
     DebertaTokenizerFast,
     DataCollatorForLanguageModeling,
-    Trainer,
-    TrainingArguments
 )
+
 from datasets import load_dataset
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--train_file", type=str, required=True)
-    parser.add_argument("--validation_file", type=str, default=None)
-    parser.add_argument("--tokenizer_name_or_path", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--max_seq_length", type=int, default=128)
-    parser.add_argument("--per_device_train_batch_size", type=int, default=8)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=8)
-    parser.add_argument("--num_train_epochs", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=5e-5)
-    parser.add_argument("--tpu_num_cores", type=int, default=None)
-    parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--logging_steps", type=int, default=100)
-    parser.add_argument("--overwrite_output_dir", action="store_true")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--logging_dir", type=str, default="./logs", help="Where to store the tensorboard logs.")
-    args = parser.parse_args()
-
-    # Set seed for reproducibility
-    torch.manual_seed(args.seed)
+def train_fn(index, args):
+    # Each process has its own device (TPU core)
+    device = xm.xla_device()
 
     # Load dataset
     data_files = {"train": args.train_file}
     if args.validation_file is not None:
         data_files["validation"] = args.validation_file
-    raw_datasets = load_dataset("text", data_files=data_files)
+    raw_datasets = load_dataset("json", data_files=data_files)
 
     # Load tokenizer
     tokenizer = DebertaTokenizerFast.from_pretrained(args.tokenizer_name_or_path, use_fast=True)
@@ -49,52 +30,91 @@ def main():
     def tokenize_fn(examples):
         return tokenizer(examples["text"], truncation=True, max_length=args.max_seq_length)
 
-    tokenized_datasets = raw_datasets.map(tokenize_fn, batched=True, remove_columns=["text"])
+    tokenized_datasets = raw_datasets.map(
+        tokenize_fn,
+        batched=True,
+        remove_columns=["text"]
+    )
 
     train_dataset = tokenized_datasets["train"]
     eval_dataset = tokenized_datasets.get("validation", None)
 
-    # Create DeBERTa config and model from scratch
+    # Create the model on the XLA device
     config = DebertaConfig()
-    model = DebertaForMaskedLM(config)
+    model = DebertaForMaskedLM(config).to(device)
 
-    # Data collator for MLM
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=True,
         mlm_probability=0.15
     )
 
-    # Training arguments with tensorboard reporting
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        overwrite_output_dir=args.overwrite_output_dir,
-        num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
-        save_steps=args.save_steps,
-        logging_steps=args.logging_steps,
-        evaluation_strategy="steps" if eval_dataset is not None else "no",
-        learning_rate=args.learning_rate,
-        report_to=["tensorboard"],  # Enable tensorboard
-        logging_dir=args.logging_dir, # Directory for tensorboard logs
-        seed=args.seed
+    # Dataloaders with Distributed Sampler
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset,
+        num_replicas=xm.xrt_world_size(),
+        rank=xm.get_ordinal(),
+        shuffle=True
+    )
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.per_device_train_batch_size,
+        sampler=train_sampler,
+        collate_fn=data_collator
     )
 
-    # Initialize Trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=data_collator
-    )
+    # Set up optimizer, etc.
+    optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.learning_rate)
 
-    # Train
-    trainer.train()
+    # Example training loop (simplistic)
+    model.train()
+    for epoch in range(args.num_train_epochs):
+        xm.master_print(f"Starting epoch {epoch+1}")
+        for step, batch in enumerate(train_loader):
+            # Move batch to the XLA device
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
 
-    # Save final model
-    trainer.save_model()
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+            loss = outputs.loss
+            loss.backward()
+
+            optimizer.step()
+            optimizer.zero_grad()
+
+            if step % args.logging_steps == 0:
+                xm.master_print(f"Epoch {epoch+1}, step {step}, loss: {loss.item()}")
+
+    # Optionally save on master
+    if xm.is_master_ordinal():
+        xm.master_print("Saving model...")
+        model.save_pretrained(args.output_dir)
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--train_file", type=str, required=True)
+    parser.add_argument("--validation_file", type=str, default=None)
+    parser.add_argument("--tokenizer_name_or_path", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--max_seq_length", type=int, default=1024)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=8)
+    parser.add_argument("--num_train_epochs", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--logging_steps", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    # Set the same seed for all processes
+    torch.manual_seed(args.seed)
+
+    # Spawn processes
+    xmp.spawn(train_fn, args=(args,), nprocs=8)  # For v2-8 or v3-8 TPU
 
 if __name__ == "__main__":
     main()
