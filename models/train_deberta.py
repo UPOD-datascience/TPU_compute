@@ -1,9 +1,14 @@
-# run_mlm_tpu.py
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*torch_xla.distributed.xla_multiprocessing.*")# run_mlm_tpu.py
+
+print("Importing libraries...")
 import argparse
 import torch
 import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
+
+
 
 from transformers import (
     DebertaConfig,
@@ -18,13 +23,17 @@ def train_fn(index, args):
     # Each process has its own device (TPU core)
     device = xm.xla_device()
 
+    xm.master_print(f"Process index = {index} started")
+
     # Load dataset
+    xm.master_print("Loading dataset...")
     data_files = {"train": args.train_file}
     if args.validation_file is not None:
         data_files["validation"] = args.validation_file
     raw_datasets = load_dataset("json", data_files=data_files)
 
     # Load tokenizer
+    xm.master_print("Loading tokenizer...")
     tokenizer = DebertaTokenizerFast.from_pretrained(args.tokenizer_name_or_path, use_fast=True)
 
     def tokenize_fn(examples):
@@ -40,9 +49,11 @@ def train_fn(index, args):
     eval_dataset = tokenized_datasets.get("validation", None)
 
     # Create the model on the XLA device
+    xm.master_print("Creating the model...")
     config = DebertaConfig()
     model = DebertaForMaskedLM(config).to(device)
 
+    xm.master_print("Creating the data collator...")
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=True,
@@ -50,6 +61,7 @@ def train_fn(index, args):
     )
 
     # Dataloaders with Distributed Sampler
+    xm.master_print("Creating data loaders...")
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_dataset,
         num_replicas=xm.xrt_world_size(),
@@ -67,6 +79,7 @@ def train_fn(index, args):
     optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.learning_rate)
 
     # Example training loop (simplistic)
+    xm.master_print("Staring model training..")
     model.train()
     for epoch in range(args.num_train_epochs):
         xm.master_print(f"Starting epoch {epoch+1}")
@@ -114,7 +127,8 @@ def main():
     torch.manual_seed(args.seed)
 
     # Spawn processes
-    xmp.spawn(train_fn, args=(args,), nprocs=8)  # For v2-8 or v3-8 TPU
+    xmp.spawn(train_fn, args=(args,), nprocs=8)
 
 if __name__ == "__main__":
+    print("Starting...")
     main()

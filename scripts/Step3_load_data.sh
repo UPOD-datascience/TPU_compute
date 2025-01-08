@@ -15,5 +15,5 @@ else
       --zone="${ZONE}" \
       --project="${PROJECT_ID}" \
       --worker=all \
-      ${LOCAL_MODEL_DIRECTORY} ${TPU_NAME}:~/models
+      ${LOCAL_MODEL_DIRECTORY}/*.py ${TPU_NAME}:~/models
 fi
