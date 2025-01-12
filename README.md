@@ -27,7 +27,11 @@ TPU_compute
       train_xlstm.py
 ```
 
+Consider using [Tensorflow](https://huggingface.co/blog/tf_tpu) if Torch is not working for you.
+
 Sources:
 * https://cloud.google.com/tpu/docs/v5p-training#llama_2
 * https://cloud.google.com/tpu/docs/pytorch-pods
 * https://www.philschmid.de/getting-started-tpu-transformers#2-setup-jupyter-environment--install-transformers
+* https://github.com/bramiozo/ModernBERT
+* https://www.philschmid.de/fine-tune-modern-bert-in-2025

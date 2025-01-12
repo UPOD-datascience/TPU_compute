@@ -1,14 +1,10 @@
-import warnings
-warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*torch_xla.distributed.xla_multiprocessing.*")# run_mlm_tpu.py
-
 print("Importing libraries...")
 import argparse
 import torch
 import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
-
-
+import torch_xla.test.test_utils as test_utils
 
 from transformers import (
     DebertaConfig,
@@ -106,7 +102,16 @@ def train_fn(index, args):
     # Optionally save on master
     if xm.is_master_ordinal():
         xm.master_print("Saving model...")
-        model.save_pretrained(args.output_dir)
+        if args.output_dir.startswith("gs://"):
+            import tempfile
+            import subprocess
+            with tempfile.TemporaryDirectory() as tmpdirname:
+                local_output_dir = tmpdirname
+                model.save_pretrained(local_output_dir)
+                xm.master_print(f"Uploading model to {args.output_dir}...")
+                subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
+        else:
+            model.save_pretrained(args.output_dir)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -121,13 +126,19 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_cores", type=int, default=8)
     args = parser.parse_args()
 
     # Set the same seed for all processes
     torch.manual_seed(args.seed)
 
     # Spawn processes
-    xmp.spawn(train_fn, args=(args,), nprocs=8)
+    #xmp.spawn(train_fn, args=(args,), nprocs=8)
+    debug_single_process = args.num_cores == 1
+    torch_xla.launch(
+        train_fn, args=(args,),
+        debug_single_process=debug_single_process)
+
 
 if __name__ == "__main__":
     print("Starting...")

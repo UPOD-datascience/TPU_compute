@@ -10,6 +10,11 @@ python = "^3.12"
 transformers = "^4.47.0"
 accelerate = "^1.2.0"
 tokenizers = "^0.21.0"
+google-cloud = "^0.34.0"
+google-cloud-storage = "^2.19.0"
+pandas = "^2.2.3"
+pyarrow = "^18.1.0"
+ftfy = "^6.3.1"
 
 
 [build-system]
