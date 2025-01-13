@@ -10,13 +10,19 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --worker=all \
     --command="export PJRT_DEVICE=TPU && export XLA_USE_PJRT=1 && TPU_NAME=${TPU_NAME}"
 
+echo "Removing dataset cache folders for HuggingFace"
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+    --zone=${ZONE} \
+    --project=${PROJECT_ID} \
+    --worker=all \
+    --command="rm -rf /home/bes3/.cache/huggingface/datasets/json/*"
+
 echo "Starting training..."
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
   --command="
-sudo pkill -f python3 &&
 python3 /home/${USERNAME}/models/train_deberta.py  \
   --train_file=${DATA_BUCKET_TRAIN} \
   --validation_file=${DATA_BUCKET_VAL} \

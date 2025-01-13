@@ -1,36 +1,64 @@
 print("Importing libraries...")
+import os
+#os.environ.pop('TPU_PROCESS_ADDRESSES')
+#os.environ.pop('CLOUD_TPU_TASK_ID')
+
 import argparse
 import torch
 import torch_xla
+from torch_xla.runtime import global_ordinal
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 import torch_xla.test.test_utils as test_utils
 
+from tokenizers import ByteLevelBPETokenizer
+
 from transformers import (
     DebertaConfig,
     DebertaForMaskedLM,
-    DebertaTokenizerFast,
     DataCollatorForLanguageModeling,
 )
 
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 
 def train_fn(index, args):
     # Each process has its own device (TPU core)
     device = xm.xla_device()
-
     xm.master_print(f"Process index = {index} started")
+    rank = global_ordinal()
 
     # Load dataset
     xm.master_print("Loading dataset...")
     data_files = {"train": args.train_file}
     if args.validation_file is not None:
         data_files["validation"] = args.validation_file
-    raw_datasets = load_dataset("json", data_files=data_files)
+
+    if args.data_in_memory==True:
+        xm.master_print("Loading dataset..assuming in memory.")
+        raw_datasets = load_dataset("json",
+                                    data_files=data_files,
+                                    num_proc=1,
+                                    keep_in_memory=True)
+                                    #cache_dir=f'/home/bes3/.cache/huggingface/datasets/json/{rank}')
+    else:
+        if xm.is_master_ordinal():
+            xm.master_print("Loading dataset..assuming from disk.")
+            raw_datasets = load_dataset("json",
+                                        data_files=data_files,
+                                        num_proc=1,
+                                        keep_in_memory=False)
+            xm.master_print("Saving dataset to disk.")
+            raw_datasets.save_to_disk('/home/bes3/.cache/huggingface/datasets/nlllm')
+
+        xm.master_print("Waiting for saving operation to finish.")
+        xm.rendezvous("save_to_disk")
+        raw_datasets = load_from_disk("/home/bes3/.cache/huggingface/datasets/nlllm")
+
 
     # Load tokenizer
     xm.master_print("Loading tokenizer...")
-    tokenizer = DebertaTokenizerFast.from_pretrained(args.tokenizer_name_or_path, use_fast=True)
+    tokenizer = ByteLevelBPETokenizer.from_file(merges_filename=os.path.join(args.tokenizer_name_or_path, 'merges.txt'),
+        vocab_filename=os.path.join(args.tokenizer_name_or_path, 'vocab.json'))
 
     def tokenize_fn(examples):
         return tokenizer(examples["text"], truncation=True, max_length=args.max_seq_length)
@@ -127,17 +155,18 @@ def main():
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_cores", type=int, default=8)
+    parser.add_argument("--data_in_memory", action='store_true')
     args = parser.parse_args()
 
     # Set the same seed for all processes
     torch.manual_seed(args.seed)
 
     # Spawn processes
-    #xmp.spawn(train_fn, args=(args,), nprocs=8)
-    debug_single_process = args.num_cores == 1
-    torch_xla.launch(
-        train_fn, args=(args,),
-        debug_single_process=debug_single_process)
+    xmp.spawn(train_fn, args=(args,), nprocs=8)
+    #debug_single_process = args.num_cores == 1
+    #torch_xla.launch(
+    #    train_fn, args=(args,),
+    #    debug_single_process=debug_single_process)
 
 
 if __name__ == "__main__":

@@ -12,22 +12,23 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all --command="
 pip install torch~=2.5.0 torch_xla[tpu]~=2.5.0 -f https://storage.googleapis.com/libtpu-releases/index.html -f https://storage.googleapis.com/libtpu-wheels/index.html"
 
-echo "Installing libraries..."
-gcloud compute tpus tpu-vm ssh ${TPU_NAME}  \
---project ${PROJECT_ID} \
---zone  ${ZONE} \
---worker=all \
---command="
-pip install google-cloud
-pip install google-cloud-storage
-"
+# echo "Installing libraries..."
+# gcloud compute tpus tpu-vm ssh ${TPU_NAME}  \
+# --project ${PROJECT_ID} \
+# --zone  ${ZONE} \
+# --worker=all \
+# --command="
+# pip install google-cloud
+# pip install google-cloud-tpu
+# pip install google-cloud-storage
+# "
 
 echo "Installing more libraries..."
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all --command="
-pip install transformers datasets[gcs] evaluate accelerate tensorboard"
+pip install transformers tokenizers gcsfs datasets"
 
 echo "Cloning XLA..."
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \

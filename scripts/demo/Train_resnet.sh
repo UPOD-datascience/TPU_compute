@@ -14,3 +14,9 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --fake_data \
   --model=resnet50  \
   --num_epochs=1 2>&1 | tee ~/logs.txt"
+
+gcloud compute tpus tpu-vm scp \
+    --recurse \
+    --zone="${ZONE}" \
+    --project="${PROJECT_ID}" \
+    ${TPU_NAME}:/home/${USERNAME}/logs.txt ./log.txt

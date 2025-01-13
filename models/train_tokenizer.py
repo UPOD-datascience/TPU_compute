@@ -22,7 +22,7 @@ def clean_text(text):
     # replace spurious repetitions of characters, punctuation, whitespace and linebreaks with a single instance
     text = re_spurious_chars.sub(r'\1', text)
     text = re_spurious_words.sub(r'\1', text)
-    text = ftfy.fix_text(text)
+    text = ftfy.fix_encoding(text)
 
     return text
 
