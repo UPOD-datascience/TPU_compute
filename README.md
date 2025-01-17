@@ -35,3 +35,4 @@ Sources:
 * https://www.philschmid.de/getting-started-tpu-transformers#2-setup-jupyter-environment--install-transformers
 * https://github.com/bramiozo/ModernBERT
 * https://www.philschmid.de/fine-tune-modern-bert-in-2025
+* https://discuss.huggingface.co/t/tpu-trainer-with-multi-core/16957

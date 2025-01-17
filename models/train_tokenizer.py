@@ -1,5 +1,5 @@
 # train_tokenizer.py
-from tokenizers import ByteLevelBPETokenizer
+from tokenizers import ByteLevelBPETokenizer, SentencePieceBPETokenizer
 import os
 import argparse
 import json

@@ -17,91 +17,109 @@ from transformers import (
     DebertaConfig,
     DebertaForMaskedLM,
     DataCollatorForLanguageModeling,
+    PreTrainedTokenizerFast
 )
 
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, Dataset, DatasetDict
 
-def train_fn(index, args):
+def prep_fn(args):
     # Each process has its own device (TPU core)
-    device = xm.xla_device()
-    xm.master_print(f"Process index = {index} started")
-    rank = global_ordinal()
+    #rank = global_ordinal()
 
     # Load dataset
-    xm.master_print("Loading dataset...")
-    data_files = {"train": args.train_file}
-    if args.validation_file is not None:
-        data_files["validation"] = args.validation_file
+    print("Loading dataset...")
+    raw_datasets = load_from_disk(args.dataset_dir, keep_in_memory=False)
 
-    if args.data_in_memory==True:
-        xm.master_print("Loading dataset..assuming in memory.")
-        raw_datasets = load_dataset("json",
-                                    data_files=data_files,
-                                    num_proc=1,
-                                    keep_in_memory=True)
-                                    #cache_dir=f'/home/bes3/.cache/huggingface/datasets/json/{rank}')
-    else:
-        if xm.is_master_ordinal():
-            xm.master_print("Loading dataset..assuming from disk.")
-            raw_datasets = load_dataset("json",
-                                        data_files=data_files,
-                                        num_proc=1,
-                                        keep_in_memory=False)
-            xm.master_print("Saving dataset to disk.")
-            raw_datasets.save_to_disk('/home/bes3/.cache/huggingface/datasets/nlllm')
-
-        xm.master_print("Waiting for saving operation to finish.")
-        xm.rendezvous("save_to_disk")
-        raw_datasets = load_from_disk("/home/bes3/.cache/huggingface/datasets/nlllm")
-
-
-    # Load tokenizer
-    xm.master_print("Loading tokenizer...")
-    tokenizer = ByteLevelBPETokenizer.from_file(merges_filename=os.path.join(args.tokenizer_name_or_path, 'merges.txt'),
+    print("Loading tokenizer...")
+    _tokenizer = ByteLevelBPETokenizer.from_file(merges_filename=os.path.join(args.tokenizer_name_or_path, 'merges.txt'),
         vocab_filename=os.path.join(args.tokenizer_name_or_path, 'vocab.json'))
 
-    def tokenize_fn(examples):
-        return tokenizer(examples["text"], truncation=True, max_length=args.max_seq_length)
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=_tokenizer._tokenizer, model_max_length=args.max_seq_length, truncation=True)
+    tokenizer.add_special_tokens({'pad_token': '<pad>'})
+    tokenizer.add_special_tokens({'bos_token': '<s>'})
+    tokenizer.add_special_tokens({'eos_token': '</s>'})
+    tokenizer.add_special_tokens({'unk_token': '<unk>'})
+    tokenizer.add_special_tokens({'mask_token': '<mask>'})
 
-    tokenized_datasets = raw_datasets.map(
-        tokenize_fn,
-        batched=True,
-        remove_columns=["text"]
-    )
+    if args.pre_tokenized == False:
+        # Load tokenizer
 
-    train_dataset = tokenized_datasets["train"]
-    eval_dataset = tokenized_datasets.get("validation", None)
+        def tokenize_fn(examples):
+            return tokenizer(
+                examples["text"],
+                truncation=True,
+                max_length=args.max_seq_length,
+                padding="max_length"
+            )
 
-    # Create the model on the XLA device
+        print("Tokenizing datasets...")
+        next(iter(raw_datasets["train"]))
+        # maybe use forkserver
+        tokenized_datasets = raw_datasets.map(
+            tokenize_fn,
+            batched=True,
+            num_proc=1,
+            remove_columns=["text"],
+        )
+
+        print("Getting train and eval datasets...")
+        train_dataset = tokenized_datasets["train"]
+        eval_dataset = tokenized_datasets.get("validation", None)
+
+        return DatasetDict({'train': train_dataset, 'validation': eval_dataset}), tokenizer
+    else:
+        return raw_datasets, tokenizer
+
+
+def train_fn(index, args):
     xm.master_print("Creating the model...")
+    device = xm.xla_device()
+    # Create the model on the XLA device
     config = DebertaConfig()
     model = DebertaForMaskedLM(config).to(device)
 
+    xm.master_print(f"Model config: {config}")
+
     xm.master_print("Creating the data collator...")
     data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
+        tokenizer=args.tokenizer,
         mlm=True,
         mlm_probability=0.15
     )
 
     # Dataloaders with Distributed Sampler
-    xm.master_print("Creating data loaders...")
+    xm.master_print("Creating training data loader...")
     train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset,
+        args.tokenized_datasets["train"],
         num_replicas=xm.xrt_world_size(),
         rank=xm.get_ordinal(),
         shuffle=True
     )
     train_loader = torch.utils.data.DataLoader(
-        train_dataset,
+        args.tokenized_datasets["train"],
         batch_size=args.per_device_train_batch_size,
         sampler=train_sampler,
+        collate_fn=data_collator
+    )
+
+    xm.master_print("Creating validation data loader...")
+    validation_sampler = torch.utils.data.distributed.DistributedSampler(
+        args.tokenized_datasets["validation"],
+        num_replicas=xm.xrt_world_size(),
+        rank=xm.get_ordinal(),
+        shuffle=True
+    )
+    validation_loader = torch.utils.data.DataLoader(
+        args.tokenized_datasets["validation"],
+        batch_size=args.per_device_train_batch_size,
+        sampler=validation_sampler,
         collate_fn=data_collator
     )
 
     # Set up optimizer, etc.
     optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.learning_rate)
 
+    # maybe use standard Training functions from transformers library..
     # Example training loop (simplistic)
     xm.master_print("Staring model training..")
     model.train()
@@ -144,10 +162,10 @@ def train_fn(index, args):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--train_file", type=str, required=True)
-    parser.add_argument("--validation_file", type=str, default=None)
+    parser.add_argument("--dataset_dir", type=str, required=True)
     parser.add_argument("--tokenizer_name_or_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--pre_tokenized", action='store_true', default=False)
     parser.add_argument("--max_seq_length", type=int, default=1024)
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
     parser.add_argument("--num_train_epochs", type=int, default=1)
@@ -161,12 +179,20 @@ def main():
     # Set the same seed for all processes
     torch.manual_seed(args.seed)
 
+    tokenized_dataset, tokenizer = prep_fn(args)
+
+    # update args with traindata, valdata, tokenizer
+    args.tokenized_dataset = tokenized_dataset
+    args.tokenizer = tokenizer
+
     # Spawn processes
-    xmp.spawn(train_fn, args=(args,), nprocs=8)
-    #debug_single_process = args.num_cores == 1
-    #torch_xla.launch(
-    #    train_fn, args=(args,),
-    #    debug_single_process=debug_single_process)
+    print("Spawning processes...")
+    #xmp.spawn(train_fn, args=(args,), nprocs=8, start_method='fork')
+    debug_single_process = args.num_cores == 1
+    print(f"debug_single_process: {debug_single_process}")
+    torch_xla.launch(
+        train_fn, args=(args,),
+        debug_single_process=debug_single_process)
 
 
 if __name__ == "__main__":
