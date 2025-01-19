@@ -31,15 +31,16 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="python3 /home/${USERNAME}/models/train_deberta.py  \
   --dataset_dir=${LOCAL_DATA} \
+  --tmp_dir=${TMP_DIR} \
   --output_dir=${MODEL_BUCKET} \
   --tokenizer_name_or_path=/home/${USERNAME}/tokenizer \
   --per_device_train_batch_size=16 \
   --max_seq_length=512 \
-  --num_cores=1 \
-  --data_in_memory \
+  --num_cores=8 \
   --pre_tokenized \
   --learning_rate=0.0001 \
-  --num_train_epochs=1 2>&1 | tee ~/logs.txt"
+  --weight_decay=0.001 \
+  --num_train_epochs=20 2>&1 | tee ~/logs.txt"
 
 # ideally you would launch a shell script on the workers like
 # nohup some_script.sh & exit

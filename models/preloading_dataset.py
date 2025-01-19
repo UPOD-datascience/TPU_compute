@@ -63,7 +63,7 @@ def chunk_text(example):
             # Candidate chunk by adding the current sentence
             candidate = " ".join(current_chunk + [sentence]).strip()
             # Tokenize the candidate text without truncation
-            tokenized_candidate = tokenizer(candidate, truncation=False)["input_ids"]
+            tokenized_candidate = tokenizer(candidate)["input_ids"]
             if len(tokenized_candidate) <= args.max_seq_length:
                 # If the candidate is within the limit, update current chunk.
                 current_chunk.append(sentence)
@@ -72,11 +72,15 @@ def chunk_text(example):
                 if current_chunk:
                     chunk_text_str = " ".join(current_chunk).strip()
                     # Tokenize the finalized chunk with truncation (for safety)
-                    tokenized_chunk = tokenizer(chunk_text_str, truncation=True, max_length=args.max_seq_length)["input_ids"]
-                    chunks.append({"text": chunk_text_str, "input_ids": tokenized_chunk})
+                    tokenized_chunk = tokenizer(chunk_text_str, truncation=True, max_length=args.max_seq_length, padding='max_length', return_special_tokens_mask=True)
+
+                    chunks.append({
+                        "input_ids": tokenized_chunk['input_ids'],
+                        "attention_mask": tokenized_chunk['attention_mask']
+                    })
                 # Start a new chunk with the current sentence.
                 # Optionally, check if the sentence itself exceeds the limit:
-                tokenized_sentence = tokenizer(sentence, truncation=True, max_length=args.max_seq_length)["input_ids"]
+                tokenized_sentence = tokenizer(sentence, truncation=False)["input_ids"]
                 current_chunk = [sentence] if len(tokenized_sentence) <= args.max_seq_length else []
                 # If the sentence on its own exceeds max_seq_length, you might want to
                 # either split it further (not covered here) or skip it.
@@ -84,11 +88,24 @@ def chunk_text(example):
         # After processing all sentences, add any remaining text as a chunk.
         if current_chunk:
             chunk_text_str = " ".join(current_chunk).strip()
-            tokenized_chunk = tokenizer(chunk_text_str, truncation=True, max_length=args.max_seq_length)["input_ids"]
-            chunks.append({"text": chunk_text_str, "input_ids": tokenized_chunk})
+            tokenized_output = tokenizer(chunk_text_str, truncation=True, max_length=args.max_seq_length, padding='max_length', return_special_tokens_mask=True)
+
+            tokenized_chunk = tokenized_output["input_ids"]
+            attention_mask = tokenized_output["attention_mask"]
+
+            chunks.append({
+                "input_ids": tokenized_chunk,
+                "attention_mask": attention_mask
+            })
         return chunks
     except:
-        return [{"text": full_text, "input_ids": tokenizer(full_text, truncation=True, max_length=args.max_seq_length)["input_ids"]}]
+        tokenized_output=tokenizer(full_text, truncation=True,
+           padding='max_length', max_length=args.max_seq_length)
+
+        return [{
+                "input_ids": tokenized_output["input_ids"],
+                "attention_mask": tokenized_output['attention_mask']
+        }]
 
 # Assume raw_datasets has been loaded as before.
 print("Chunking training dataset manually...")

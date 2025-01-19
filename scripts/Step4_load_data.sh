@@ -16,6 +16,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --project=${PROJECT_ID} \
   --worker=all \
   --command="
+  rm -rf ${LOCAL_DATA}
   python3 /home/${USERNAME}/models/preloading_dataset.py  \
   --train_loc=${DATA_BUCKET_TRAIN} \
   --validation_loc=${DATA_BUCKET_VAL} \
