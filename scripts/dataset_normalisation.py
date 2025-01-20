@@ -97,37 +97,45 @@ def clean_text(text):
 # We load the datafiles from GCS one by one
 def load_datafiles_from_gcs(gcs_dir, out_dir, separator=None):
     client = storage.Client.from_service_account_json('../gsa.json')
-    bucket = client.get_bucket(gcs_dir)
-    blobs = bucket.list_blobs()
-    existing_files = set(blob.name for blob in bucket.list_blobs(prefix=out_dir))
+    bucket = client.get_bucket(gcs_dir.split("/")[0])
+    blobs = bucket.list_blobs(prefix=gcs_dir.split("/")[1])
+    existing_files = set(blob.name for blob in bucket.list_blobs(prefix=out_dir.split("/")[1]))
     blobs = [blob for blob in blobs if blob.name not in existing_files]
 
+    print(f"Downloading files from GCS")
     for blob in blobs:
         _, file_extension = os.path.splitext(blob.name)
+        filename = blob.name.split('/')[-1]
+        tmp_file_name = '../tmp/'+filename
         if file_extension in ['.json', '.jsonl']:
-            blob.download_as_file(blob.name)
-            with open(blob.name, 'r') as json_file:
+            with open(tmp_file_name, 'wb') as file_out:
+                blob.download_to_file(file_out)
+            with open(tmp_file_name, 'r') as json_file:
                 json_list = list(json_file)
             res = []
             for json_str in json_list:
                 res.append(json.loads(json_str))
-            os.remove(blob.name)
-            yield 'json', blob.name, res
+            os.remove(tmp_file_name)
+            yield 'json', filename, res
         elif file_extension == '.parquet':
-            res = pd.read_parquet(blob.download_as_bytes())
-            yield 'parquet', blob.name, res
+            with open(tmp_file_name, 'wb') as file_out:
+                blob.download_to_file(file_out)
+            res = pd.read_parquet(tmp_file_name)
+            os.remove(tmp_file_name)
+            yield 'parquet', filename, res
         elif file_extension == '.txt':
             # read all lines of the file with an optional seperator
             # if seperator regex not provided, default to '\n'
-            blob.download_as_file(blob.name)
-            with open(blob.name, 'r') as txt_file:
+            with open(tmp_file_name, 'wb') as file_out:
+                blob.download_to_file(file_out)
+            with open(tmp_file_name, 'r', encoding='latin1') as txt_file:
                 bulk = txt_file.read()
                 if separator is not None:
                     lines = bulk.split(separator)
                 else:
                     lines = bulk.splitlines()
-            os.remove(blob.name)
-            yield 'txt', blob.name, lines
+            os.remove(tmp_file_name)
+            yield 'txt', filename, lines
 
 
 def normalise_data(data, file_type, incoming_file_name):
@@ -162,7 +170,7 @@ def normalise_data(data, file_type, incoming_file_name):
 
     return normalised_data, word_count
 
-def data_transfer(data, output_dir):
+def data_transfer(data, output_dir, file_name):
     # write to local
     local_file_path = '../tmp/normalised_data.jsonl'
     with open(local_file_path, 'w') as f:
@@ -171,9 +179,9 @@ def data_transfer(data, output_dir):
             f.write('\n')
 
     # upload to GCS
-    client = storage.Client()
-    bucket = client.get_bucket(output_dir)
-    blob = bucket.blob(os.path.basename(local_file_path))
+    client = storage.Client.from_service_account_json('../gsa.json')
+    bucket = client.get_bucket(output_dir.split("/")[0])
+    blob = bucket.blob(output_dir.split("/")[1] + '/' + file_name + '_normalised.json')
     blob.upload_from_filename(local_file_path)
 
     # remove local file
@@ -193,5 +201,5 @@ if __name__=="__main__":
 
     for file_type, file_name, data in file_iterator:
         normalised_data, word_count = normalise_data(data, file_type, file_name)
-        data_transfer(normalised_data, args.output_dir)
+        data_transfer(normalised_data, args.output_dir, file_name)
         print(f"Normalised {file_name}, Wordcount: {word_count}.")
