@@ -15,6 +15,7 @@ google-cloud-storage = "^2.19.0"
 pandas = "^2.2.3"
 pyarrow = "^18.1.0"
 ftfy = "^6.3.1"
+tqdm = "^4.67.1"
 
 
 [build-system]

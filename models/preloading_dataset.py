@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-from datasets import load_dataset, Dataset, DatasetDict
+from datasets import load_dataset, Dataset, DatasetDict, Features, Value
 import argparse
 import os
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
@@ -16,7 +16,6 @@ argparser.add_argument("--tokenizer_name_or_path", type=str, required=True, help
 argparser.add_argument("--max_seq_length", type=int, required=True, help="Maximum sequence length for each chunk.")
 
 args = argparser.parse_args()
-
 
 print(f"Loading tokenizer from {args.tokenizer_name_or_path}...")
 _tokenizer = ByteLevelBPETokenizer.from_file(merges_filename=os.path.join(args.tokenizer_name_or_path, 'merges.txt'),
@@ -37,9 +36,21 @@ data_files = {
                 "train": args.train_loc,
                 "validation": args.validation_loc
 }
+features = Features({
+    "id": Value("string"),
+    "text": Value("string"),
+    "source": Value("string"),
+    "approx_token_counts_original": Value("int64"),
+    "approx_token_counts_translated": Value("int64"),
+})
 
 print("Loading dataset...")
-raw_datasets = load_dataset("json", data_files=data_files, keep_in_memory=True, num_proc=1)
+raw_datasets = load_dataset("json",
+    data_files=data_files,
+    features=features,
+    keep_in_memory=False,
+    streaming=False,
+    num_proc=1)
 print("Dataset loaded.")
 
 segmenter = pysbd.Segmenter(language="nl", clean=True)

@@ -40,6 +40,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --pre_tokenized \
   --learning_rate=0.0001 \
   --weight_decay=0.001 \
+  --streaming_data \
   --num_train_epochs=20 2>&1 | tee ~/logs.txt"
 
 # ideally you would launch a shell script on the workers like

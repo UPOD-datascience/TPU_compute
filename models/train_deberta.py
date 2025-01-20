@@ -88,7 +88,7 @@ def train_fn(index, args):
     print(f"Process {index} is starting...")
 
     if xm.is_master_ordinal():
-        wandb.login('29c3dd3150a673a67772f6b5ea35d0e5d835b0fa')
+        wandb.login(key='29c3dd3150a673a67772f6b5ea35d0e5d835b0fa')
         wandb.init(
             # set the wandb project where this run will be logged
             project="DeBERTa TPU testing",
@@ -180,7 +180,7 @@ def train_fn(index, args):
             optimizer.zero_grad()
 
             total_loss+=loss.item()
-
+            total_step += 1
             if step % args.logging_steps == 0:
                 local_avg_loss = total_loss / args.logging_steps
                 global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
@@ -188,7 +188,6 @@ def train_fn(index, args):
                 xm.master_print(f"Epoch {epoch+1}, step {step}, loss: {global_avg_loss}")
 
                 total_loss = 0.
-                total_step += 1
                 if xm.is_master_ordinal():
                     wandb.log({
                         "train_global_average_loss": global_avg_loss,
@@ -275,6 +274,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_cores", type=int, default=8)
     parser.add_argument("--keep_in_memory", action='store_true')
+    parser.add_argument("--streaming_data", action='store_true')
     args = parser.parse_args()
 
     # Set the same seed for all processes
