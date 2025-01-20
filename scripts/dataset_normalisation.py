@@ -96,12 +96,11 @@ def clean_text(text):
 # name of id column may vary
 # We load the datafiles from GCS one by one
 def load_datafiles_from_gcs(gcs_dir, out_dir, separator=None):
-    client = storage.Client()
+    client = storage.Client.from_service_account_json('../gsa.json')
     bucket = client.get_bucket(gcs_dir)
     blobs = bucket.list_blobs()
     existing_files = set(blob.name for blob in bucket.list_blobs(prefix=out_dir))
     blobs = [blob for blob in blobs if blob.name not in existing_files]
-
 
     for blob in blobs:
         _, file_extension = os.path.splitext(blob.name)
@@ -190,7 +189,7 @@ if __name__=="__main__":
     argparser.add_argument("--output_dir", type=str, required=True)
     args = argparser.parse_args()
 
-    file_iterator = load_datafiles_from_gcs(args.gcs_dir, args.output_dir)
+    file_iterator = load_datafiles_from_gcs(args.gcs_dir.strip("gs://"), args.output_dir.strip("gs://"))
 
     for file_type, file_name, data in file_iterator:
         normalised_data, word_count = normalise_data(data, file_type, file_name)
