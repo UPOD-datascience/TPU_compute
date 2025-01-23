@@ -16,7 +16,10 @@ pandas = "^2.2.3"
 pyarrow = "^18.1.0"
 ftfy = "^6.3.1"
 tqdm = "^4.67.1"
-
+pysbd = "^0.3.4"
+datasets = "^3.2.0"
+fsspec = "2023.9.2"
+gcsfs = "2023.9.2"
 
 [build-system]
 requires = ["poetry-core"]

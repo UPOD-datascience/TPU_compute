@@ -28,7 +28,9 @@ from tokenizers import ByteLevelBPETokenizer
 
 from transformers import (
     DebertaConfig,
+    DebertaV2Config,
     DebertaForMaskedLM,
+    DebertaV2ForMaskedLM,
     DataCollatorForLanguageModeling,
     PreTrainedTokenizerFast
 )
@@ -107,6 +109,12 @@ def train_fn(index, args):
     device = xm.xla_device()
     # Create the model on the XLA device
     config = DebertaConfig()
+    config.vocab_size = args.tokenizer.get_vocab_size()
+    config.max_position_embeddings = args.max_seq_length
+    config.num_hidden_layers = args.num_hidden_layers
+    config.hidden_size = args.hidden_size
+    config.num_attention_heads = args.num_attention_heads
+
     model = DebertaForMaskedLM(config).to(device)
 
     xm.master_print(f"Model config: {config}")
@@ -265,6 +273,10 @@ def main():
     parser.add_argument("--tokenizer_name_or_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--pre_tokenized", action='store_true', default=False)
+    parser.add_argument("--max_seq_length", type=int, default=1024)
+    parser.add_argument("--num_hidden_layers", type=int, default=28)
+    parser.add_argument("--hidden_size", type=int, default=1024)
+    parser.add_argument("--num_attention_heads", type=int, default=24)
     parser.add_argument("--max_seq_length", type=int, default=1024)
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
     parser.add_argument("--num_train_epochs", type=int, default=1)

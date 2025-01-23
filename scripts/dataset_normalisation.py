@@ -27,11 +27,11 @@ replacements = [
 replacements_re = [(re.compile(repl[0]), repl[1]) for repl in replacements]
 
 meta_data = {
-    'MariaNMT_cardiomyopathy.json ': {
+    'MariaNMT_cardiomyopathy.json': {
                                         'id_field': 'id',
                                         'text_field': 'text'
                                     },
-    'PubmedPatients_nllb200.jsonl':{
+    'PubmedPatients_nllb200.json':{
                                      'id_field':'patient_uid',
                                       'text_field':'text'
                                     },
@@ -39,7 +39,7 @@ meta_data = {
                                     'id_field':'id',
                                     'text_field':'text'
     },
-    'DeepL_PUBMED_ABSTRACTS_15345931.parquet': {
+    'DeepL_PUBMED_ABSTRACTS_*.parquet': {
                                     'id_field':None,
                                     'text_field':'text'
     },
@@ -52,7 +52,7 @@ meta_data = {
                                     'text_field': 'transformed_text'
     },
     'Scraped.jsonl': {
-                                    'id_field': 'id',
+                                    'id_field': None,
                                     'text_field': 'text'
     },
     'apollo_guidelines_MariaNMT.json': {
@@ -68,6 +68,11 @@ meta_data = {
                                     'text_field': 'text'
     },
     'GPT4omini_pubmed_cardiomyopathy.json': {
+                                    'id_field': 'id',
+                                    'text_field': 'text'
+    },
+    {
+    'GeminiFlash15_mimic3_*.jsonl': {
                                     'id_field': 'id',
                                     'text_field': 'text'
     }
@@ -100,13 +105,19 @@ def load_datafiles_from_gcs(gcs_dir, out_dir, separator=None):
     bucket = client.get_bucket(gcs_dir.split("/")[0])
     blobs = bucket.list_blobs(prefix=gcs_dir.split("/")[1])
     existing_files = set(blob.name for blob in bucket.list_blobs(prefix=out_dir.split("/")[1]))
-    blobs = [blob for blob in blobs if blob.name not in existing_files]
+
+    print(f"Currently existing files {existing_files}")
+
+    namer = lambda x: x.name.split('/')[-1].split('.')[0]
+
+    blobs = [blob for blob in blobs if  not any([namer(blob) in _existing_file for _existing_file in existing_files])]
 
     print(f"Downloading files from GCS")
     for blob in blobs:
         _, file_extension = os.path.splitext(blob.name)
         filename = blob.name.split('/')[-1]
         tmp_file_name = '../tmp/'+filename
+        print(f"Downloading {filename}")
         if file_extension in ['.json', '.jsonl']:
             with open(tmp_file_name, 'wb') as file_out:
                 blob.download_to_file(file_out)
@@ -144,29 +155,45 @@ def normalise_data(data, file_type, incoming_file_name):
 
     normalised_data = []
     word_count = 0
-    if file_type in ['parquet', 'json']:
-        for k,entry in enumerate(data):
-            if isinstance(entry[text_field], str) and len(entry[text_field]) > 0:
-                cleaned_text = clean_text(entry[text_field])
-                cid = str(entry[id_field]) if id_field is not None else f"{incoming_file_name}_{str(k)}"
+    if file_type in ['json']:
+        for k, entry in tqdm.tqdm(enumerate(data)):
+            if entry is not None:
+                if isinstance(entry[text_field], str) and len(entry[text_field]) > 0:
+                    cleaned_text = clean_text(entry[text_field])
+                    cid = str(entry[id_field]) if id_field is not None else f"{incoming_file_name}_{str(k)}"
+                    word_count += len(cleaned_text.split())
+                    normalised_entry = {
+                        "id": cid,
+                        "text": cleaned_text,
+                        "source": entry.get("source", "not available"),
+                        "approx_token_counts_original": entry.get("approx_token_counts_original", -1),
+                        "approx_token_counts_translated": entry.get("approx_token_counts_translated", -1)
+                    }
+                    normalised_data.append(normalised_entry)
+    elif file_type in ['parquet']:
+        for index, row in tqdm.tqdm(data.iterrows()):
+            if isinstance(row[text_field], str) and len(row[text_field]) > 0:
+                cleaned_text = clean_text(row[text_field])
+                cid = str(row[id_field]) if id_field is not None else f"{incoming_file_name}_{str(index)}"
                 word_count += len(cleaned_text.split())
                 normalised_entry = {
                     "id": cid,
                     "text": cleaned_text,
-                    "source": entry.get("source", "not available"),
-                    "approx_token_counts_original": entry.get("approx_token_counts_original", -1),
-                    "approx_token_counts_translated": entry.get("approx_token_counts_translated", -1)
+                    "source": row.get("source", "not available"),
+                    "approx_token_counts_original": row.get("approx_token_counts_original", -1),
+                    "approx_token_counts_translated": row.get("approx_token_counts_translated", -1)
                 }
                 normalised_data.append(normalised_entry)
     else:
-        for k, txt in enumerate(data):
-            cleaned_text = clean_text(txt)
-            word_count += len(cleaned_text.split())
-            normalised_entry = {
-                "id": f"{incoming_file_name}_{str(k)}",
-                "text": cleaned_text,
-            }
-            normalised_data.append(normalised_entry)
+        for k, txt in tqdm.tqdm(enumerate(data)):
+            if txt is not None and len(txt) > 0:
+                cleaned_text = clean_text(txt)
+                word_count += len(cleaned_text.split())
+                normalised_entry = {
+                    "id": f"{incoming_file_name}_{str(k)}",
+                    "text": cleaned_text,
+                }
+                normalised_data.append(normalised_entry)
 
     return normalised_data, word_count
 
@@ -201,5 +228,5 @@ if __name__=="__main__":
 
     for file_type, file_name, data in file_iterator:
         normalised_data, word_count = normalise_data(data, file_type, file_name)
-        data_transfer(normalised_data, args.output_dir, file_name)
-        print(f"Normalised {file_name}, Wordcount: {word_count}.")
+        data_transfer(normalised_data, args.output_dir.strip("gs://"), file_name)
+        print(f"Normalised and uploaded {file_name}, Wordcount: {word_count}.")

@@ -8,7 +8,8 @@ set +o allexport
 
 ./Step2a_startup_pod.sh
 ./Step2b_install_prequisites.sh
-./Step3_upload_scripts.sh
+#./Step3a_normalize_data.sh
+./Step3b_upload_scripts.sh
 ./Step4_load_data.sh
 ./Step5_tpu_train_deberta.sh
 
