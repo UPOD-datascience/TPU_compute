@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+from posixpath import extsep
 from datasets import load_dataset, Dataset, DatasetDict, Features, Value
 import argparse
 import os
@@ -7,6 +8,8 @@ from tokenizers import ByteLevelBPETokenizer
 import pysbd
 import tqdm
 import json
+import pyarrow as pa
+import pyarrow.parquet as pq
 from google.cloud import storage
 
 # Create an argument parser to accept file paths, tokenizer model, and max_seq_length.
@@ -18,6 +21,8 @@ argparser.add_argument("--save_dir_local", type=str, required=True, help="Direct
 argparser.add_argument("--save_dir_gcs", type=str, required=False, help="Google Cloud Storage path where the preprocessed dataset will be saved.")
 argparser.add_argument("--tokenizer_name_or_path", type=str, required=True, help="Pretrained tokenizer model name or path (e.g., 'microsoft/deberta-v3-base').")
 argparser.add_argument("--max_seq_length", type=int, required=True, help="Maximum sequence length for each chunk.")
+argparser.add_argument("--write_mode", type=str, required=True, choices=["jsonl", "parquet"], help="Format to save the preprocessed dataset.")
+argparser.add_argument("--debug_mode", action="store_true", help="Run the script in debug mode.")
 
 args = argparser.parse_args()
 
@@ -57,6 +62,7 @@ client = storage.Client.from_service_account_json('../gsa.json')
 bucket = client.get_bucket(args.data_bucket.split('gs://')[-1])
 
 local_train_files = []
+counter = 0
 print(f"Downloading training data from {args.train_loc}...")
 for blob in bucket.list_blobs(prefix=args.train_loc.split('gs://')[-1].split("/")[1]):
     local_file_path = os.path.join(train_loc_dir, blob.name.split('/')[-1])
@@ -66,8 +72,12 @@ for blob in bucket.list_blobs(prefix=args.train_loc.split('gs://')[-1].split("/"
         print(f'Downloading to {local_file_path}')
         blob.download_to_filename(local_file_path)
         local_train_files.append(local_file_path)
+        counter += 1
+        if (counter == 1) & (args.debug_mode):
+            break
 
 local_validation_files = []
+counter = 0
 print(f"Downloading validation data from {args.validation_loc}...")
 for blob in bucket.list_blobs(prefix=args.validation_loc.split('gs://')[-1].split("/")[1]):
     local_file_path = os.path.join(val_loc_dir, blob.name.split('/')[-1])
@@ -77,6 +87,9 @@ for blob in bucket.list_blobs(prefix=args.validation_loc.split('gs://')[-1].spli
         print(f'Downloading to {local_file_path}')
         blob.download_to_filename(local_file_path)
         local_validation_files.append(local_file_path)
+        counter += 1
+        if (counter == 1) & (args.debug_mode):
+            break
 
 data_files = {
                 "train": local_train_files,
@@ -169,32 +182,64 @@ def write_chunks_to_disk(generator, output_file):
     with open(output_file, 'w') as f:
         for chunk in generator:
             f.write(json.dumps(chunk) + '\n')
-    pass
+
+def write_chunks_to_parquet(generator, output_file):
+    """Writes data from a generator to a Parquet file in chunks."""
+    schema = pa.schema([
+        pa.field("input_ids", pa.int64()),
+        pa.field("attention_mask", pa.int64())
+    ])
+
+    with pq.ParquetWriter(output_file, compression='snappy', schema=schema) as writer:  # Choose compression
+        for batch in generator: # Assuming your generator yields batches of data
+            table = pa.Table.from_pydict(batch, schema=schema) # Create a pyarrow table from batch
+            writer.write_table(table)
+
+
+###################################################################
+################### Chunking the training dataset #################
 
 print("Chunking training dataset manually...")
-output_file_train = os.path.join(args.save_dir_local, 'chunked_train.jsonl')
-if not os.path.exists(output_file_train):
-    write_chunks_to_disk(chunked_examples_generator(raw_datasets, "train"), output_file_train)
+if args.write_mode == 'parquet':
+    output_file_train = os.path.join(args.save_dir_local, f'chunked_train_{args.max_seq_length}.parquet')
+    if not os.path.exists(output_file_train):
+        write_chunks_to_parquet(chunked_examples_generator(raw_datasets, "train"), output_file_train)
+    else:
+        print(f"{output_file_train} already exists, skipping chunking.")
+elif args.write_mode == 'jsonl':
+    output_file_train = os.path.join(args.save_dir_local, f'chunked_train_{args.max_seq_length}.jsonl')
+    if not os.path.exists(output_file_train):
+        write_chunks_to_disk(chunked_examples_generator(raw_datasets, "train"), output_file_train)
+    else:
+        print(f"{output_file_train} already exists, skipping chunking.")
 else:
-    print(f"{output_file_train} already exists, skipping chunking.")
+    raise ValueError(f"Invalid write mode: {args.write_mode}")
 
 print("Chunking validation dataset manually...")
-output_file_validation = os.path.join(args.save_dir_local, 'chunked_validation.jsonl')
-if not os.path.exists(output_file_validation):
-    write_chunks_to_disk(chunked_examples_generator(raw_datasets, "validation"), output_file_validation)
-else:
-    print(f"{output_file_validation} already exists, skipping chunking.")
-
+if args.write_mode == 'parquet':
+    output_file_validation = os.path.join(args.save_dir_local, f'chunked_validation_{args.max_seq_length}.parquet')
+    if not os.path.exists(output_file_validation):
+        write_chunks_to_parquet(chunked_examples_generator(raw_datasets, "validation"), output_file_validation)
+    else:
+        print(f"{output_file_validation} already exists, skipping chunking.")
+elif args.write_mode == 'jsonl':
+    output_file_validation = os.path.join(args.save_dir_local, f'chunked_validation_{args.max_seq_length}.jsonl')
+    if not os.path.exists(output_file_validation):
+        write_chunks_to_disk(chunked_examples_generator(raw_datasets, "validation"), output_file_validation)
+    else:
+        print(f"{output_file_validation} already exists, skipping chunking.")
 ###############
 
-bucket = client.get_bucket(args.save_dir_gcs+"/dataset")
-blob = bucket.blob("tokenized_and_collated_train.json")
-print(f"Upload chunked training dataset to disk to {args.save_dir_gcs+"/dataset"}...")
+ext = "json" if args.write_mode == 'jsonl' else "parquet"
+
+bucket = client.get_bucket(args.save_dir_gcs.replace("gs://",""))
+blob = bucket.blob(f"dataset/tokenized_and_collated_train{ext}")
+print(f"Upload chunked training dataset to disk to {args.save_dir_gcs.replace("gs://","")+"/dataset"}...")
 blob.upload_from_filename(output_file_train)
 # remove local file
 
-blob = bucket.blob("tokenized_and_collated_validation.json")
-print(f"Upload chunked training dataset to disk to {args.save_dir_gcs+"/dataset"}...")
+blob = bucket.blob(f"dataset/tokenized_and_collated_validation.{ext}")
+print(f"Upload chunked training dataset to disk to {args.save_dir_gcs.replace("gs://","")+"/dataset"}...")
 blob.upload_from_filename(output_file_validation)
 # remove local file
 

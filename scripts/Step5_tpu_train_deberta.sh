@@ -35,7 +35,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --output_dir=${MODEL_BUCKET} \
   --tokenizer_name_or_path=/home/${USERNAME}/tokenizer \
   --per_device_train_batch_size=16 \
-  --max_seq_length=512 \
+  --max_seq_length=${MAX_SEQ_LEN} \
   --num_cores=8 \
   --pre_tokenized \
   --learning_rate=0.0001 \

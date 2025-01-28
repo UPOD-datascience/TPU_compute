@@ -11,4 +11,6 @@ python3 preloading_dataset.py  \
   --save_dir_local=${LOCAL_DATA} \
   --save_dir_gcs=${DATA_BUCKET} \
   --tokenizer_name_or_path=${TOKENIZER_PATH} \
-  --max_seq_length=512
+  --max_seq_length=${MAX_SEQ_LEN} \
+  --write_mode=parquet \
+  --debug_mode

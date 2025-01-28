@@ -20,6 +20,7 @@ from google.cloud import storage
 import ftfy as ftfy
 import tqdm
 import re
+from typing import List, Tuple
 
 replacements = [
     (r'\s{2,}', ' ')
@@ -28,6 +29,22 @@ replacements_re = [(re.compile(repl[0]), repl[1]) for repl in replacements]
 
 meta_data = {
     'MariaNMT_cardiomyopathy.json': {
+                                        'id_field': 'id',
+                                        'text_field': 'text'
+                                    },
+    'MariaNMT_acute_coronary_syndrome.jsonl': {
+                                        'id_field': 'id',
+                                        'text_field': 'text'
+                                    },
+    'MariaNMT_atrial_fibrillation.jsonl': {
+                                        'id_field': 'id',
+                                        'text_field': 'text'
+                                    },
+    'MariaNMT_cardiomyopathy.jsonl': {
+                                        'id_field': 'id',
+                                        'text_field': 'text'
+                                    },
+    'MariaNMT_cardiovascular_disease.jsonl': {
                                         'id_field': 'id',
                                         'text_field': 'text'
                                     },
@@ -71,15 +88,53 @@ meta_data = {
                                     'id_field': 'id',
                                     'text_field': 'text'
     },
-    {
     'GeminiFlash15_mimic3_*.jsonl': {
                                     'id_field': 'id',
                                     'text_field': 'text'
+    },
+    'AGCT_MariaNMT.jsonl': {
+                                    'id_field': 'id',
+                                    'text_field': 'text'
+    },
+    'Apollo_medicalGuideline_en_text_GeminiFlash15.json':{
+                                    'id_field': 'id',
+                                    'text_field': 'text'
+    },
+    'EMEA_*.jsonl' :{
+                                    'id_field': None,
+                                    'text_field': 'text'
+    },
+    'MariaNMT_Mimic4_*.json' : {
+                                    'id_field': 'id',
+                                    'text_field': 'text'
+    },
+    'MariaNMT_mimic3_*.json' : {
+                                    'id_field': 'id',
+                                    'text_field': 'text'
+    },
+     'meditron_guidelines_gpt4omini.json': {
+                                    'id_field': 'id',
+                                    'text_field': 'text'
+    },
+    'ntvg.parquet': {
+                                   'id_field': None,
+                                   'text_field': 'total_text'
+    },
+    'apollo_books_nllb200.jsonl': {
+                                'id_field': 'id',
+                                'text_field': 'text'
     }
 }
 
-# things to add: repetitions of non-word characters, punctuation, whitespace and linebreaks
-# things to add: repetitions of words
+def regexifyer(tdict: dict)->List[Tuple[str,str]]:
+    '''
+        Given a dictionary with keys that contain catchall * and ? characters
+        we will return a list of tuples with the regexified key and the value.
+        This also means: escaping existing regex-special characters
+    '''
+    return [(re.sub(r'\*', '.*', key.replace('.', '[.]')), key) for key in tdict.keys()]
+
+meta_keys_re = regexifyer(meta_data)
 
 def clean_text(text):
     # fix encoding issues
@@ -150,8 +205,21 @@ def load_datafiles_from_gcs(gcs_dir, out_dir, separator=None):
 
 
 def normalise_data(data, file_type, incoming_file_name):
-    id_field = meta_data[incoming_file_name]['id_field']
-    text_field = meta_data[incoming_file_name]['text_field']
+
+    # find the right meta_id using the meta_keys_re
+    #
+    id_field = None
+    text_field = None
+    for key_re, _key in meta_keys_re:
+        if re.match(key_re, incoming_file_name) is not None:
+            id_field = meta_data[_key]['id_field']
+            text_field = meta_data[_key]['text_field']
+            print(f"Using meta key:{_key}")
+            break
+        #print(f'NO MATCH \t {key_re}, {_key}\n')
+
+    if not text_field and file_type!='txt':
+        raise ValueError(f"Could not find the right meta data for {incoming_file_name}")
 
     normalised_data = []
     word_count = 0
@@ -225,6 +293,7 @@ if __name__=="__main__":
     args = argparser.parse_args()
 
     file_iterator = load_datafiles_from_gcs(args.gcs_dir.strip("gs://"), args.output_dir.strip("gs://"))
+
 
     for file_type, file_name, data in file_iterator:
         normalised_data, word_count = normalise_data(data, file_type, file_name)

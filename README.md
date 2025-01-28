@@ -39,9 +39,10 @@ Sources:
 * https://www.kaggle.com/code/tanlikesmath/pytorch-tpu-starter-deberta-v3-large-training
 * https://github.com/huggingface/transformers/issues/29659#issuecomment-2006524634
 
-
 # Pre-training scripts
 
 [DeBERTav3 pre-training](https://github.com/microsoft/DeBERTa/tree/master/experiments/language_model)
 
 [ModernBERT pre-training](https://github.com/AnswerDotAI/ModernBERT/tree/main)
+
+[Llama3 pre-training](https://github.com/vvr-rao/Training-a-Mini-114M-Parameter-Llama-3-like-Model-from-Scratch/blob/main/model%20and%20training%20code/train.py)
