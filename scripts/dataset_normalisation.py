@@ -68,6 +68,10 @@ meta_data = {
                                     'id_field': 'patient_uid',
                                     'text_field': 'transformed_text'
     },
+    'PMC-Patients-V2_GeminiFlash-1-5.json': {
+                                    'id_field': 'patient_uid',
+                                    'text_field': 'transformed_text'
+    },
     'Scraped.jsonl': {
                                     'id_field': None,
                                     'text_field': 'text'
@@ -123,6 +127,14 @@ meta_data = {
     'apollo_books_nllb200.jsonl': {
                                 'id_field': 'id',
                                 'text_field': 'text'
+    },
+    'wikipedia_*.parquet': {
+                            'id_field': None,
+                            'text_field': 'text'
+    },
+    'apollo_wiki_mariaNMT.jsonl': {
+                            'id_field': 'id',
+                            'text_field': 'text'
     }
 }
 
