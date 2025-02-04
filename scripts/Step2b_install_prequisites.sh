@@ -28,7 +28,9 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all --command="
-pip install transformers tokenizers gcsfs datasets tqdm wandb
+pip install transformers tokenizers datasets tqdm wandb
+pip install accelerate>=0.26.0
+pip install gcsfs==2023.9.2
 pip install fsspec==2023.9.2"
 
 echo "Cloning XLA..."

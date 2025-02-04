@@ -10,7 +10,7 @@ python3 preloading_dataset.py  \
   --validation_loc=${DATA_BUCKET_VAL_NORMALISED} \
   --save_dir_local=${LOCAL_DATA} \
   --save_dir_gcs=${DATA_BUCKET} \
+  --autotokenizer=${AUTO_TOKENIZER} \
   --tokenizer_name_or_path=${TOKENIZER_PATH} \
   --max_seq_length=${MAX_SEQ_LEN} \
-  --write_mode=parquet \
-  --debug_mode
+  --write_mode=jsonl \

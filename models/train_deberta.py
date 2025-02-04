@@ -90,7 +90,7 @@ def train_fn(index, args):
     print(f"Process {index} is starting...")
 
     if xm.is_master_ordinal():
-        wandb.login(key='29c3dd3150a673a67772f6b5ea35d0e5d835b0fa')
+        wandb.login(key=args.wandb_key)
         wandb.init(
             # set the wandb project where this run will be logged
             project="DeBERTa TPU testing",
@@ -287,6 +287,7 @@ def main():
     parser.add_argument("--num_cores", type=int, default=8)
     parser.add_argument("--keep_in_memory", action='store_true')
     parser.add_argument("--streaming_data", action='store_true')
+    parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
     args = parser.parse_args()
 
     # Set the same seed for all processes

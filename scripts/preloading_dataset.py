@@ -23,6 +23,7 @@ argparser.add_argument("--tokenizer_name_or_path", type=str, required=True, help
 argparser.add_argument("--max_seq_length", type=int, required=True, help="Maximum sequence length for each chunk.")
 argparser.add_argument("--write_mode", type=str, required=True, choices=["jsonl", "parquet"], help="Format to save the preprocessed dataset.")
 argparser.add_argument("--debug_mode", action="store_true", help="Run the script in debug mode.")
+argparser.add_argument('--autotokenizer', type=bool, default=False, help='Automatically download and cache the tokenizer from the Hugging Face model hub.')
 
 args = argparser.parse_args()
 
@@ -33,18 +34,27 @@ os.makedirs(os.path.join(args.save_dir_local, 'validation'), exist_ok=True)
 train_loc_dir = os.path.join(args.save_dir_local, 'train')
 val_loc_dir = os.path.join(args.save_dir_local, 'validation')
 
-print(f"Loading tokenizer from {args.tokenizer_name_or_path}...")
-_tokenizer = ByteLevelBPETokenizer.from_file(merges_filename=os.path.join(args.tokenizer_name_or_path, 'merges.txt'),
-    vocab_filename=os.path.join(args.tokenizer_name_or_path, 'vocab.json'))
+# get lists of files present
+current_train_files = os.listdir(train_loc_dir)
+local_train_files = [os.path.join(train_loc_dir, f) for f in current_train_files]
+current_validation_files = os.listdir(val_loc_dir)
+local_validation_files = [os.path.join(val_loc_dir, f) for f in current_validation_files]
 
-print(f"Casting tokenizer TokenizerFast...")
-tokenizer = PreTrainedTokenizerFast(tokenizer_object=_tokenizer._tokenizer, truncation=True, model_max_length=args.max_seq_length)
-tokenizer.add_special_tokens({'pad_token': '<pad>'})
-tokenizer.add_special_tokens({'bos_token': '<s>'})
-tokenizer.add_special_tokens({'eos_token': '</s>'})
-tokenizer.add_special_tokens({'unk_token': '<unk>'})
-tokenizer.add_special_tokens({'mask_token': '<mask>'})
+if args.autotokenizer:
+    print(f"Loading AutoTokenizer from {args.tokenizer_name_or_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path, use_fast=True, truncation=True, model_max_length=args.max_seq_length)
+else:
+    print(f"Loading tokenizer from {args.tokenizer_name_or_path}...")
+    _tokenizer = ByteLevelBPETokenizer.from_file(merges_filename=os.path.join(args.tokenizer_name_or_path, 'merges.txt'),
+        vocab_filename=os.path.join(args.tokenizer_name_or_path, 'vocab.json'))
 
+    print(f"Casting tokenizer TokenizerFast...")
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=_tokenizer._tokenizer, truncation=True, model_max_length=args.max_seq_length)
+    tokenizer.add_special_tokens({'pad_token': '<pad>'})
+    tokenizer.add_special_tokens({'bos_token': '<s>'})
+    tokenizer.add_special_tokens({'eos_token': '</s>'})
+    tokenizer.add_special_tokens({'unk_token': '<unk>'})
+    tokenizer.add_special_tokens({'mask_token': '<mask>'})
 print("Tokenizer loaded.")
 
 # Define data_files dictionary for the dataset loader.
@@ -233,13 +243,13 @@ elif args.write_mode == 'jsonl':
 ext = "json" if args.write_mode == 'jsonl' else "parquet"
 
 bucket = client.get_bucket(args.save_dir_gcs.replace("gs://",""))
-blob = bucket.blob(f"dataset/tokenized_and_collated_train{ext}")
-print(f"Upload chunked training dataset to disk to {args.save_dir_gcs.replace("gs://","")+"/dataset"}...")
+blob = bucket.blob(f"dataset/tokenized_and_collated_train_{args.max_seq_length}.{ext}")
+print(f"Upload chunked training dataset to disk to {args.save_dir_gcs.replace("gs://","")}{"/dataset"}...")
 blob.upload_from_filename(output_file_train)
 # remove local file
 
-blob = bucket.blob(f"dataset/tokenized_and_collated_validation.{ext}")
-print(f"Upload chunked training dataset to disk to {args.save_dir_gcs.replace("gs://","")+"/dataset"}...")
+blob = bucket.blob(f"dataset/tokenized_and_collated_validation_{args.max_seq_length}.{ext}")
+print(f"Upload chunked training dataset to disk to {args.save_dir_gcs.replace("gs://","")}{"/dataset"}...")
 blob.upload_from_filename(output_file_validation)
 # remove local file
 

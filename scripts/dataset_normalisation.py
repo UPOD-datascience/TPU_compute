@@ -68,9 +68,9 @@ meta_data = {
                                     'id_field': 'patient_uid',
                                     'text_field': 'transformed_text'
     },
-    'PMC-Patients-V2_GeminiFlash-1-5.json': {
+    'PMC-Patients-V2_GeminiFlash-1-5_corrected.json': {
                                     'id_field': 'patient_uid',
-                                    'text_field': 'transformed_text'
+                                    'text_field': 'text'
     },
     'Scraped.jsonl': {
                                     'id_field': None,
@@ -128,11 +128,15 @@ meta_data = {
                                 'id_field': 'id',
                                 'text_field': 'text'
     },
-    'wikipedia_*.parquet': {
+    'wikipedia-*.parquet': {
                             'id_field': None,
                             'text_field': 'text'
     },
     'apollo_wiki_mariaNMT.jsonl': {
+                            'id_field': 'id',
+                            'text_field': 'text'
+    },
+    'GPT4omini_pubmed_*.jsonl': {
                             'id_field': 'id',
                             'text_field': 'text'
     }
@@ -179,6 +183,8 @@ def load_datafiles_from_gcs(gcs_dir, out_dir, separator=None):
 
     blobs = [blob for blob in blobs if  not any([namer(blob) in _existing_file for _existing_file in existing_files])]
 
+    failed_lines = []
+    fix_needed = []
     print(f"Downloading files from GCS")
     for blob in blobs:
         _, file_extension = os.path.splitext(blob.name)
@@ -191,8 +197,19 @@ def load_datafiles_from_gcs(gcs_dir, out_dir, separator=None):
             with open(tmp_file_name, 'r') as json_file:
                 json_list = list(json_file)
             res = []
-            for json_str in json_list:
-                res.append(json.loads(json_str))
+            for ln, json_str in tqdm.tqdm(enumerate(json_list)):
+                try:
+                    res.append(json.loads(json_str))
+                except:
+                    # fix attempt, simply add \"}
+                    json_str += '\"}'
+                    fix_needed.append(ln)
+                    try:
+                        res.append(json.loads(json_str))
+                    except:
+                        failed_lines.append(ln)
+            print(f"{len(fix_needed)} lines had json-parsing issue")
+            print(f"Failed to load {len(failed_lines)} lines, after simple fix attempt")
             os.remove(tmp_file_name)
             yield 'json', filename, res
         elif file_extension == '.parquet':
