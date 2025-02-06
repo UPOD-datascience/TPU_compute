@@ -38,6 +38,7 @@ Sources:
 * https://discuss.huggingface.co/t/tpu-trainer-with-multi-core/16957
 * https://www.kaggle.com/code/tanlikesmath/pytorch-tpu-starter-deberta-v3-large-training
 * https://github.com/huggingface/transformers/issues/29659#issuecomment-2006524634
+* https://pytorch.org/blog/quantization-aware-training/
 
 # Pre-training scripts
 

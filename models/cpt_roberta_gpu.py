@@ -7,12 +7,7 @@ from torch_xla.runtime import world_size, global_ordinal
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
-from transformers import (
-RobertaTokenizer,
-RobertaConfig,
-RobertaForMaskedLM,
-DataCollatorForLanguageModeling
-)
+from transformers import RobertaTokenizer, RobertaConfig, RobertaForMaskedLM, DataCollatorForLanguageModeling
 from transformers import Trainer, TrainingArguments
 from transformers import get_linear_schedule_with_warmup
 
@@ -27,7 +22,6 @@ import math
 import gc
 import datetime
 import shutil
-import numpy as np
 
 try:
     os.environ.pop('TPU_PROCESS_ADDRESSES')
@@ -112,7 +106,7 @@ def train_fn(index, args):
     if global_ordinal() == 0: #.is_master_ordinal():
         wandb.login(key=args.wandb_key)
         wandb.init(
-            project="RoBERTa TPU CPT",
+            project="RoBERTa GPU CPT EHR",
             config={
                 "learning_rate": args.learning_rate,
                 "architecture": "RoBERTa",
@@ -211,9 +205,7 @@ def train_fn(index, args):
         print(f"Total warmup steps: {args.num_warmup_steps}", flush=True)
 
     # Training loop
-    total_step = 0
     for epoch in range(args.num_train_epochs):
-        total_loss = 0.
         model.train()
         for step, batch in enumerate(xla_train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -226,24 +218,11 @@ def train_fn(index, args):
                 scheduler.step()
                 optimizer.zero_grad()
 
-                total_loss +=loss.item()
-                total_step += args.gradient_accumulation_steps
-
-            if (step % args.logging_steps == 0): # xm.is_master_ordinal():
-                local_avg_loss = total_loss / args.logging_steps
-                global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
-                perplexity = math.exp(global_avg_loss)
-                xm.master_print(f"Epoch {epoch+1}, step {step}, loss: {global_avg_loss}")
-
-                total_loss = 0.
-                if xm.is_master_ordinal():
-                    wandb.log({
-                        "train_global_average_loss": global_avg_loss,
-                        "train_perplexity": perplexity,
-                        "epoch": epoch,
-                        "step": step,
-                        "total_step": total_step
-                    })
+            if (global_ordinal() ==0) & (step % args.logging_steps == 0): # xm.is_master_ordinal():
+                wandb.log({
+                    "train_loss": loss.item(),
+                    "rel_step_epoch": 100 * step / steps_per_epoch / 2,
+                })
 
             if (global_ordinal() ==0) & (step % save_steps == 0):
                 xm.master_print("Saving model...")
@@ -267,12 +246,30 @@ def train_fn(index, args):
                     model_cpu = copy.deepcopy(model).to("cpu")
                     model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
-        val_ppl = evaluate(model, xla_validation_loader, device)
-        xm.master_print(f"Epoch {epoch+1} Validation Perplexity: {val_ppl:.3f}")
+        # Validation loop
+        model.eval()
+        val_loss_batch = 0
+        total_loss = 0
+        total_tokens = 0
+        with torch.no_grad():
+            for valcount, batch in enumerate(xla_validation_loader):
+                batch = {k: v.to(device) for k, v in batch.items()}
+                outputs = model(**batch)
+                val_loss_batch += outputs.loss.item()
+                # Sum the loss
+                total_loss += outputs.loss.item() * batch['input_ids'].size(0)
+                # Count non-padding tokens
+                total_tokens += (batch['input_ids'] != model.config.pad_token_id).sum().item()
 
-        if xm.is_master_ordinal():
+
+        val_loss_batch /= valcount
+        avg_loss = total_loss / total_tokens
+        perplexity = torch.exp(torch.tensor(avg_loss))
+        if global_ordinal() == 0: #xm.is_master_ordinal():
             wandb.log({
-                "val_perplexity": val_ppl,
+                "val_loss_batch": val_loss_batch,
+                "val_loss_token": avg_loss,
+                "val_perplexity": perplexity,
                 "epoch": epoch,
             })
 
@@ -302,42 +299,6 @@ def train_fn(index, args):
     # Finish wandb run
     if global_ordinal() == 0:
         wandb.finish()
-
-def evaluate(model, dataloader, device):
-    model.eval()
-    total_loss = 0.0
-    total_steps = 0
-
-    # Loop over the validation set
-    for batch in dataloader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-
-        with torch.no_grad():
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
-        loss = outputs.loss
-
-        # Accumulate the loss locally (on this TPU core)
-        total_loss += loss.item()
-        total_steps += 1
-
-    # Average loss for this core
-    local_avg_loss = total_loss / total_steps
-
-    # Now reduce across all TPU cores to get a "global" average
-    # mesh_reduce can apply a function (here `np.mean`) over the local values
-    global_avg_loss = xm.mesh_reduce("eval_loss", local_avg_loss, np.mean)
-
-    # Perplexity = exp(average cross-entropy loss)
-    ppl = math.exp(global_avg_loss)
-
-    model.train()  # Switch back to train mode
-    return ppl
 
 def main():
     parser = argparse.ArgumentParser()
