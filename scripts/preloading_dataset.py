@@ -108,12 +108,21 @@ data_files = {
 print("Data files loaded.")
 print(data_files)
 print("Loading dataset...")
-raw_datasets = load_dataset("json",
-    data_files=data_files,
-    features=features,
-    keep_in_memory=False,
-    streaming=True,
-    num_proc=None)
+
+# TODO:
+# Split in two lists of datasets
+# train and validation
+# per file in the list we create a dataset
+# raw_datasets = {'train': [dataset1, dataset2, ...], 'validation': [dataset1, dataset2, ...]}
+#
+def create_dataset_from_file(filename):
+    return Dataset.from_file(filename, features=features,
+        keep_in_memory=False, streaming=True, num_proc=None)
+
+raw_datasets = {
+    'train': [(create_dataset_from_file(file), os.path.splitext(os.path.basename(file))[0]) for file in data_files['train']],
+    'validation': [(create_dataset_from_file(file), os.path.splitext(os.path.basename(file))[0]) for file in data_files['validation']]
+}
 
 segmenter = pysbd.Segmenter(language="nl", clean=True)
 
@@ -209,49 +218,78 @@ def write_chunks_to_parquet(generator, output_file):
 ###################################################################
 ################### Chunking the training dataset #################
 
+upload_bucket = client.get_bucket(args.save_dir_gcs.replace("gs://",""))
+# get list of files in the bucket under the dataset folder
+existing_files = [blob.name for blob in upload_bucket.list_blobs(prefix="dataset/")]
+
 print("Chunking training dataset manually...")
+train_files = []
 if args.write_mode == 'parquet':
-    output_file_train = os.path.join(args.save_dir_local, f'chunked_train_{args.max_seq_length}.parquet')
-    if not os.path.exists(output_file_train):
-        write_chunks_to_parquet(chunked_examples_generator(raw_datasets, "train"), output_file_train)
-    else:
-        print(f"{output_file_train} already exists, skipping chunking.")
+    # TODO: loop over all datasets in raw_datasets['train'], check that the output file does not exist
+    for dataset, dataset_name in raw_datasets['train']:
+        if not any([dataset in ef for ef in existing_files]):
+            output_file_train = os.path.join(args.save_dir_local, f'{dataset_name}_chunked_train_{args.max_seq_length}.parquet')
+            if not os.path.exists(output_file_train):
+                write_chunks_to_parquet(chunked_examples_generator(dataset, "train"), output_file_train)
+                train_files.append((output_file_train,dataset_name))
+            else:
+                print(f"{output_file_train} already exists locally, skipping chunking.")
+        else:
+            print(f"{dataset_name} already exists in the GCS bucket, skipping chunking.")
+
 elif args.write_mode == 'jsonl':
-    output_file_train = os.path.join(args.save_dir_local, f'chunked_train_{args.max_seq_length}.jsonl')
-    if not os.path.exists(output_file_train):
-        write_chunks_to_disk(chunked_examples_generator(raw_datasets, "train"), output_file_train)
-    else:
-        print(f"{output_file_train} already exists, skipping chunking.")
+    for dataset, dataset_name in raw_datasets['train']:
+        if not any([dataset in ef for ef in existing_files]):
+            output_file_train = os.path.join(args.save_dir_local, f'{dataset_name}_chunked_train_{args.max_seq_length}.jsonl')
+            if not os.path.exists(output_file_train):
+                write_chunks_to_disk(chunked_examples_generator(dataset, "train"), output_file_train)
+                train_files.append((output_file_train,dataset_name))
+            else:
+                print(f"{output_file_train} already exists, skipping chunking.")
+        else:
+            print(f"{dataset_name} already exists in the GCS bucket, skipping chunking.")
 else:
     raise ValueError(f"Invalid write mode: {args.write_mode}")
 
 print("Chunking validation dataset manually...")
+validation_files = []
 if args.write_mode == 'parquet':
-    output_file_validation = os.path.join(args.save_dir_local, f'chunked_validation_{args.max_seq_length}.parquet')
-    if not os.path.exists(output_file_validation):
-        write_chunks_to_parquet(chunked_examples_generator(raw_datasets, "validation"), output_file_validation)
-    else:
-        print(f"{output_file_validation} already exists, skipping chunking.")
+    for dataset, dataset_name in raw_datasets['validation']:
+        if not any([dataset in ef for ef in existing_files]):
+            output_file_validation = os.path.join(args.save_dir_local, f'{dataset_name}_chunked_validation_{args.max_seq_length}.parquet')
+            if not os.path.exists(output_file_validation):
+                write_chunks_to_parquet(chunked_examples_generator(dataset, "validation"), output_file_validation)
+                validation_files.append((output_file_validation,dataset_name))
+            else:
+                print(f"{output_file_validation} already exists, skipping chunking.")
+        else:
+            print(f"{dataset_name} already exists in the GCS bucket, skipping chunking.")
 elif args.write_mode == 'jsonl':
-    output_file_validation = os.path.join(args.save_dir_local, f'chunked_validation_{args.max_seq_length}.jsonl')
-    if not os.path.exists(output_file_validation):
-        write_chunks_to_disk(chunked_examples_generator(raw_datasets, "validation"), output_file_validation)
-    else:
-        print(f"{output_file_validation} already exists, skipping chunking.")
+    for dataset, dataset_name in raw_datasets['validation']:
+        if not any([dataset in ef for ef in existing_files]):
+            output_file_validation = os.path.join(args.save_dir_local, f'{dataset_name}_chunked_validation_{args.max_seq_length}.jsonl')
+            if not os.path.exists(output_file_validation):
+                write_chunks_to_disk(chunked_examples_generator(dataset, "validation"), output_file_validation)
+                validation_files.append((output_file_validation,dataset_name))
+            else:
+                print(f"{output_file_validation} already exists, skipping chunking.")
+        else:
+            print(f"{dataset_name} already exists in the GCS bucket, skipping chunking.")
 ###############
 
 ext = "json" if args.write_mode == 'jsonl' else "parquet"
 
-bucket = client.get_bucket(args.save_dir_gcs.replace("gs://",""))
-blob = bucket.blob(f"dataset/tokenized_and_collated_train_{args.max_seq_length}.{ext}")
-print(f"Upload chunked training dataset to disk to {args.save_dir_gcs.replace("gs://","")}{"/dataset"}...")
-blob.upload_from_filename(output_file_train)
-# remove local file
+upload_bucket = client.get_bucket(args.save_dir_gcs.replace("gs://",""))
+for output_file_train, dataset_name in train_files:
+    blob = upload_bucket.blob(f"dataset/{dataset_name}_train_{args.max_seq_length}.{ext}")
+    print(f"Upload chunked training dataset to disk to {args.save_dir_gcs.replace("gs://","")}{"/dataset"}...")
+    blob.upload_from_filename(output_file_train)
 
-blob = bucket.blob(f"dataset/tokenized_and_collated_validation_{args.max_seq_length}.{ext}")
-print(f"Upload chunked training dataset to disk to {args.save_dir_gcs.replace("gs://","")}{"/dataset"}...")
-blob.upload_from_filename(output_file_validation)
-# remove local file
+for output_file_validation, dataset_name in validation_files:
+    blob = upload_bucket.blob(f"dataset/{dataset_name}_validation_{args.max_seq_length}.{ext}")
+    print(f"Upload chunked training dataset to disk to {args.save_dir_gcs.replace("gs://","")}{"/dataset"}...")
+    blob.upload_from_filename(output_file_validation)
+    # remove local file
 
 print("Removing local files..")
 for f in local_train_files + local_validation_files:
