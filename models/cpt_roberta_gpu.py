@@ -112,19 +112,42 @@ def get_optimizer(model, args):
     )
     return optimizer
 
+def evaluate(model, dataloader, device):
+    model.eval()
+    total_loss = 0.0
+    total_steps = 0
+
+    for batch in dataloader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+        loss = outputs.loss
+        total_loss += loss.item()
+        total_steps += 1
+
+    global_avg_loss = total_loss / total_steps
+    ppl = math.exp(global_avg_loss)
+    model.train()  # Switch back to train mode
+    return ppl, global_avg_loss
+
 def train_fn(index, args):
     # Set up device for GPU (or CPU if no GPU available)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Initialize wandb for the master process (we use index==0 as master)
-    if index == 0:
-        wandb.login(key=args.wandb_key)
+    if index == 0:        
         wandb.init(
             project="RoBERTa GPU CPT",
             config={
                 "learning_rate": args.learning_rate,
                 "architecture": "RoBERTa",
-                "dataset": args.dataset_dir,
                 "epochs": args.num_train_epochs,
                 "weight_decay": args.weight_decay,
                 "max_seq_length": args.max_seq_length,
@@ -223,8 +246,7 @@ def train_fn(index, args):
                 total_step += args.gradient_accumulation_steps
 
             if step % args.logging_steps == 0:
-                local_avg_loss = total_loss / args.logging_steps if args.logging_steps > 0 else loss.item()
-                global_avg_loss = local_avg_loss  # No distributed reduction needed for GPU
+                global_avg_loss = total_loss / step
                 perplexity = math.exp(global_avg_loss)
                 print(f"Epoch {epoch+1}, step {step}, loss: {global_avg_loss}")
 
@@ -256,12 +278,13 @@ def train_fn(index, args):
                     model_cpu = copy.deepcopy(model).to("cpu")
                     model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
-        val_ppl = evaluate(model, validation_loader, device)
+        val_ppl,val_loss = evaluate(model, validation_loader, device)
         print(f"Epoch {epoch+1} Validation Perplexity: {val_ppl:.3f}")
 
         if index == 0:
             wandb.log({
                 "val_perplexity": val_ppl,
+                "val_eval_loss": val_loss,
                 "epoch": epoch,
             })
 
@@ -288,35 +311,8 @@ def train_fn(index, args):
     if index == 0:
         wandb.finish()
 
-def evaluate(model, dataloader, device):
-    model.eval()
-    total_loss = 0.0
-    total_steps = 0
-
-    for batch in dataloader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-
-        with torch.no_grad():
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
-        loss = outputs.loss
-        total_loss += loss.item()
-        total_steps += 1
-
-    local_avg_loss = total_loss / total_steps
-    global_avg_loss = local_avg_loss  # No reduction needed for single-GPU training
-    ppl = math.exp(global_avg_loss)
-    model.train()  # Switch back to train mode
-    return ppl
-
 def main():
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--dataset_dir", type=str, required=True)
     parser.add_argument("--tmp_dir", type=str, required=True)
     parser.add_argument("--tokenizer_name_or_path", type=str, required=True)
@@ -341,6 +337,9 @@ def main():
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
     parser.add_argument("--wandb_key", type=str, required=True, help="Weights & Biases API key")
     args = parser.parse_args()
+
+
+    wandb.login(key=args.wandb_key)
 
     if args.keep_in_memory and args.streaming_data:
         raise ValueError("keep_in_memory and streaming_data are mutually exclusive. Please set only one of them to True.")
