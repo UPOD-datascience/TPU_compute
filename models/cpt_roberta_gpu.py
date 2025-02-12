@@ -107,8 +107,8 @@ def get_optimizer(model, args):
     
     optimizer = torch.optim.AdamW(
         optimizer_grouped_parameters,
-        lr=args['learning_rate'],
-        weight_decay=args['weight_decay'],
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
     )
     return optimizer
 
