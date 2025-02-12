@@ -93,8 +93,10 @@ def prep_fn(args):
     if args.pre_tokenized:
         datasets = {"train": args.dataset_dir+f"/train_{args.max_seq_length}.json",
                     "validation": args.dataset_dir+f"/validation_{args.max_seq_length}.json"}
-        tokenized_dataset = load_dataset("json", data_files=datasets,                     streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
+        tokenized_dataset = load_dataset("json", data_files=datasets, streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
     else:
+        datasets = {"train": args.dataset_dir+f"/train/*.json",
+                    "validation": args.dataset_dir+f"/validation/*.json"}    
         dataset = load_dataset(args.dataset_dir, streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
 
         def tokenize_function(examples):

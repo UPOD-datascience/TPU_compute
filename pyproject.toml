@@ -20,6 +20,8 @@ pysbd = "^0.3.4"
 datasets = "^3.2.0"
 fsspec = "2023.9.2"
 gcsfs = "2023.9.2"
+torch = "^2.6.0"
+wandb = "^0.19.6"
 
 [build-system]
 requires = ["poetry-core"]

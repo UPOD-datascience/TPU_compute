@@ -1,13 +1,15 @@
 """
-This is the main script to continue pre-training a Roberta model.
+This is the main script to continue pre-training a Roberta model on GPU.
 """
 import argparse
 import torch
-from torch_xla.runtime import world_size, global_ordinal
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
-import torch_xla.distributed.xla_multiprocessing as xmp
-from transformers import RobertaTokenizer, RobertaConfig, RobertaForMaskedLM, DataCollatorForLanguageModeling
+
+from transformers import (
+    RobertaTokenizer,
+    RobertaConfig,
+    RobertaForMaskedLM,
+    DataCollatorForLanguageModeling
+)
 from transformers import Trainer, TrainingArguments
 from transformers import get_linear_schedule_with_warmup
 
@@ -22,30 +24,8 @@ import math
 import gc
 import datetime
 import shutil
+import numpy as np
 
-try:
-    os.environ.pop('TPU_PROCESS_ADDRESSES')
-    os.environ.pop('CLOUD_TPU_TASK_ID')
-except:
-    print("No TPU_PROCESS_ADDRESSES or CLOUD_TPU_TASK_ID to remove")
-
-# class ShardedShuffleDataset(IterableDataset):
-#     def __init__(self, dataset, num_shards, shard_id, shuffle_buffer_size):
-#         self.dataset = dataset
-#         self.num_shards = num_shards
-#         self.shard_id = shard_id
-#         self.shuffle_buffer_size = shuffle_buffer_size
-
-#     def __iter__(self):
-#         sharded_data = itertools.islice(self.dataset, self.shard_id, None, self.num_shards)
-
-#         buffer = []
-#         for item in itertools.cycle(sharded_data):  # Use cycle to repeat the dataset
-#             buffer.append(item)
-#             if len(buffer) >= self.shuffle_buffer_size:
-#                 random.shuffle(buffer)
-#                 while len(buffer) > self.shuffle_buffer_size // 2:
-#                     yield buffer.pop(0)
 
 class ShardedShuffleDataset(torch.utils.data.IterableDataset):
     def __init__(self, dataset, num_shards, shard_id, shuffle_buffer_size):
@@ -85,10 +65,19 @@ def prep_fn(args):
 
     # Load and tokenize dataset
     if args.pre_tokenized:
-        datasets = {"train": args.dataset_dir+f"/train_{args.max_seq_length}.json",
-                    "validation": args.dataset_dir+f"/validation_{args.max_seq_length}.json"}
-        tokenized_dataset = load_dataset("json", data_files=datasets,                     streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
+        datasets = {
+            "train": args.dataset_dir + f"/train_{args.max_seq_length}.json",
+            "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.json"
+        }
+        tokenized_dataset = load_dataset(
+            "json", 
+            data_files=datasets, 
+            streaming=args.streaming_data, 
+            keep_in_memory=args.keep_in_memory
+        )
     else:
+        datasets = {"train": args.dataset_dir+f"/train/*.json",
+                    "validation": args.dataset_dir+f"/validation/*.json"}   
         dataset = load_dataset(args.dataset_dir, streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
 
         def tokenize_function(examples):
@@ -98,15 +87,40 @@ def prep_fn(args):
 
     return tokenized_dataset, tokenizer
 
-def train_fn(index, args):
-    # Set up device
-    device = xm.xla_device()
+def get_optimizer(model, args):
+    """
+    Initializes AdamW optimizer with warm-up and linear decay.
+    Excludes weight decay for biases and LayerNorm weights.
+    """
 
-    # Initialize wandb for the master process
-    if global_ordinal() == 0: #.is_master_ordinal():
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": args['weight_decay'],
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+    
+    optimizer = torch.optim.AdamW(
+        optimizer_grouped_parameters,
+        lr=args['learning_rate'],
+        weight_decay=args['weight_decay'],
+    )
+    return optimizer
+
+def train_fn(index, args):
+    # Set up device for GPU (or CPU if no GPU available)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Initialize wandb for the master process (we use index==0 as master)
+    if index == 0:
         wandb.login(key=args.wandb_key)
         wandb.init(
-            project="RoBERTa GPU CPT EHR",
+            project="RoBERTa GPU CPT",
             config={
                 "learning_rate": args.learning_rate,
                 "architecture": "RoBERTa",
@@ -118,45 +132,28 @@ def train_fn(index, args):
             }
         )
 
-    # Load model configuration
-    #config = RobertaConfig.from_pretrained(args.model_name)
-
     # Load pre-trained model
-    model = RobertaForMaskedLM.from_pretrained(args.model_name)#, config=config)
+    model = RobertaForMaskedLM.from_pretrained(args.model_name)
     model.to(device)
 
     # Set up data collator
     data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer, mlm=True, mlm_probability=0.15)
 
-    # Decide on distributed sampler parameters:
-    if args.num_cores == 1:
-        sampler_rank = 0
-        sampler_replicas = 1
-    else:
-        sampler_rank = global_ordinal()
-        sampler_replicas = world_size()
+    # For GPU training, assume a single process (non-distributed)
+    sampler_rank = 0
+    sampler_replicas = 1
 
-    # Create sampler
+    # Create dataloader
     if args.streaming_data:
-        num_shards = world_size()  # Total number of TPU cores (or processes)
-        shard_id = global_ordinal()  # Unique id for the current process
-
-        sharded_shuffled_dataset = ShardedShuffleDataset(
-            args.tokenized_datasets["train"],
-            num_shards=num_shards,
-            shard_id=shard_id,
-            shuffle_buffer_size=args.shuffle_buffer_size
-        )
-
+        # For GPU, simply use the dataset without sharding
         train_dataloader = torch.utils.data.DataLoader(
-            sharded_shuffled_dataset,
+            args.tokenized_datasets["train"],
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
             num_workers=0
         )
     elif args.sharded_data:
-        sharded_dataset = args.tokenized_datasets["train"].shard(num_shards=world_size(), index=global_ordinal())
-
+        sharded_dataset = args.tokenized_datasets["train"].shard(num_shards=1, index=0)
         train_dataloader = torch.utils.data.DataLoader(
             sharded_dataset,
             batch_size=args.per_device_train_batch_size,
@@ -170,14 +167,13 @@ def train_fn(index, args):
             rank=sampler_rank,
             shuffle=True
         )
-        # Create dataloaders
         train_dataloader = torch.utils.data.DataLoader(
             args.tokenized_datasets["train"],
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
             sampler=train_sampler
         )
-    #################
+
     validation_dataloader = torch.utils.data.DataLoader(
         args.tokenized_datasets["validation"],
         batch_size=args.per_device_train_batch_size,
@@ -187,118 +183,136 @@ def train_fn(index, args):
     del args.tokenized_datasets
     gc.collect()
 
-    xla_train_loader = pl.MpDeviceLoader(train_dataloader, xm.xla_device())
-    xla_validation_loader = pl.MpDeviceLoader(validation_dataloader, xm.xla_device())
+    # For GPU training, use the dataloaders directly (no device loader wrapper needed)
+    train_loader = train_dataloader
+    validation_loader = validation_dataloader
 
     # Set up optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = get_optimizer(model, args)
     steps_per_epoch = args.max_steps_per_epoch if args.streaming_data else len(train_dataloader)
     save_steps = int(steps_per_epoch * args.save_epoch_percentage)
     total_steps = steps_per_epoch * args.num_train_epochs
-    #scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=total_steps)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
+    scheduler = get_linear_schedule_with_warmup(optimizer,
+                                                 num_warmup_steps=args.num_warmup_steps, 
+                                                 num_training_steps=total_steps)
 
-    if global_ordinal() == 0: # xm.is_master_ordinal():
+    if index == 0:
         print("Starting training...", flush=True)
         print(f"Total steps: {total_steps}", flush=True)
         print(f"Total epochs: {args.num_train_epochs}", flush=True)
         print(f"Total warmup steps: {args.num_warmup_steps}", flush=True)
 
     # Training loop
+    total_step = 0
     for epoch in range(args.num_train_epochs):
+        total_loss = 0.
         model.train()
-        for step, batch in enumerate(xla_train_loader):
+        for step, batch in enumerate(train_loader):
+            # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
             outputs = model(**batch)
             loss = outputs.loss
             loss.backward()
 
-            if  (step+1) % args.gradient_accumulation_steps == 0:
-                xm.optimizer_step(optimizer)
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                optimizer.step()  # Replaces xm.optimizer_step(optimizer)
                 scheduler.step()
                 optimizer.zero_grad()
 
-            if (global_ordinal() ==0) & (step % args.logging_steps == 0): # xm.is_master_ordinal():
-                wandb.log({
-                    "train_loss": loss.item(),
-                    "rel_step_epoch": 100 * step / steps_per_epoch / 2,
-                })
+                total_loss += loss.item()
+                total_step += args.gradient_accumulation_steps
 
-            if (global_ordinal() ==0) & (step % save_steps == 0):
-                xm.master_print("Saving model...")
+            if step % args.logging_steps == 0:
+                local_avg_loss = total_loss / args.logging_steps if args.logging_steps > 0 else loss.item()
+                global_avg_loss = local_avg_loss  # No distributed reduction needed for GPU
+                perplexity = math.exp(global_avg_loss)
+                print(f"Epoch {epoch+1}, step {step}, loss: {global_avg_loss}")
+
+                total_loss = 0.
+                if index == 0:
+                    wandb.log({
+                        "train_global_average_loss": global_avg_loss,
+                        "train_perplexity": perplexity,
+                        "epoch": epoch,
+                        "step": step,
+                        "total_step": total_step
+                    })
+
+            if (index == 0) and (step % save_steps == 0) and (step > 0):
+                print("Saving model...")
                 if args.output_dir.startswith("gs://"):
                     with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
                         local_output_dir = tmpdirname
-                        xm.master_print(f"Saving model to {local_output_dir}...")
+                        print(f"Saving model to {local_output_dir}...")
                         model_cpu = copy.deepcopy(model).to("cpu")
                         model_cpu.save_pretrained(local_output_dir, save_serialization=True)
-                        xm.master_print(f"Uploading model to {args.output_dir}...")
+                        print(f"Uploading model to {args.output_dir}...")
                         subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
-                        # rename the directory on GCS to the model name, date, and epoch_step
-                        # Generate a new directory name with model name, date, and epoch_step
                         current_time = datetime.datetime.now().strftime("%Y%m%d")
                         new_dir_name = f"{args.model_name}_epoch{epoch}_step{step}_{current_time}"
                         new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                        # Rename the directory on GCS
                         subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
-
                 else:
                     model_cpu = copy.deepcopy(model).to("cpu")
                     model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
-        # Validation loop
-        model.eval()
-        val_loss_batch = 0
-        total_loss = 0
-        total_tokens = 0
-        with torch.no_grad():
-            for valcount, batch in enumerate(xla_validation_loader):
-                batch = {k: v.to(device) for k, v in batch.items()}
-                outputs = model(**batch)
-                val_loss_batch += outputs.loss.item()
-                # Sum the loss
-                total_loss += outputs.loss.item() * batch['input_ids'].size(0)
-                # Count non-padding tokens
-                total_tokens += (batch['input_ids'] != model.config.pad_token_id).sum().item()
+        val_ppl = evaluate(model, validation_loader, device)
+        print(f"Epoch {epoch+1} Validation Perplexity: {val_ppl:.3f}")
 
-
-        val_loss_batch /= valcount
-        avg_loss = total_loss / total_tokens
-        perplexity = torch.exp(torch.tensor(avg_loss))
-        if global_ordinal() == 0: #xm.is_master_ordinal():
+        if index == 0:
             wandb.log({
-                "val_loss_batch": val_loss_batch,
-                "val_loss_token": avg_loss,
-                "val_perplexity": perplexity,
+                "val_perplexity": val_ppl,
                 "epoch": epoch,
             })
 
-        # Save model checkpoint
-        if global_ordinal() == 0:
-            xm.master_print("Saving model...")
+        # Save model checkpoint at the end of each epoch
+        if index == 0:
+            print("Saving model...")
             if args.output_dir.startswith("gs://"):
                 with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
                     local_output_dir = tmpdirname
-                    xm.master_print(f"Saving model to {local_output_dir}...")
+                    print(f"Saving model to {local_output_dir}...")
                     model_cpu = copy.deepcopy(model).to("cpu")
                     model_cpu.save_pretrained(local_output_dir, save_serialization=True)
-                    xm.master_print(f"Uploading model to {args.output_dir}...")
+                    print(f"Uploading model to {args.output_dir}...")
                     subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
-                    # rename the directory on GCS to the model name, date, and epoch_step
-                    # Generate a new directory name with model name, date, and epoch_step
                     current_time = datetime.datetime.now().strftime("%Y%m%d")
                     new_dir_name = f"{args.model_name}_epoch{epoch}_{current_time}"
                     new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                    # Rename the directory on GCS
                     subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
             else:
                 model_cpu = copy.deepcopy(model).to("cpu")
                 model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
-
     # Finish wandb run
-    if global_ordinal() == 0:
+    if index == 0:
         wandb.finish()
+
+def evaluate(model, dataloader, device):
+    model.eval()
+    total_loss = 0.0
+    total_steps = 0
+
+    for batch in dataloader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+        loss = outputs.loss
+        total_loss += loss.item()
+        total_steps += 1
+
+    local_avg_loss = total_loss / total_steps
+    global_avg_loss = local_avg_loss  # No reduction needed for single-GPU training
+    ppl = math.exp(global_avg_loss)
+    model.train()  # Switch back to train mode
+    return ppl
 
 def main():
     parser = argparse.ArgumentParser()
@@ -318,41 +332,32 @@ def main():
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--save_epoch_percentage", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_cores", type=int, default=8)
+    parser.add_argument("--num_cores", type=int, default=1)  # Set to 1 for single GPU training
     parser.add_argument("--keep_in_memory", action='store_true')
     parser.add_argument("--streaming_data", action='store_true')
     parser.add_argument("--sharded_data", action='store_true')
     parser.add_argument("--max_steps_per_epoch", type=int, default=None)
     parser.add_argument("--shuffle_buffer_size", type=int, default=10_000)
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
-    parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
+    parser.add_argument("--wandb_key", type=str, required=True, help="Weights & Biases API key")
     args = parser.parse_args()
 
-    # give error if both keep_in_memory and streaming_data are set to True
-    # as they are mutually exclusive
     if args.keep_in_memory and args.streaming_data:
         raise ValueError("keep_in_memory and streaming_data are mutually exclusive. Please set only one of them to True.")
 
-    if args.streaming_data==True and args.shuffle_buffer_size is None:
+    if args.streaming_data and args.shuffle_buffer_size is None:
         raise ValueError("shuffle_buffer_size is required when streaming_data is set to True.")
 
-    # Set the same seed for all processes
+    # Set the same seed for reproducibility
     torch.manual_seed(args.seed)
     tokenized_dataset, tokenizer = prep_fn(args)
 
-    # update args with traindata, valdata, tokenizer
     args.tokenized_datasets = tokenized_dataset
     args.tokenizer = tokenizer
 
-    # Spawn processes
-    print(f"Initializing TPU...with {args.num_cores} cores")
-    print("Spawning processes...")
-
-    if args.num_cores == 1:
-        print("Running single process...")
-        train_fn(0, args)
-    else:
-        xmp.spawn(train_fn, args=(args,))
+    # For GPU training, we are using a single process.
+    print("Running on GPU (or CPU if no GPU is available)...")
+    train_fn(0, args)
 
 if __name__ == "__main__":
     print("Starting...")
