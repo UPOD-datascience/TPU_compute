@@ -100,9 +100,16 @@ def prep_fn(args):
         dataset = load_dataset(args.dataset_dir, streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
 
         def tokenize_function(examples):
-            return tokenizer(examples["text"], truncation=True, max_length=args.max_seq_length, padding="max_length")
+            return tokenizer(examples["text"], truncation=True, 
+                             max_length=args.max_seq_length, padding="max_length")
 
-        tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+        tokenized_dataset = dataset.map(tokenize_function, 
+                                        batched=True, 
+                                        remove_columns=["text",
+                                                         "id", 
+                                                         "source",
+                                                         "approx_token_counts_translated",
+                                                         "approx_token_counts_original"])
 
     return tokenized_dataset, tokenizer
 
@@ -134,7 +141,8 @@ def train_fn(index, args):
     model.to(device)
 
     # Set up data collator
-    data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer, mlm=True, mlm_probability=0.15)
+    data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
+                                                    mlm=True, mlm_probability=0.15)
 
     # Decide on distributed sampler parameters:
     if args.num_cores == 1:
@@ -222,16 +230,17 @@ def train_fn(index, args):
             outputs = model(**batch)
             loss = outputs.loss
             loss.backward()
+            
+            total_loss +=loss.item()
 
             if  (step+1) % args.gradient_accumulation_steps == 0:
                 xm.optimizer_step(optimizer)
                 scheduler.step()
                 optimizer.zero_grad()
 
-                total_loss +=loss.item()
                 total_step += args.gradient_accumulation_steps
 
-            if (step % args.logging_steps == 0): # xm.is_master_ordinal():
+            if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
                 local_avg_loss = total_loss / args.logging_steps
                 global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
                 perplexity = math.exp(global_avg_loss)

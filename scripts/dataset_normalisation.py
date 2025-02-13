@@ -139,6 +139,10 @@ meta_data = {
     'GPT4omini_pubmed_*.jsonl': {
                             'id_field': 'id',
                             'text_field': 'text'
+    },
+    'COMBINED_DEID_cleaned.parquet':{
+                            'id_field': None,
+                            'text_field': 'text'
     }
 }
 
@@ -232,6 +236,57 @@ def load_datafiles_from_gcs(gcs_dir, out_dir, separator=None):
             os.remove(tmp_file_name)
             yield 'txt', filename, lines
 
+def load_datafiles_from_local(in_dir, out_dir, seperator=None):
+    files = os.listdir(in_dir)
+    existing_files = set([file.split('.')[0] for file in os.listdir(out_dir)])
+
+    print(f"Currently existing files {existing_files}")
+
+    namer = lambda x: x.name.split('/')[-1].split('.')[0]
+
+    files = [file for file in files if  not any([file.split('.')[0] in _existing_file 
+                                                 for _existing_file in existing_files])]
+
+    failed_lines = []
+    fix_needed = []
+    print(f"Downloading files from {in_dir}")
+    for file in files:
+        _, file_extension = os.path.splitext(file)
+        filename = os.path.join(in_dir, file)
+        print(f"Loading {filename}")
+        if file_extension in ['.json', '.jsonl']:
+            with open(filename, 'r') as json_file:
+                json_list = list(json_file)
+            res = []
+            for ln, json_str in tqdm.tqdm(enumerate(json_list)):
+                try:
+                    res.append(json.loads(json_str))
+                except:
+                    # fix attempt, simply add \"}
+                    json_str += '\"}'
+                    fix_needed.append(ln)
+                    try:
+                        res.append(json.loads(json_str))
+                    except:
+                        failed_lines.append(ln)
+            print(f"{len(fix_needed)} lines had json-parsing issue")
+            print(f"Failed to load {len(failed_lines)} lines, after simple fix attempt")
+            os.remove(filename)
+            yield 'json', file, res
+        elif file_extension == '.parquet':
+            res = pd.read_parquet(filename)
+            yield 'parquet', file, res
+        elif file_extension == '.txt':
+            # read all lines of the file with an optional seperator
+            # if seperator regex not provided, default to '\n'
+            with open(filename, 'r', encoding='latin1') as txt_file:
+                bulk = txt_file.read()
+                if separator is not None:
+                    lines = bulk.split(separator)
+                else:
+                    lines = bulk.splitlines()
+            yield 'txt', file, lines
+
 
 def normalise_data(data, file_type, incoming_file_name):
 
@@ -289,6 +344,9 @@ def normalise_data(data, file_type, incoming_file_name):
                 normalised_entry = {
                     "id": f"{incoming_file_name}_{str(k)}",
                     "text": cleaned_text,
+                    "source": row.get("source", "not available"),
+                    "approx_token_counts_original": row.get("approx_token_counts_original", -1),
+                    "approx_token_counts_translated": row.get("approx_token_counts_translated", -1)
                 }
                 normalised_data.append(normalised_entry)
 
@@ -312,19 +370,37 @@ def data_transfer(data, output_dir, file_name):
     os.remove(local_file_path)
     return True
 
+def data_transfer_local(data, output_dir, file_name):
+    # write to local
+    local_file_path = os.path.join(output_dir, 'normalised_data.jsonl')
+    with open(local_file_path, 'w') as f:
+        for entry in data:
+            json.dump(entry, f)
+            f.write('\n')
+    return True
+
 # We then normalise the data and save it to a new .json and upload to the GCS normalised data folder
 # We then remove the original data file from the local drive
 
 if __name__=="__main__":
     argparser = argparse.ArgumentParser()
-    argparser.add_argument("--gcs_dir", type=str, required=True)
+    argparser.add_argument("--input_dir", type=str, required=True)
     argparser.add_argument("--output_dir", type=str, required=True)
     args = argparser.parse_args()
 
-    file_iterator = load_datafiles_from_gcs(args.gcs_dir.strip("gs://"), args.output_dir.strip("gs://"))
 
+    if args.input_dir.startswith("gs://") and args.output_dir.startswith("gs://"):
+        file_iterator = load_datafiles_from_gcs(args.input_dir.strip("gs://"), args.output_dir.strip("gs://"))
 
-    for file_type, file_name, data in file_iterator:
-        normalised_data, word_count = normalise_data(data, file_type, file_name)
-        data_transfer(normalised_data, args.output_dir.strip("gs://"), file_name)
-        print(f"Normalised and uploaded {file_name}, Wordcount: {word_count}.")
+        for file_type, file_name, data in file_iterator:
+            normalised_data, word_count = normalise_data(data, file_type, file_name)
+            data_transfer(normalised_data, args.output_dir.strip("gs://"), file_name)
+            print(f"Normalised and uploaded {file_name}, Wordcount: {word_count}.")
+
+    else:
+        file_iterator = load_datafiles_from_local(args.input_dir, args.output_dir)
+        for file_type, file_name, data in file_iterator:
+            normalised_data, word_count = normalise_data(data, file_type, file_name)
+            data_transfer_local(normalised_data, args.output_dir.strip("gs://"), file_name)
+            print(f"Normalised and saved {file_name}, Wordcount: {word_count}.")
+

@@ -65,6 +65,7 @@ def prep_fn(args):
 
     # Load and tokenize dataset
     if args.pre_tokenized:
+        print("Loading pre-tokenized dataset...", flush=True)
         datasets = {
             "train": args.dataset_dir + f"/train_{args.max_seq_length}.json",
             "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.json"
@@ -76,14 +77,24 @@ def prep_fn(args):
             keep_in_memory=args.keep_in_memory
         )
     else:
+        print("Tokenizing dataset...", flush=True)
         datasets = {"train": args.dataset_dir+f"/train/*.json",
                     "validation": args.dataset_dir+f"/validation/*.json"}   
         dataset = load_dataset(args.dataset_dir, streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
 
         def tokenize_function(examples):
-            return tokenizer(examples["text"], truncation=True, max_length=args.max_seq_length, padding="max_length")
+            return tokenizer(examples["text"], 
+                             truncation=True, 
+                             max_length=args.max_seq_length, 
+                             padding=True) #"max_length")
 
-        tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+        tokenized_dataset = dataset.map(tokenize_function,
+                                         batched=True,
+                                         remove_columns=["text",
+                                                         "id",
+                                                         "source",
+                                                         "approx_token_counts_translated",
+                                                         "approx_token_counts_original"])
 
     return tokenized_dataset, tokenizer
 
@@ -97,7 +108,7 @@ def get_optimizer(model, args):
     optimizer_grouped_parameters = [
         {
             "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args['weight_decay'],
+            "weight_decay": args.weight_decay,
         },
         {
             "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
@@ -160,7 +171,9 @@ def train_fn(index, args):
     model.to(device)
 
     # Set up data collator
-    data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer, mlm=True, mlm_probability=0.15)
+    data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
+                                                     mlm=True, 
+                                                     mlm_probability=0.15)
 
     # For GPU training, assume a single process (non-distributed)
     sampler_rank = 0
@@ -237,15 +250,15 @@ def train_fn(index, args):
             loss = outputs.loss
             loss.backward()
 
+            total_loss += loss.item()
+
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 optimizer.step()  # Replaces xm.optimizer_step(optimizer)
                 scheduler.step()
                 optimizer.zero_grad()
-
-                total_loss += loss.item()
                 total_step += args.gradient_accumulation_steps
 
-            if step % args.logging_steps == 0:
+            if (step + 1) % args.logging_steps == 0:
                 global_avg_loss = total_loss / step
                 perplexity = math.exp(global_avg_loss)
                 print(f"Epoch {epoch+1}, step {step}, loss: {global_avg_loss}")
