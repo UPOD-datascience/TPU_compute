@@ -33,7 +33,7 @@ $cmd = 'cd /d ' + $env:FULL_SCRIPT_DIR + ' && poetry run python ../models/cpt_ro
        '--shuffle_buffer_size=10_000 ' +
        '--weight_decay=0.001 ' +
        '--wandb_key=' + $env:WANDB_KEY + ' ' +
-       '--num_train_epochs=5'
+       '--num_train_epochs=10'
 
 Start-Process -NoNewWindow -FilePath "cmd.exe" -ArgumentList "/c", $cmd -Wait
 Write-Output "Training started."

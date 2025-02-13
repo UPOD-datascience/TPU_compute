@@ -25,7 +25,7 @@ import gc
 import datetime
 import shutil
 import numpy as np
-
+from itertools import chain
 
 class ShardedShuffleDataset(torch.utils.data.IterableDataset):
     def __init__(self, dataset, num_shards, shard_id, shuffle_buffer_size):
@@ -59,7 +59,23 @@ class ShardedShuffleDataset(torch.utils.data.IterableDataset):
         while buffer:
             yield buffer.pop(0)
 
+        
 def prep_fn(args):
+    def group_texts(examples):
+        # Concatenate all texts.
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        # We drop the small remainder, and if the total_length < max_seq_length  we exclude this batch and return an empty dict.
+        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+        total_length = (total_length // args.max_seq_length) * args.max_seq_length
+        # Split by chunks of max_len.
+        # TODO: add sentence/paragraph boundary respecter..
+        result = {
+            k: [t[i : i + args.max_seq_length] for i in range(0, total_length, args.max_seq_length)]
+            for k, t in concatenated_examples.items()
+        }
+        return result
+    
     # Load tokenizer
     tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name_or_path)
 
@@ -83,18 +99,28 @@ def prep_fn(args):
         dataset = load_dataset(args.dataset_dir, streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
 
         def tokenize_function(examples):
+            # here you can actually add a chunker to split the text into smaller parts, of max_len
             return tokenizer(examples["text"], 
                              truncation=True, 
                              max_length=args.max_seq_length, 
                              padding=True) #"max_length")
 
-        tokenized_dataset = dataset.map(tokenize_function,
+        tokenized_dataset_raw = dataset.map(tokenize_function,
                                          batched=True,
                                          remove_columns=["text",
                                                          "id",
                                                          "source",
                                                          "approx_token_counts_translated",
                                                          "approx_token_counts_original"])
+        
+        tokenized_dataset = tokenized_dataset_raw.map(
+                group_texts,
+                batched=True,
+                num_proc=4,
+                desc=f"Grouping texts in chunks of {args.max_seq_length}",
+            )
+        del tokenized_dataset_raw
+
 
     return tokenized_dataset, tokenizer
 
