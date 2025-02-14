@@ -374,7 +374,7 @@ def data_transfer_local(data, output_dir, file_name):
     # write to local
     local_file_path = os.path.join(output_dir, 'normalised_data.jsonl')
     with open(local_file_path, 'w') as f:
-        for entry in data:
+        for entry in tqdm.tqdm(data):
             json.dump(entry, f)
             f.write('\n')
     return True

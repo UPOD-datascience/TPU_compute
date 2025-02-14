@@ -20,9 +20,14 @@ pysbd = "^0.3.4"
 datasets = "^3.2.0"
 fsspec = "2023.9.2"
 gcsfs = "2023.9.2"
-torch = "^2.6.0"
+torch = { version = "2.6.0", source = "torch" }
 wandb = "^0.19.6"
 
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[[tool.poetry.source]]
+name = "torch"
+url = "https://download.pytorch.org/whl/cu124"
+priority = "supplemental"

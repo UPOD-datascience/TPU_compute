@@ -168,7 +168,8 @@ def train_fn(index, args):
             sharded_shuffled_dataset,
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
-            num_workers=0
+            num_workers=0,
+            shuffle=True
         )
     elif args.sharded_data:
         sharded_dataset = args.tokenized_datasets["train"].shard(num_shards=world_size(), index=global_ordinal())

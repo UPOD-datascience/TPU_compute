@@ -104,6 +104,7 @@ def prep_fn(args):
                              truncation=True, 
                              max_length=args.max_seq_length, 
                              padding=True) #"max_length")
+        opt_kwargs = {'num_proc': 8} if args.streaming_data==False else {}
 
         tokenized_dataset_raw = dataset.map(tokenize_function,
                                          batched=True,
@@ -111,17 +112,16 @@ def prep_fn(args):
                                                          "id",
                                                          "source",
                                                          "approx_token_counts_translated",
-                                                         "approx_token_counts_original"])
-        
+                                                         "approx_token_counts_original"],
+                                         **opt_kwargs)
+                                         
+        opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
         tokenized_dataset = tokenized_dataset_raw.map(
                 group_texts,
                 batched=True,
-                num_proc=4,
-                desc=f"Grouping texts in chunks of {args.max_seq_length}",
+                **opt_kwargs
             )
         del tokenized_dataset_raw
-
-
     return tokenized_dataset, tokenizer
 
 def get_optimizer(model, args):
@@ -177,7 +177,9 @@ def evaluate(model, dataloader, device):
 def train_fn(index, args):
     # Set up device for GPU (or CPU if no GPU available)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    print(f"Running on {device}")
+    print(50*"+")
+    
     # Initialize wandb for the master process (we use index==0 as master)
     if index == 0:        
         wandb.init(
@@ -241,7 +243,7 @@ def train_fn(index, args):
         batch_size=args.per_device_train_batch_size,
         collate_fn=data_collator
     )
-
+    
     del args.tokenized_datasets
     gc.collect()
 
