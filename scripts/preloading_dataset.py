@@ -24,7 +24,7 @@ argparser.add_argument("--max_seq_length", type=int, required=True, help="Maximu
 argparser.add_argument("--write_mode", type=str, required=True, choices=["jsonl", "parquet"], help="Format to save the preprocessed dataset.")
 argparser.add_argument("--debug_mode", action="store_true", help="Run the script in debug mode.")
 argparser.add_argument('--autotokenizer', type=bool, default=False, help='Automatically download and cache the tokenizer from the Hugging Face model hub.')
-
+argparser.add_argument('--validation_only', type=bool, default=False, help='Only preprocess the validation data.')
 args = argparser.parse_args()
 
 print(f"Checking if save_dir_local exists and otherwise make...")
@@ -72,19 +72,20 @@ client = storage.Client.from_service_account_json('../gsa.json')
 bucket = client.get_bucket(args.data_bucket.split('gs://')[-1])
 
 local_train_files = []
-counter = 0
-print(f"Downloading training data from {args.train_loc}...")
-for blob in bucket.list_blobs(prefix=args.train_loc.split('gs://')[-1].split("/")[1]):
-    local_file_path = os.path.join(train_loc_dir, blob.name.split('/')[-1])
-    current_files = os.listdir(train_loc_dir)
-    local_train_files = [os.path.join(train_loc_dir, f) for f in current_files]
-    if ('.json' in local_file_path) and (local_file_path.split('/')[-1] not in current_files):
-        print(f'Downloading to {local_file_path}')
-        blob.download_to_filename(local_file_path)
-        local_train_files.append(local_file_path)
-        counter += 1
-        if (counter == 1) & (args.debug_mode):
-            break
+if args.validation_only==False:
+    counter = 0
+    print(f"Downloading training data from {args.train_loc}...")
+    for blob in bucket.list_blobs(prefix=args.train_loc.split('gs://')[-1].split("/")[1]):
+        local_file_path = os.path.join(train_loc_dir, blob.name.split('/')[-1])
+        current_files = os.listdir(train_loc_dir)
+        local_train_files = [os.path.join(train_loc_dir, f) for f in current_files]
+        if ('.json' in local_file_path) and (local_file_path.split('/')[-1] not in current_files):
+            print(f'Downloading to {local_file_path}')
+            blob.download_to_filename(local_file_path)
+            local_train_files.append(local_file_path)
+            counter += 1
+            if (counter == 1) & (args.debug_mode):
+                break
 
 local_validation_files = []
 counter = 0
