@@ -268,6 +268,7 @@ def train_fn(index, args):
     for epoch in range(args.num_train_epochs):
         total_loss = 0.
         sub_total_loss = 0.
+        sub_step = 0
         model.train()
         for step, batch in enumerate(train_loader):
             # Move batch to device
