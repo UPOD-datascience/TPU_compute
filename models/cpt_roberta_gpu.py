@@ -267,6 +267,7 @@ def train_fn(index, args):
     total_step = 0
     for epoch in range(args.num_train_epochs):
         total_loss = 0.
+        sub_total_loss = 0.
         model.train()
         for step, batch in enumerate(train_loader):
             # Move batch to device
@@ -276,26 +277,36 @@ def train_fn(index, args):
             loss.backward()
 
             total_loss += loss.item()
+            sub_total_loss += loss.item()
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 optimizer.step()  # Replaces xm.optimizer_step(optimizer)
                 scheduler.step()
                 optimizer.zero_grad()
-                total_step += args.gradient_accumulation_steps
 
             if (step + 1) % max(args.logging_steps, args.gradient_accumulation_steps) == 0:
                 global_avg_loss = total_loss / step
+                global_avg_loss_N = sub_total_loss / sub_step
                 perplexity = math.exp(global_avg_loss)
+                perplexity_N = math.exp(global_avg_loss_N)
                 print(f"Epoch {epoch+1}, step {step}, loss: {global_avg_loss}, train perplexity: {perplexity}")
-
+                
+                sub_step = 0
+                sub_total_loss = 0.
+                
                 if index == 0:
                     wandb.log({
-                        "train_global_average_loss": global_avg_loss,
-                        "train_perplexity": perplexity,
+                        "train_global_average_loss_epoch": global_avg_loss,
+                        f"train_global_average_loss_N{args.logging_steps}": global_avg_loss_N,
+                        "train_perplexity_epoch": perplexity,
+                        f"train_perplexity_epoch_N{args.logging_steps}": perplexity_N,
                         "epoch": epoch,
                         "step": step,
                         "total_step": total_step
                     })
+                    
+            total_step += 1
+            sub_step +=1
 
             if (index == 0) and (step % save_steps == 0) and (step > 0):
                 print("Saving model...")
