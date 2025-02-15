@@ -59,7 +59,7 @@ class ShardedShuffleDataset(torch.utils.data.IterableDataset):
         while buffer:
             yield buffer.pop(0)
 
-        
+
 def prep_fn(args):
     def group_texts(examples):
         # Concatenate all texts.
@@ -75,7 +75,7 @@ def prep_fn(args):
             for k, t in concatenated_examples.items()
         }
         return result
-    
+
     # Load tokenizer
     tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name_or_path)
 
@@ -87,22 +87,22 @@ def prep_fn(args):
             "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.json"
         }
         tokenized_dataset = load_dataset(
-            "json", 
-            data_files=datasets, 
-            streaming=args.streaming_data, 
+            "json",
+            data_files=datasets,
+            streaming=args.streaming_data,
             keep_in_memory=args.keep_in_memory
         )
     else:
         print("Tokenizing dataset...", flush=True)
         datasets = {"train": args.dataset_dir+f"/train/*.json",
-                    "validation": args.dataset_dir+f"/validation/*.json"}   
+                    "validation": args.dataset_dir+f"/validation/*.json"}
         dataset = load_dataset(args.dataset_dir, streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
 
         def tokenize_function(examples):
             # here you can actually add a chunker to split the text into smaller parts, of max_len
-            return tokenizer(examples["text"], 
-                             truncation=True, 
-                             max_length=args.max_seq_length, 
+            return tokenizer(examples["text"],
+                             truncation=True,
+                             max_length=args.max_seq_length,
                              padding=True) #"max_length")
         opt_kwargs = {'num_proc': 8} if args.streaming_data==False else {}
 
@@ -114,7 +114,7 @@ def prep_fn(args):
                                                          "approx_token_counts_translated",
                                                          "approx_token_counts_original"],
                                          **opt_kwargs)
-                                         
+
         opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
         tokenized_dataset = tokenized_dataset_raw.map(
                 group_texts,
@@ -141,7 +141,7 @@ def get_optimizer(model, args):
             "weight_decay": 0.0,
         },
     ]
-    
+
     optimizer = torch.optim.AdamW(
         optimizer_grouped_parameters,
         lr=args.learning_rate,
@@ -179,9 +179,9 @@ def train_fn(index, args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running on {device}")
     print(50*"+")
-    
+
     # Initialize wandb for the master process (we use index==0 as master)
-    if index == 0:        
+    if index == 0:
         wandb.init(
             project="RoBERTa GPU CPT",
             config={
@@ -200,7 +200,7 @@ def train_fn(index, args):
 
     # Set up data collator
     data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
-                                                     mlm=True, 
+                                                     mlm=True,
                                                      mlm_probability=0.15)
 
     # For GPU training, assume a single process (non-distributed)
@@ -225,17 +225,11 @@ def train_fn(index, args):
             shuffle=True
         )
     else:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            args.tokenized_datasets["train"],
-            num_replicas=sampler_replicas,
-            rank=sampler_rank,
-            shuffle=True
-        )
         train_dataloader = torch.utils.data.DataLoader(
             args.tokenized_datasets["train"],
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
-            sampler=train_sampler
+            shuffle=True
         )
 
     validation_dataloader = torch.utils.data.DataLoader(
@@ -243,7 +237,7 @@ def train_fn(index, args):
         batch_size=args.per_device_train_batch_size,
         collate_fn=data_collator
     )
-    
+
     del args.tokenized_datasets
     gc.collect()
 
@@ -257,7 +251,7 @@ def train_fn(index, args):
     save_steps = int(steps_per_epoch * args.save_epoch_percentage)
     total_steps = steps_per_epoch * args.num_train_epochs
     scheduler = get_linear_schedule_with_warmup(optimizer,
-                                                 num_warmup_steps=args.num_warmup_steps, 
+                                                 num_warmup_steps=args.num_warmup_steps,
                                                  num_training_steps=total_steps)
 
     if index == 0:

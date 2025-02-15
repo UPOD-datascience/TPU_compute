@@ -96,17 +96,17 @@ def prep_fn(args):
         tokenized_dataset = load_dataset("json", data_files=datasets, streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
     else:
         datasets = {"train": args.dataset_dir+f"/train/*.json",
-                    "validation": args.dataset_dir+f"/validation/*.json"}    
+                    "validation": args.dataset_dir+f"/validation/*.json"}
         dataset = load_dataset(args.dataset_dir, streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
 
         def tokenize_function(examples):
-            return tokenizer(examples["text"], truncation=True, 
+            return tokenizer(examples["text"], truncation=True,
                              max_length=args.max_seq_length, padding="max_length")
 
-        tokenized_dataset = dataset.map(tokenize_function, 
-                                        batched=True, 
+        tokenized_dataset = dataset.map(tokenize_function,
+                                        batched=True,
                                         remove_columns=["text",
-                                                         "id", 
+                                                         "id",
                                                          "source",
                                                          "approx_token_counts_translated",
                                                          "approx_token_counts_original"])
@@ -153,6 +153,7 @@ def train_fn(index, args):
         sampler_replicas = world_size()
 
     # Create sampler
+    distributed_sampler = False
     if args.streaming_data:
         num_shards = world_size()  # Total number of TPU cores (or processes)
         shard_id = global_ordinal()  # Unique id for the current process
@@ -181,6 +182,7 @@ def train_fn(index, args):
             shuffle=True
         )
     else:
+        distributed_sampler = True
         train_sampler = torch.utils.data.distributed.DistributedSampler(
             args.tokenized_datasets["train"],
             num_replicas=sampler_replicas,
@@ -226,12 +228,16 @@ def train_fn(index, args):
     for epoch in range(args.num_train_epochs):
         total_loss = 0.
         model.train()
+
+        if distributed_sampler:
+            train_sampler.set_epoch(epoch)
+
         for step, batch in enumerate(xla_train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
             outputs = model(**batch)
             loss = outputs.loss
             loss.backward()
-            
+
             total_loss +=loss.item()
 
             if  (step+1) % args.gradient_accumulation_steps == 0:

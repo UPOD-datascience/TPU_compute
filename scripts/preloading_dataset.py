@@ -116,13 +116,17 @@ print("Loading dataset...")
 # per file in the list we create a dataset
 # raw_datasets = {'train': [dataset1, dataset2, ...], 'validation': [dataset1, dataset2, ...]}
 #
-def create_dataset_from_file(filename):
-    return Dataset.from_file(filename, features=features,
-        keep_in_memory=False, streaming=True, num_proc=None)
+def create_dataset_from_file(filename, split='train'):
+    return load_dataset("json",
+                        data_files={split: filename},
+                        features=features,
+                        keep_in_memory=False,
+                        streaming=True,
+                        num_proc=None)
 
 raw_datasets = {
-    'train': [(create_dataset_from_file(file), os.path.splitext(os.path.basename(file))[0]) for file in data_files['train']],
-    'validation': [(create_dataset_from_file(file), os.path.splitext(os.path.basename(file))[0]) for file in data_files['validation']]
+    'train':      [(create_dataset_from_file(file, 'train'),      os.path.splitext(os.path.basename(file))[0]) for file in data_files['train']],
+    'validation': [(create_dataset_from_file(file, 'validation'), os.path.splitext(os.path.basename(file))[0]) for file in data_files['validation']]
 }
 
 segmenter = pysbd.Segmenter(language="nl", clean=True)
@@ -191,9 +195,9 @@ def chunk_text(example):
         }]
 
 # Assume raw_datasets has been loaded as before.
-def chunked_examples_generator(raw_datasets, split_name):
-    assert(split_name is not None)
-    for example in tqdm.tqdm(raw_datasets[split_name]):
+def chunked_examples_generator(raw_dataset, split):
+    assert split is not None, "Split should be set to train or validation"
+    for example in tqdm.tqdm(raw_dataset[split]):
         chunks = chunk_text(example)  # This returns a list of dicts.
         for chunk in chunks:
             yield chunk
@@ -228,10 +232,11 @@ train_files = []
 if args.write_mode == 'parquet':
     # TODO: loop over all datasets in raw_datasets['train'], check that the output file does not exist
     for dataset, dataset_name in raw_datasets['train']:
-        if not any([dataset in ef for ef in existing_files]):
+        if not any([dataset_name in ef for ef in existing_files]):
             output_file_train = os.path.join(args.save_dir_local, f'{dataset_name}_chunked_train_{args.max_seq_length}.parquet')
+            print(f"Writing {dataset_name} for train")
             if not os.path.exists(output_file_train):
-                write_chunks_to_parquet(chunked_examples_generator(dataset, "train"), output_file_train)
+                write_chunks_to_parquet(chunked_examples_generator(dataset, 'train'), output_file_train)
                 train_files.append((output_file_train,dataset_name))
             else:
                 print(f"{output_file_train} already exists locally, skipping chunking.")
@@ -240,10 +245,11 @@ if args.write_mode == 'parquet':
 
 elif args.write_mode == 'jsonl':
     for dataset, dataset_name in raw_datasets['train']:
-        if not any([dataset in ef for ef in existing_files]):
+        if not any([dataset_name in ef for ef in existing_files]):
             output_file_train = os.path.join(args.save_dir_local, f'{dataset_name}_chunked_train_{args.max_seq_length}.jsonl')
+            print(f"Writing {dataset_name} for train")
             if not os.path.exists(output_file_train):
-                write_chunks_to_disk(chunked_examples_generator(dataset, "train"), output_file_train)
+                write_chunks_to_disk(chunked_examples_generator(dataset, 'train'), output_file_train)
                 train_files.append((output_file_train,dataset_name))
             else:
                 print(f"{output_file_train} already exists, skipping chunking.")
@@ -256,10 +262,11 @@ print("Chunking validation dataset manually...")
 validation_files = []
 if args.write_mode == 'parquet':
     for dataset, dataset_name in raw_datasets['validation']:
-        if not any([dataset in ef for ef in existing_files]):
+        if not any([dataset_name in ef for ef in existing_files]):
             output_file_validation = os.path.join(args.save_dir_local, f'{dataset_name}_chunked_validation_{args.max_seq_length}.parquet')
+            print(f"Writing {dataset_name} for validation")
             if not os.path.exists(output_file_validation):
-                write_chunks_to_parquet(chunked_examples_generator(dataset, "validation"), output_file_validation)
+                write_chunks_to_parquet(chunked_examples_generator(dataset, 'validation'), output_file_validation)
                 validation_files.append((output_file_validation,dataset_name))
             else:
                 print(f"{output_file_validation} already exists, skipping chunking.")
@@ -267,10 +274,11 @@ if args.write_mode == 'parquet':
             print(f"{dataset_name} already exists in the GCS bucket, skipping chunking.")
 elif args.write_mode == 'jsonl':
     for dataset, dataset_name in raw_datasets['validation']:
-        if not any([dataset in ef for ef in existing_files]):
+        if not any([dataset_name in ef for ef in existing_files]):
             output_file_validation = os.path.join(args.save_dir_local, f'{dataset_name}_chunked_validation_{args.max_seq_length}.jsonl')
+            print(f"Writing {dataset_name} for validation")
             if not os.path.exists(output_file_validation):
-                write_chunks_to_disk(chunked_examples_generator(dataset, "validation"), output_file_validation)
+                write_chunks_to_disk(chunked_examples_generator(dataset, 'validation'), output_file_validation)
                 validation_files.append((output_file_validation,dataset_name))
             else:
                 print(f"{output_file_validation} already exists, skipping chunking.")

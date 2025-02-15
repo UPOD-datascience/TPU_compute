@@ -8,6 +8,7 @@ python3 preloading_dataset.py  \
   --data_bucket=${DATA_BUCKET} \
   --train_loc=${DATA_BUCKET_TRAIN_NORMALISED} \
   --validation_loc=${DATA_BUCKET_VAL_NORMALISED} \
+  --validation_only=True \
   --save_dir_local=${LOCAL_DATA} \
   --save_dir_gcs=${DATA_BUCKET} \
   --autotokenizer=${AUTO_TOKENIZER} \
