@@ -14,15 +14,14 @@ sudo apt-get install libffi-dev
 pip install torch~=2.5.0 torch_xla[tpu]~=2.5.0 -f https://storage.googleapis.com/libtpu-releases/index.html -f https://storage.googleapis.com/libtpu-wheels/index.html"
 
 # echo "Installing libraries..."
-# gcloud compute tpus tpu-vm ssh ${TPU_NAME}  \
-# --project ${PROJECT_ID} \
-# --zone  ${ZONE} \
-# --worker=all \
-# --command="
+gcloud compute tpus tpu-vm ssh ${TPU_NAME}  \
+ --project ${PROJECT_ID} \
+ --zone  ${ZONE} \
+ --worker=all \
+ --command="pip install google-cloud-storage"
 # pip install google-cloud
 # pip install google-cloud-tpu
 # pip install google-cloud-storage
-# "
 
 echo "Installing more libraries..."
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -31,8 +30,8 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all --command="
 pip install transformers tokenizers datasets tqdm wandb
 pip install accelerate>=0.26.0
-pip install gcsfs==2023.9.2
-pip install fsspec==2023.9.2"
+pip install gcsfs==2024.10.0
+pip install fsspec==2024.10.0"
 
 echo "Cloning XLA..."
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
