@@ -15,7 +15,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
     --worker=all \
-    --command="rm -rf /home/bes3/.cache/huggingface/datasets/json/*"
+    --command="rm -rf /home/bes3/.cache/huggingface"
 
 echo "Stopping all running processes..."
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -41,11 +41,11 @@ nohup gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --save_epoch_percentage=0.5 \
   --logging_steps=100 \
   --num_warmup_steps=5000 \
-  --num_cores=2 \
+  --num_cores=8 \
   --max_seq_length=${MAX_SEQ_LEN} \
   --learning_rate=0.0001 \
-  --keep_in_memory \
-  --sharded_data \
+  --streaming_data \
+  --shuffle_dataset \
   --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
   --shuffle_buffer_size=100_000 \
   --max_steps_per_epoch=100_000 \

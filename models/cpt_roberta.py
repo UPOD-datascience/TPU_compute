@@ -19,6 +19,7 @@ from transformers import get_linear_schedule_with_warmup
 from datasets import load_dataset, DatasetDict
 import wandb
 import os
+import sys
 import tempfile
 import subprocess
 import copy
@@ -46,6 +47,7 @@ def shuffle_and_save_dataset(dataset, output_path, seed=42):
         'train': shuffled_train,
         'validation': dataset['validation']
     })
+    xm.master_print("Saving shuffled data to disk")
     shuffled_dataset.save_to_disk(output_path)
     print(f"Shuffled dataset saved to {output_path}", flush=True)
 
@@ -100,7 +102,7 @@ def prep_fn(args):
 
     # Load and tokenize dataset
     if args.pre_tokenized:
-        print("Loading pre-tokenized dataset...", flush=True)
+        xm.master_print("Loading pre-tokenized dataset...")
         datasets = {
             "train": args.dataset_dir + f"/train_{args.max_seq_length}.{args.dataset_format}",
             "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.{args.dataset_format}"
@@ -120,13 +122,14 @@ def prep_fn(args):
                 keep_in_memory=True,
             )
     else:
-        print(f"Tokenizing dataset... with streaming: {args.streaming_data} and keep_in_memory: {args.keep_in_memory}", flush=True)
-        print(f"Dataset location: {args.dataset_dir}", flush=True)
+        xm.master_print(f"Tokenizing dataset... with streaming: {args.streaming_data} and keep_in_memory: {args.keep_in_memory}")
+        xm.master_print(f"Dataset location: {args.dataset_dir}")
 
         datasets = {"train": args.dataset_dir+f"/train/*.{args.dataset_format}",
                     "validation": args.dataset_dir+f"/validation/*.{args.dataset_format}"}
 
         if args.streaming_data:
+            xm.master_print("Init streaming dataset...")
             dataset = load_dataset(
                     args.dataset_format,
                     data_files=datasets,
@@ -134,6 +137,7 @@ def prep_fn(args):
                     keep_in_memory=False
                 ).shuffle(buffer_size=args.shuffle_buffer_size)
         else:
+            xm.master_print("Init non-streaming dataset...")
             dataset = load_dataset(
                     args.dataset_format,
                     data_files=datasets,
@@ -147,6 +151,7 @@ def prep_fn(args):
                              max_length=args.max_seq_length,
                              padding=True) #"max_length")
         opt_kwargs = {'num_proc': args.num_cores} if args.streaming_data==False else {}
+        xm.master_print("Tokenizing dataset...")
         tokenized_dataset_raw = dataset.map(tokenize_function,
                                          batched=True,
                                          remove_columns=["text",
@@ -157,6 +162,7 @@ def prep_fn(args):
                                          **opt_kwargs)
 
         opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
+        xm.master_print("Performing chunking tokenized data...")
         tokenized_dataset = tokenized_dataset_raw.map(
                 group_texts,
                 batched=True,
@@ -189,10 +195,12 @@ def train_fn(index, args):
     #config = RobertaConfig.from_pretrained(args.model_name)
 
     # Load pre-trained model
+    xm.master_print("Loading the LM ...")
     model = RobertaForMaskedLM.from_pretrained(args.model_name)#, config=config)
     model.to(device)
 
     # Set up data collator
+    xm.master_print("Setting up data collator...")
     data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
                                                     mlm=True, mlm_probability=0.15)
 
@@ -210,24 +218,27 @@ def train_fn(index, args):
         num_shards = world_size()  # Total number of TPU cores (or processes)
         shard_id = global_ordinal()  # Unique id for the current process
 
-        sharded_shuffled_dataset = ShardedShuffleDataset(
-            args.tokenized_datasets["train"],
-            num_shards=num_shards,
-            shard_id=shard_id,
-            shuffle_buffer_size=args.shuffle_buffer_size,
-            max_steps=args.max_steps_per_epoch
-        )
+        # xm.master_print("Starting the ShardedShuffleDataset...")
+        # sharded_shuffled_dataset = ShardedShuffleDataset(
+        #     args.tokenized_datasets["train"],
+        #     num_shards=num_shards,
+        #     shard_id=shard_id,
+        #     shuffle_buffer_size=args.shuffle_buffer_size,
+        #     max_steps=args.max_steps_per_epoch
+        # )
 
+        xm.master_print("Starting the DataLoader...")
         train_dataloader = torch.utils.data.DataLoader(
-            sharded_shuffled_dataset,
+            args.tokenized_datasets["train"],
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
             num_workers=0,
-            shuffle=False
+            shuffle=True
         )
     elif args.sharded_data:
         sharded_dataset = args.tokenized_datasets["train"].shard(num_shards=world_size(), index=global_ordinal())
 
+        xm.master_print("Starting the DataLoader...")
         train_dataloader = torch.utils.data.DataLoader(
             sharded_dataset,
             batch_size=args.per_device_train_batch_size,
@@ -235,6 +246,7 @@ def train_fn(index, args):
             shuffle=True
         )
     else:
+        xm.master_print("Starting the DistributedSampler...")
         distributed_sampler = True
         train_sampler = torch.utils.data.distributed.DistributedSampler(
             args.tokenized_datasets["train"],
@@ -243,6 +255,7 @@ def train_fn(index, args):
             shuffle=True
         )
         # Create dataloaders
+        xm.master_print("Starting the DataLoader...")
         train_dataloader = torch.utils.data.DataLoader(
             args.tokenized_datasets["train"],
             batch_size=args.per_device_train_batch_size,
@@ -470,20 +483,30 @@ def main():
 
     if args.shuffle_dataset:
         if xm.is_master_ordinal():
-            print("Loading dataset for shuffling...")
+            xm.master_print("Loading dataset for shuffling...")
+
             dataset = load_dataset(args.dataset_format, data_files={
                 "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
                 "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
-            })
-            print("Shuffling and saving dataset...")
-            shuffle_and_save_dataset(dataset,
-                args.shuffled_dataset_path)
+            }, keep_in_memory=True)
+
+            xm.master_print("Clearing cache!")
+            cache_dir = os.path.expanduser("~/.cache/huggingface")
+            if os.path.exists(cache_dir):
+                xm.master_print(f"Removing Hugging Face cache directory: {cache_dir}")
+                shutil.rmtree(cache_dir)
+            else:
+                xm.master_print("Hugging Face cache directory not found.")
+
+            xm.master_print("Shuffling and saving dataset...")
+            shuffle_and_save_dataset(dataset, args.shuffle_dataset_path)
+
 
             # Make sure all processes wait for the shuffling to complete
             xm.rendezvous("dataset_shuffled")
 
             # Update the dataset directory to the shuffled dataset path
-            args.dataset_dir = args.shuffled_dataset_path
+            args.dataset_dir = args.shuffle_dataset_path
 
             # Clear the dataset from memory
             del dataset
