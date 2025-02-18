@@ -262,6 +262,7 @@ def train_fn(index, args):
         print(f"Total steps: {total_steps}", flush=True)
         print(f"Total epochs: {args.num_train_epochs}", flush=True)
         print(f"Total warmup steps: {args.num_warmup_steps}", flush=True)
+        print(f"Saving model every: {save_steps}", flush=True)
 
     # Training loop
     total_step = 0

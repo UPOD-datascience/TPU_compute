@@ -22,16 +22,16 @@ $cmd = 'cd /d ' + $env:FULL_SCRIPT_DIR + ' && poetry run python ../models/cpt_ro
        '--tokenizer_name_or_path=' + $env:TOKENIZER_PATH + ' ' +
        '--per_device_train_batch_size=32 ' +
        '--gradient_accumulation_steps=10 ' +
-       '--save_epoch_percentage=0.5 ' +
-       '--logging_steps=100 ' +
-       '--num_warmup_steps=2000 ' +
+       '--save_epoch_percentage=0.05 ' +
+       '--logging_steps=500 ' +
+       '--num_warmup_steps=25_000 ' +
        '--num_cores=8 ' +
        '--max_seq_length=' + $env:MAX_SEQ_LEN + ' ' +
        '--learning_rate=0.0001 ' +
        '--keep_in_memory ' +
        '--weight_decay=0.001 ' +
        '--wandb_key=' + $env:WANDB_KEY + ' ' +
-       '--num_train_epochs=10'
+       '--num_train_epochs=3'
 
 Start-Process -NoNewWindow -FilePath "cmd.exe" -ArgumentList "/c", $cmd -Wait
 Write-Output "Training started."
