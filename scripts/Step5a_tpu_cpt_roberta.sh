@@ -15,7 +15,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
     --worker=all \
-    --command="rm -rf /home/bes3/.cache/huggingface/datasets/json/*"
+    --command="rm -rf /home/bes3/.cache/huggingface"
 
 echo "Stopping all running processes..."
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -31,6 +31,7 @@ nohup gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --worker=all \
   --command="nohup python3 /home/${USERNAME}/models/cpt_roberta.py  \
   --dataset_dir=${DATASET_FOLDER} \
+  --dataset_format=${DATASET_FORMAT} \
   --tmp_dir=${TMP_DIR} \
   --output_dir=${MODEL_BUCKET} \
   --model_name=${MODEL_NAME} \
@@ -38,15 +39,16 @@ nohup gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --per_device_train_batch_size=32 \
   --gradient_accumulation_steps=4 \
   --save_epoch_percentage=0.5 \
-  --logging_steps=5 \
-  --num_warmup_steps=2000 \
+  --logging_steps=100 \
+  --num_warmup_steps=5000 \
   --num_cores=8 \
-  --pre_tokenized \
   --max_seq_length=${MAX_SEQ_LEN} \
   --learning_rate=0.0001 \
-  --keep_in_memory \
-  --sharded_data \
-  --shuffle_buffer_size=10_000 \
+  --streaming_data \
+  --shuffle_dataset \
+  --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
+  --shuffle_buffer_size=100_000 \
+  --max_steps_per_epoch=100_000 \
   --weight_decay=0.001 \
   --wandb_key=${WANDB_KEY} \
   --num_train_epochs=5 2>&1 | tee ~/logs.txt &" &

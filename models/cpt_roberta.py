@@ -16,9 +16,10 @@ DataCollatorForLanguageModeling
 from transformers import Trainer, TrainingArguments
 from transformers import get_linear_schedule_with_warmup
 
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 import wandb
 import os
+import sys
 import tempfile
 import subprocess
 import copy
@@ -28,6 +29,8 @@ import gc
 import datetime
 import shutil
 import numpy as np
+from gcsfs import GCSFileSystem
+import fsspec
 
 try:
     os.environ.pop('TPU_PROCESS_ADDRESSES')
@@ -35,82 +38,137 @@ try:
 except:
     print("No TPU_PROCESS_ADDRESSES or CLOUD_TPU_TASK_ID to remove")
 
-# class ShardedShuffleDataset(IterableDataset):
-#     def __init__(self, dataset, num_shards, shard_id, shuffle_buffer_size):
-#         self.dataset = dataset
-#         self.num_shards = num_shards
-#         self.shard_id = shard_id
-#         self.shuffle_buffer_size = shuffle_buffer_size
+def shuffle_and_save_dataset(dataset, output_path, seed=42):
+    # Shuffle only the training dataset
+    shuffled_train = dataset['train'].shuffle(seed=seed)
 
-#     def __iter__(self):
-#         sharded_data = itertools.islice(self.dataset, self.shard_id, None, self.num_shards)
-
-#         buffer = []
-#         for item in itertools.cycle(sharded_data):  # Use cycle to repeat the dataset
-#             buffer.append(item)
-#             if len(buffer) >= self.shuffle_buffer_size:
-#                 random.shuffle(buffer)
-#                 while len(buffer) > self.shuffle_buffer_size // 2:
-#                     yield buffer.pop(0)
+    # Save the shuffled training dataset and the original validation dataset
+    shuffled_dataset = DatasetDict({
+        'train': shuffled_train,
+        'validation': dataset['validation']
+    })
+    xm.master_print("Saving shuffled data to disk")
+    shuffled_dataset.save_to_disk(output_path)
+    print(f"Shuffled dataset saved to {output_path}", flush=True)
 
 class ShardedShuffleDataset(torch.utils.data.IterableDataset):
-    def __init__(self, dataset, num_shards, shard_id, shuffle_buffer_size):
+    def __init__(self, dataset, num_shards, shard_id, shuffle_buffer_size, max_steps=None, batch_size=1):
         self.dataset = dataset
         self.num_shards = num_shards
         self.shard_id = shard_id
         self.shuffle_buffer_size = shuffle_buffer_size
+        self.max_steps = max_steps
+        self.batch_size = batch_size
 
     def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:
-            iter_start = self.shard_id
-            iter_end = None
-        else:
-            per_worker = int(math.ceil((self.num_shards - self.shard_id) / float(worker_info.num_workers)))
-            worker_id = worker_info.id
-            iter_start = self.shard_id + worker_id * per_worker
-            iter_end = min(iter_start + per_worker, self.num_shards)
-
         buffer = []
+        items_yielded = 0
+        max_items = self.max_steps * self.batch_size if self.max_steps is not None else float('inf')
+
         for i, item in enumerate(self.dataset):
+            if items_yielded >= max_items:
+                break
             if i % self.num_shards == self.shard_id:
                 buffer.append(item)
                 if len(buffer) >= self.shuffle_buffer_size:
                     random.shuffle(buffer)
-                    while len(buffer) > self.shuffle_buffer_size // 2:
+                    while buffer and items_yielded < max_items:
+                        items_yielded += 1
                         yield buffer.pop(0)
 
         # Yield remaining items
         random.shuffle(buffer)
-        while buffer:
+        while buffer and items_yielded < max_items:
+            items_yielded += 1
             yield buffer.pop(0)
 
 def prep_fn(args):
+    def group_texts(examples):
+        # Concatenate all texts.
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        total_length = (total_length // args.max_seq_length) * args.max_seq_length
+        # Split by chunks of max_len.
+        # TODO: add sentence/paragraph boundary respecter..
+        # TODO: add a chunker that also store the last part of the previous chunk
+        result = {
+            k: [t[i : i + args.max_seq_length] for i in range(0, total_length, args.max_seq_length)]
+            for k, t in concatenated_examples.items()
+        }
+        return result
+
     # Load tokenizer
     tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name_or_path)
 
     # Load and tokenize dataset
     if args.pre_tokenized:
-        datasets = {"train": args.dataset_dir+f"/train_{args.max_seq_length}.json",
-                    "validation": args.dataset_dir+f"/validation_{args.max_seq_length}.json"}
-        tokenized_dataset = load_dataset("json", data_files=datasets, streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
+        xm.master_print("Loading pre-tokenized dataset...")
+        datasets = {
+            "train": args.dataset_dir + f"/train_{args.max_seq_length}.{args.dataset_format}",
+            "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.{args.dataset_format}"
+        }
+        if args.streaming_data:
+            tokenized_dataset = load_dataset(
+                args.dataset_format,
+                data_files=datasets,
+                streaming=True,
+                keep_in_memory=False,
+            ).shuffle(buffer_size=args.shuffle_buffer_size)
+        else:
+            tokenized_dataset = load_dataset(
+                args.dataset_format,
+                data_files=datasets,
+                streaming=False,
+                keep_in_memory=True,
+            )
     else:
-        datasets = {"train": args.dataset_dir+f"/train/*.json",
-                    "validation": args.dataset_dir+f"/validation/*.json"}
-        dataset = load_dataset(args.dataset_dir, streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
+        xm.master_print(f"Tokenizing dataset... with streaming: {args.streaming_data} and keep_in_memory: {args.keep_in_memory}")
+        xm.master_print(f"Dataset location: {args.dataset_dir}")
 
+        datasets = {"train": args.dataset_dir+f"/train/*.{args.dataset_format}",
+                    "validation": args.dataset_dir+f"/validation/*.{args.dataset_format}"}
+
+        if args.streaming_data:
+            xm.master_print("Init streaming dataset...")
+            dataset = load_dataset(
+                    args.dataset_format,
+                    data_files=datasets,
+                    streaming=True,
+                    keep_in_memory=False
+                ).shuffle(buffer_size=args.shuffle_buffer_size)
+        else:
+            xm.master_print("Init non-streaming dataset...")
+            dataset = load_dataset(
+                    args.dataset_format,
+                    data_files=datasets,
+                    streaming=False,
+                    keep_in_memory=True
+                )
         def tokenize_function(examples):
-            return tokenizer(examples["text"], truncation=True,
-                             max_length=args.max_seq_length, padding="max_length")
-
-        tokenized_dataset = dataset.map(tokenize_function,
-                                        batched=True,
-                                        remove_columns=["text",
+            # here you can actually add a chunker to split the text into smaller parts, of max_len
+            return tokenizer(examples["text"],
+                             truncation=True,
+                             max_length=args.max_seq_length,
+                             padding=True) #"max_length")
+        opt_kwargs = {'num_proc': args.num_cores} if args.streaming_data==False else {}
+        xm.master_print("Tokenizing dataset...")
+        tokenized_dataset_raw = dataset.map(tokenize_function,
+                                         batched=True,
+                                         remove_columns=["text",
                                                          "id",
                                                          "source",
                                                          "approx_token_counts_translated",
-                                                         "approx_token_counts_original"])
+                                                         "approx_token_counts_original"],
+                                         **opt_kwargs)
 
+        opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
+        xm.master_print("Performing chunking tokenized data...")
+        tokenized_dataset = tokenized_dataset_raw.map(
+                group_texts,
+                batched=True,
+                **opt_kwargs
+            )
+        del tokenized_dataset_raw
     return tokenized_dataset, tokenizer
 
 def train_fn(index, args):
@@ -137,10 +195,12 @@ def train_fn(index, args):
     #config = RobertaConfig.from_pretrained(args.model_name)
 
     # Load pre-trained model
+    xm.master_print("Loading the LM ...")
     model = RobertaForMaskedLM.from_pretrained(args.model_name)#, config=config)
     model.to(device)
 
     # Set up data collator
+    xm.master_print("Setting up data collator...")
     data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
                                                     mlm=True, mlm_probability=0.15)
 
@@ -158,15 +218,18 @@ def train_fn(index, args):
         num_shards = world_size()  # Total number of TPU cores (or processes)
         shard_id = global_ordinal()  # Unique id for the current process
 
-        sharded_shuffled_dataset = ShardedShuffleDataset(
-            args.tokenized_datasets["train"],
-            num_shards=num_shards,
-            shard_id=shard_id,
-            shuffle_buffer_size=args.shuffle_buffer_size
-        )
+        # xm.master_print("Starting the ShardedShuffleDataset...")
+        # sharded_shuffled_dataset = ShardedShuffleDataset(
+        #     args.tokenized_datasets["train"],
+        #     num_shards=num_shards,
+        #     shard_id=shard_id,
+        #     shuffle_buffer_size=args.shuffle_buffer_size,
+        #     max_steps=args.max_steps_per_epoch
+        # )
 
+        xm.master_print("Starting the DataLoader...")
         train_dataloader = torch.utils.data.DataLoader(
-            sharded_shuffled_dataset,
+            args.tokenized_datasets["train"],
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
             num_workers=0,
@@ -175,6 +238,7 @@ def train_fn(index, args):
     elif args.sharded_data:
         sharded_dataset = args.tokenized_datasets["train"].shard(num_shards=world_size(), index=global_ordinal())
 
+        xm.master_print("Starting the DataLoader...")
         train_dataloader = torch.utils.data.DataLoader(
             sharded_dataset,
             batch_size=args.per_device_train_batch_size,
@@ -182,6 +246,7 @@ def train_fn(index, args):
             shuffle=True
         )
     else:
+        xm.master_print("Starting the DistributedSampler...")
         distributed_sampler = True
         train_sampler = torch.utils.data.distributed.DistributedSampler(
             args.tokenized_datasets["train"],
@@ -190,6 +255,7 @@ def train_fn(index, args):
             shuffle=True
         )
         # Create dataloaders
+        xm.master_print("Starting the DataLoader...")
         train_dataloader = torch.utils.data.DataLoader(
             args.tokenized_datasets["train"],
             batch_size=args.per_device_train_batch_size,
@@ -227,6 +293,8 @@ def train_fn(index, args):
     total_step = 0
     for epoch in range(args.num_train_epochs):
         total_loss = 0.
+        sub_total_loss = 0.
+        sub_step = 0
         model.train()
 
         if distributed_sampler:
@@ -238,7 +306,8 @@ def train_fn(index, args):
             loss = outputs.loss
             loss.backward()
 
-            total_loss +=loss.item()
+            total_loss += loss.item()
+            sub_total_loss += loss.item()
 
             if  (step+1) % args.gradient_accumulation_steps == 0:
                 xm.optimizer_step(optimizer)
@@ -248,20 +317,33 @@ def train_fn(index, args):
                 total_step += args.gradient_accumulation_steps
 
             if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
-                local_avg_loss = total_loss / args.logging_steps
+                local_avg_loss = total_loss / step
+                local_avg_loss_N = sub_total_loss / sub_step
                 global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
-                perplexity = math.exp(global_avg_loss)
-                xm.master_print(f"Epoch {epoch+1}, step {step}, loss: {global_avg_loss}")
+                global_avg_loss_N = xm.mesh_reduce("loss_N", local_avg_loss_N, np.mean)
 
-                total_loss = 0.
+                perplexity = math.exp(global_avg_loss)
+                perplexity_N = math.exp(global_avg_loss_N)
+
+                xm.master_print(f"Epoch {epoch+1}, step {step}, loss: {global_avg_loss}, perplexity: {perplexity}")
+
+                sub_step = 0
+                sub_total_loss = 0.
+
                 if xm.is_master_ordinal():
                     wandb.log({
                         "train_global_average_loss": global_avg_loss,
+                        "train_global_average_loss_N": global_avg_loss_N,
                         "train_perplexity": perplexity,
+                        "train_perplexity_N": perplexity_N,
                         "epoch": epoch,
                         "step": step,
                         "total_step": total_step
                     })
+
+            total_step += 1
+            sub_step +=1
+
 
             if (global_ordinal() ==0) & (step % save_steps == 0):
                 xm.master_print("Saving model...")
@@ -361,6 +443,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--dataset_dir", type=str, required=True)
+    parser.add_argument("--dataset_format", default="json", choices=["json", "parquet"])
     parser.add_argument("--tmp_dir", type=str, required=True)
     parser.add_argument("--tokenizer_name_or_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
@@ -381,6 +464,8 @@ def main():
     parser.add_argument("--sharded_data", action='store_true')
     parser.add_argument("--max_steps_per_epoch", type=int, default=None)
     parser.add_argument("--shuffle_buffer_size", type=int, default=10_000)
+    parser.add_argument("--shuffle_dataset_path", type=str, default="/home/bob/tmp/shuffle.parquet")
+    parser.add_argument("--shuffle_dataset", action='store_true')
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
     args = parser.parse_args()
@@ -395,6 +480,39 @@ def main():
 
     # Set the same seed for all processes
     torch.manual_seed(args.seed)
+
+    if args.shuffle_dataset:
+        if xm.is_master_ordinal():
+            xm.master_print("Loading dataset for shuffling...")
+
+            dataset = load_dataset(args.dataset_format, data_files={
+                "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
+                "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
+            }, keep_in_memory=True)
+
+            xm.master_print("Clearing cache!")
+            cache_dir = os.path.expanduser("~/.cache/huggingface")
+            if os.path.exists(cache_dir):
+                xm.master_print(f"Removing Hugging Face cache directory: {cache_dir}")
+                shutil.rmtree(cache_dir)
+            else:
+                xm.master_print("Hugging Face cache directory not found.")
+
+            xm.master_print("Shuffling and saving dataset...")
+            shuffle_and_save_dataset(dataset, args.shuffle_dataset_path)
+
+
+            # Make sure all processes wait for the shuffling to complete
+            xm.rendezvous("dataset_shuffled")
+
+            # Update the dataset directory to the shuffled dataset path
+            args.dataset_dir = args.shuffle_dataset_path
+
+            # Clear the dataset from memory
+            del dataset
+            gc.collect()
+            print("Cleared shuffled dataset from master's memory")
+
     tokenized_dataset, tokenizer = prep_fn(args)
 
     # update args with traindata, valdata, tokenizer

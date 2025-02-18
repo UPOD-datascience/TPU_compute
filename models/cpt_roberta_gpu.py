@@ -27,38 +27,6 @@ import shutil
 import numpy as np
 from itertools import chain
 
-class ShardedShuffleDataset(torch.utils.data.IterableDataset):
-    def __init__(self, dataset, num_shards, shard_id, shuffle_buffer_size):
-        self.dataset = dataset
-        self.num_shards = num_shards
-        self.shard_id = shard_id
-        self.shuffle_buffer_size = shuffle_buffer_size
-
-    def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:
-            iter_start = self.shard_id
-            iter_end = None
-        else:
-            per_worker = int(math.ceil((self.num_shards - self.shard_id) / float(worker_info.num_workers)))
-            worker_id = worker_info.id
-            iter_start = self.shard_id + worker_id * per_worker
-            iter_end = min(iter_start + per_worker, self.num_shards)
-
-        buffer = []
-        for i, item in enumerate(self.dataset):
-            if i % self.num_shards == self.shard_id:
-                buffer.append(item)
-                if len(buffer) >= self.shuffle_buffer_size:
-                    random.shuffle(buffer)
-                    while len(buffer) > self.shuffle_buffer_size // 2:
-                        yield buffer.pop(0)
-
-        # Yield remaining items
-        random.shuffle(buffer)
-        while buffer:
-            yield buffer.pop(0)
-
 
 def prep_fn(args):
     def group_texts(examples):
@@ -292,10 +260,10 @@ def train_fn(index, args):
                 perplexity = math.exp(global_avg_loss)
                 perplexity_N = math.exp(global_avg_loss_N)
                 print(f"Epoch {epoch+1}, step {step}, loss: {global_avg_loss}, train perplexity: {perplexity}")
-                
+
                 sub_step = 0
                 sub_total_loss = 0.
-                
+
                 if index == 0:
                     wandb.log({
                         "train_global_average_loss_epoch": global_avg_loss,
@@ -306,7 +274,7 @@ def train_fn(index, args):
                         "step": step,
                         "total_step": total_step
                     })
-                    
+
             total_step += 1
             sub_step +=1
 
