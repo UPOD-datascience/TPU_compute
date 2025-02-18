@@ -32,13 +32,16 @@ import numpy as np
 from gcsfs import GCSFileSystem
 import fsspec
 
+from functools import partial
+
+
 try:
     os.environ.pop('TPU_PROCESS_ADDRESSES')
     os.environ.pop('CLOUD_TPU_TASK_ID')
 except:
     print("No TPU_PROCESS_ADDRESSES or CLOUD_TPU_TASK_ID to remove")
 
-def shuffle_and_save_dataset(dataset, output_path, seed=42):
+def shuffle_and_save_dataset(dataset, output_path, seed=7):
     # Shuffle only the training dataset
     shuffled_train = dataset['train'].shuffle(seed=seed)
 
@@ -47,9 +50,10 @@ def shuffle_and_save_dataset(dataset, output_path, seed=42):
         'train': shuffled_train,
         'validation': dataset['validation']
     })
-    xm.master_print("Saving shuffled data to disk")
+    print("Saving shuffled data to disk", flush=True)
     shuffled_dataset.save_to_disk(output_path)
     print(f"Shuffled dataset saved to {output_path}", flush=True)
+
 
 class ShardedShuffleDataset(torch.utils.data.IterableDataset):
     def __init__(self, dataset, num_shards, shard_id, shuffle_buffer_size, max_steps=None, batch_size=1):
@@ -82,6 +86,13 @@ class ShardedShuffleDataset(torch.utils.data.IterableDataset):
             items_yielded += 1
             yield buffer.pop(0)
 
+def tokenize_function(examples, tokenizer, max_seq_length):
+    # here you can actually add a chunker to split the text into smaller parts, of max_len
+    return tokenizer(examples["text"],
+                    truncation=True,
+                    max_length=max_seq_length,
+                    padding=True)
+
 def prep_fn(args):
     def group_texts(examples):
         # Concatenate all texts.
@@ -97,12 +108,9 @@ def prep_fn(args):
         }
         return result
 
-    # Load tokenizer
-    tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name_or_path)
-
     # Load and tokenize dataset
     if args.pre_tokenized:
-        xm.master_print("Loading pre-tokenized dataset...")
+        print("Loading pre-tokenized dataset...", flush=True)
         datasets = {
             "train": args.dataset_dir + f"/train_{args.max_seq_length}.{args.dataset_format}",
             "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.{args.dataset_format}"
@@ -122,14 +130,14 @@ def prep_fn(args):
                 keep_in_memory=True,
             )
     else:
-        xm.master_print(f"Tokenizing dataset... with streaming: {args.streaming_data} and keep_in_memory: {args.keep_in_memory}")
-        xm.master_print(f"Dataset location: {args.dataset_dir}")
+        print(f"Tokenizing dataset... with streaming: {args.streaming_data} and keep_in_memory: {args.keep_in_memory}", flush=True)
+        print(f"Dataset location: {args.dataset_dir}", flush=True)
 
         datasets = {"train": args.dataset_dir+f"/train/*.{args.dataset_format}",
                     "validation": args.dataset_dir+f"/validation/*.{args.dataset_format}"}
 
         if args.streaming_data:
-            xm.master_print("Init streaming dataset...")
+            print("Init streaming dataset...", flush=True)
             dataset = load_dataset(
                     args.dataset_format,
                     data_files=datasets,
@@ -137,22 +145,18 @@ def prep_fn(args):
                     keep_in_memory=False
                 ).shuffle(buffer_size=args.shuffle_buffer_size)
         else:
-            xm.master_print("Init non-streaming dataset...")
+            print("Init non-streaming dataset...", flush=True)
             dataset = load_dataset(
                     args.dataset_format,
                     data_files=datasets,
                     streaming=False,
                     keep_in_memory=True
                 )
-        def tokenize_function(examples):
-            # here you can actually add a chunker to split the text into smaller parts, of max_len
-            return tokenizer(examples["text"],
-                             truncation=True,
-                             max_length=args.max_seq_length,
-                             padding=True) #"max_length")
+
         opt_kwargs = {'num_proc': args.num_cores} if args.streaming_data==False else {}
-        xm.master_print("Tokenizing dataset...")
-        tokenized_dataset_raw = dataset.map(tokenize_function,
+        print("Tokenizing dataset...", flush=True)
+        tokenize_fn = partial(tokenize_function, tokenizer=args.tokenizer, max_seq_length=args.max_seq_length)
+        tokenized_dataset_raw = dataset.map(tokenize_fn,
                                          batched=True,
                                          remove_columns=["text",
                                                          "id",
@@ -162,14 +166,14 @@ def prep_fn(args):
                                          **opt_kwargs)
 
         opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
-        xm.master_print("Performing chunking tokenized data...")
+        print("Performing chunking tokenized data...", flush=True)
         tokenized_dataset = tokenized_dataset_raw.map(
                 group_texts,
                 batched=True,
                 **opt_kwargs
             )
         del tokenized_dataset_raw
-    return tokenized_dataset, tokenizer
+    return tokenized_dataset
 
 def train_fn(index, args):
     # Set up device
@@ -482,46 +486,41 @@ def main():
     torch.manual_seed(args.seed)
 
     if args.shuffle_dataset:
-        if xm.is_master_ordinal():
-            xm.master_print("Loading dataset for shuffling...")
+        print("Loading dataset for shuffling...", flush=True)
+        dataset = load_dataset(args.dataset_format, data_files={
+            "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
+            "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
+        }, keep_in_memory=True)
 
-            dataset = load_dataset(args.dataset_format, data_files={
-                "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
-                "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
-            }, keep_in_memory=True)
+        print("Clearing cache!", flush=True)
+        cache_dir = os.path.expanduser("~/.cache/huggingface")
+        if os.path.exists(cache_dir):
+            print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
+            shutil.rmtree(cache_dir)
+        else:
+            print("Hugging Face cache directory not found.", flush=True)
 
-            xm.master_print("Clearing cache!")
-            cache_dir = os.path.expanduser("~/.cache/huggingface")
-            if os.path.exists(cache_dir):
-                xm.master_print(f"Removing Hugging Face cache directory: {cache_dir}")
-                shutil.rmtree(cache_dir)
-            else:
-                xm.master_print("Hugging Face cache directory not found.")
+        print("Shuffling and saving dataset...", flush=True)
+        shuffle_and_save_dataset(dataset, args.shuffle_dataset_path)
 
-            xm.master_print("Shuffling and saving dataset...")
-            shuffle_and_save_dataset(dataset, args.shuffle_dataset_path)
+        # Update the dataset directory to the shuffled dataset path
+        # Clear the dataset from memory
+        del dataset
+        gc.collect()
+        print("Cleared shuffled dataset from master's memory")
 
+    args.tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name_or_path)
 
-            # Make sure all processes wait for the shuffling to complete
-            xm.rendezvous("dataset_shuffled")
-
-            # Update the dataset directory to the shuffled dataset path
-            args.dataset_dir = args.shuffle_dataset_path
-
-            # Clear the dataset from memory
-            del dataset
-            gc.collect()
-            print("Cleared shuffled dataset from master's memory")
-
-    tokenized_dataset, tokenizer = prep_fn(args)
-
+    tokenized_dataset = prep_fn(args)
     # update args with traindata, valdata, tokenizer
     args.tokenized_datasets = tokenized_dataset
-    args.tokenizer = tokenizer
 
     # Spawn processes
     print(f"Initializing TPU...with {args.num_cores} cores")
     print("Spawning processes...")
+
+    if args.shuffle_dataset:
+        args.dataset_dir = args.shuffle_dataset_path
 
     if args.num_cores == 1:
         print("Running single process...")
