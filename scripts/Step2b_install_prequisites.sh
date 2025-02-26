@@ -28,7 +28,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all --command="
-pip install transformers tokenizers datasets tqdm wandb
+pip install transformers tokenizers datasets tqdm wandb safetensors
 pip install accelerate>=0.26.0
 pip install gcsfs==2024.10.0
 pip install fsspec==2024.10.0"

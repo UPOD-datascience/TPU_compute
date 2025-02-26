@@ -20,12 +20,21 @@ set -e
 if [ $grep_exit_code -eq 0 ]; then
     echo "TPU ${TPU_NAME} already exists, skipping creation."
 else
-    echo "Creating TPU ${TPU_NAME}..."
+echo "Creating TPU ${TPU_NAME}..."
+if [ "${PRE_EMPTIBLE}" = true ]; then
+    gcloud compute tpus tpu-vm create "${TPU_NAME}" \
+      --zone="${ZONE}" \
+      --project="${PROJECT_ID}" \
+      --accelerator-type="${ACCELERATOR_TYPE}" \
+      --version "${RUNTIME_VERSION}" \
+      --preemptible
+else
     gcloud compute tpus tpu-vm create "${TPU_NAME}" \
       --zone="${ZONE}" \
       --project="${PROJECT_ID}" \
       --accelerator-type="${ACCELERATOR_TYPE}" \
       --version "${RUNTIME_VERSION}"
+fi
 fi
 
 gcloud compute tpus tpu-vm list --zone=${ZONE} --project=${PROJECT_ID}

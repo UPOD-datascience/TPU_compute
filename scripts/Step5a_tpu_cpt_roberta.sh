@@ -15,7 +15,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
     --worker=all \
-    --command="rm -rf /home/bes3/.cache/huggingface"
+    --command="rm -rf /home/bes3/.cache/*"
 
 echo "Stopping all running processes..."
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -37,22 +37,25 @@ nohup gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --model_name=${MODEL_NAME} \
   --tokenizer_name_or_path=/home/${USERNAME}/tokenizer \
   --per_device_train_batch_size=32 \
-  --gradient_accumulation_steps=4 \
-  --save_epoch_percentage=0.5 \
-  --logging_steps=100 \
+  --gradient_accumulation_steps=10 \
+  --save_epoch_percentage=0.25 \
+  --logging_steps=250 \
   --num_warmup_steps=5000 \
   --num_cores=8 \
   --max_seq_length=${MAX_SEQ_LEN} \
-  --learning_rate=0.0001 \
+  --learning_rate=0.0002 \
   --streaming_data \
   --shuffle_dataset \
   --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
-  --shuffle_buffer_size=100_000 \
-  --max_steps_per_epoch=100_000 \
+  --max_steps_per_epoch=50_000 \
   --weight_decay=0.001 \
   --wandb_key=${WANDB_KEY} \
+  --continue_from_checkpoint \
+  --checkpoint_path=gs://dutch_clinical_models/CLTL/MedRoBERTa.nl_epoch0_step19999_20250224/model.safetensors \
   --num_train_epochs=5 2>&1 | tee ~/logs.txt &" &
 disown
+
+
 
 # ideally you would launch a shell script on the workers like
 # nohup some_script.sh & exit
