@@ -58,7 +58,7 @@ print(f"TPU_WORKER_ID: {worker_id}")
 print(f"TPU_WORKER_HOSTNAMES for {worker_id}: {shards}")
 
 
-def shuffle_and_save_dataset(dataset, output_path, seed=123):
+def shuffle_and_save_dataset(dataset, output_path, seed=None):
     # Shuffle only the training dataset
     shuffled_train = dataset['train'].shuffle(seed=seed)
 
@@ -254,6 +254,17 @@ def prep_fn(args):
         del tokenized_dataset_raw
     return tokenized_dataset
 
+def safe_iter(iterable):
+    iterator = iter(iterable)
+    while True:
+        try:
+            yield next(iterator)
+        except StopIteration:
+            break
+        except Exception as e:
+            print(f"Error encountered in iteration: {e}")
+            continue
+
 def train_fn(tokenized_dataset, device, args):
     # Initialize wandb for the master process
     if global_ordinal() == 0: #.is_master_ordinal():
@@ -269,7 +280,8 @@ def train_fn(tokenized_dataset, device, args):
                 "max_seq_length": args.max_seq_length,
                 "batch_size": args.per_device_train_batch_size,
             },
-            mode="offline"
+            mode="offline",
+            dir="/home/bes3/temp"
         )
 
     # Load model configuration
@@ -380,6 +392,7 @@ def train_fn(tokenized_dataset, device, args):
 
     # Training loop
     total_step = 0
+    miss_steps = 0
     print(f"ENTERING THE TRAINING LOOP with: {args.num_train_epochs} epochs", flush=True)
     for epoch in range(args.num_train_epochs):
         print(f"Starting with epoch {epoch}...", flush=True)
@@ -393,84 +406,88 @@ def train_fn(tokenized_dataset, device, args):
             print("done with setting epoch..", flush=True)
 
         print(f"Entering data loader iterator for epoch {epoch}...", flush=True)
-        step = 0
-        while True:
+        step = -1
+        for step, batch in enumerate(safe_iter(xla_train_loader)):
             try:
-                batch = next(iter(xla_train_loader))
-            except StopIteration:
-                break
-            except Exception as e:
-                print(f"Error occurred during iteration {step}: {e}", flush=True)
-                continue
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch)
-            loss = outputs.loss
-            loss.backward()
+                batch = {k: v.to(device) for k, v in batch.items()}
+                outputs = model(**batch)
+                loss = outputs.loss
+                loss.backward()
 
-            total_loss += loss.item()
-            sub_total_loss += loss.item()
+                total_loss += loss.item()
+                sub_total_loss += loss.item()
 
-            if  (step+1) % args.gradient_accumulation_steps == 0:
-                xm.optimizer_step(optimizer)
-                scheduler.step()
-                optimizer.zero_grad()
+                if  (step+1) % args.gradient_accumulation_steps == 0:
+                    xm.optimizer_step(optimizer)
+                    scheduler.step()
+                    optimizer.zero_grad()
 
-                total_step += args.gradient_accumulation_steps
+                    total_step += args.gradient_accumulation_steps
 
-            if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
-                xm.rendezvous("logging")
+                if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
+                    xm.rendezvous("logging")
 
-                local_avg_loss = total_loss / step
-                local_avg_loss_N = sub_total_loss / sub_step
-                global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
-                global_avg_loss_N = xm.mesh_reduce("loss_N", local_avg_loss_N, np.mean)
+                    local_avg_loss = total_loss / step
+                    local_avg_loss_N = sub_total_loss / sub_step
+                    global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
+                    global_avg_loss_N = xm.mesh_reduce("loss_N", local_avg_loss_N, np.mean)
 
-                perplexity = math.exp(global_avg_loss)
-                perplexity_N = math.exp(global_avg_loss_N)
+                    perplexity = math.exp(global_avg_loss)
+                    perplexity_N = math.exp(global_avg_loss_N)
 
-                sub_step = 0
-                sub_total_loss = 0.
+                    sub_step = 0
+                    sub_total_loss = 0.
 
-                if global_ordinal() ==0:
-                    print(f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}", flush=True)
-                    wandb.log({
-                        "train_global_average_loss": global_avg_loss,
-                        "train_global_average_loss_N": global_avg_loss_N,
-                        "train_perplexity": perplexity,
-                        "train_perplexity_N": perplexity_N,
-                        "epoch": epoch,
-                        "step": step,
-                        "total_step": total_step
-                    })
+                    if global_ordinal() ==0:
+                        print(f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}", flush=True)
+                        wandb.log({
+                            "train_global_average_loss": global_avg_loss,
+                            "train_global_average_loss_N": global_avg_loss_N,
+                            "train_perplexity": perplexity,
+                            "train_perplexity_N": perplexity_N,
+                            "epoch": epoch,
+                            "step": step,
+                            "total_step": total_step
+                        })
 
-            if args.debug:
-                break
+                if args.debug:
+                    break
 
-            total_step += 1
-            sub_step +=1
+                total_step += 1
+                sub_step +=1
 
 
-            if (global_ordinal() ==0) & ((step+1) % save_steps == 0):
-                print("Saving model...", flush=True)
-                if args.output_dir.startswith("gs://"):
-                    with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
-                        local_output_dir = tmpdirname
-                        print(f"Saving model to {local_output_dir}...", flush=True)
+                if (global_ordinal() ==0) & ((step+1) % save_steps == 0):
+                    xm.rendezvous("before_save")
+                    print("Saving model...", flush=True)
+                    if args.output_dir.startswith("gs://"):
+                        with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
+                            local_output_dir = tmpdirname
+                            print(f"Saving model to {local_output_dir}...", flush=True)
+                            model_cpu = copy.deepcopy(model).to("cpu")
+                            model_cpu.save_pretrained(local_output_dir, save_serialization=True)
+                            print(f"Uploading model to {args.output_dir}...", flush=True)
+                            subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
+                            # rename the directory on GCS to the model name, date, and epoch_step
+                            # Generate a new directory name with model name, date, and epoch_step
+                            current_time = datetime.datetime.now().strftime("%Y%m%d")
+                            new_dir_name = f"{args.model_name}_epoch{epoch}_step{step}_{current_time}"
+                            new_gcs_path = os.path.join(args.output_dir, new_dir_name)
+                            # Rename the directory on GCS
+                            subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
+
+                    else:
                         model_cpu = copy.deepcopy(model).to("cpu")
-                        model_cpu.save_pretrained(local_output_dir, save_serialization=True)
-                        print(f"Uploading model to {args.output_dir}...", flush=True)
-                        subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
-                        # rename the directory on GCS to the model name, date, and epoch_step
-                        # Generate a new directory name with model name, date, and epoch_step
-                        current_time = datetime.datetime.now().strftime("%Y%m%d")
-                        new_dir_name = f"{args.model_name}_epoch{epoch}_step{step}_{current_time}"
-                        new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                        # Rename the directory on GCS
-                        subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
-
+                        model_cpu.save_pretrained(args.output_dir, save_serialization=True)
+                    xm.rendezvous("after_save")
                 else:
-                    model_cpu = copy.deepcopy(model).to("cpu")
-                    model_cpu.save_pretrained(args.output_dir, save_serialization=True)
+                    xm.rendezvous("before_save")
+                    xm.rendezvous("after_save")
+
+            except Exception as e:
+                print(f"Error occurred during processing batch {step}: {e}", flush=True)
+                miss_steps += 1
+                continue
 
             if (step+1) % steps_per_epoch == 0:
                 break
@@ -481,12 +498,14 @@ def train_fn(tokenized_dataset, device, args):
             wandb.log({
                 "val_perplexity": val_ppl,
                 "epoch": epoch,
+                "miss_steps": miss_steps
             })
 
         xm.rendezvous("syncing for next epoch.")
 
         # Save model checkpoint
         if global_ordinal() == 0:
+            xm.rendezvous("before_epoch_save")
             print("Saving model...", flush=True)
             if args.output_dir.startswith("gs://"):
                 with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
@@ -506,7 +525,10 @@ def train_fn(tokenized_dataset, device, args):
             else:
                 model_cpu = copy.deepcopy(model).to("cpu")
                 model_cpu.save_pretrained(args.output_dir, save_serialization=True)
-
+            xm.rendezvous("after_epoch_save")
+        else:
+            xm.rendezvous("before_epoch_save")
+            xm.rendezvous("after_epoch_save")
 
     # Finish wandb run
     if global_ordinal() == 0:

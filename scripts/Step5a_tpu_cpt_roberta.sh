@@ -25,7 +25,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --command="sudo pkill -f python3"
 
 echo "Starting training..."
-nohup gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
@@ -38,20 +38,21 @@ nohup gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --tokenizer_name_or_path=/home/${USERNAME}/tokenizer \
   --per_device_train_batch_size=32 \
   --gradient_accumulation_steps=10 \
-  --save_epoch_percentage=0.25 \
+  --save_epoch_percentage=0.10\
   --logging_steps=250 \
   --num_warmup_steps=5000 \
   --num_cores=8 \
   --max_seq_length=${MAX_SEQ_LEN} \
   --learning_rate=0.0002 \
   --streaming_data \
+  --shuffle_force_update \
   --shuffle_dataset \
   --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
-  --max_steps_per_epoch=50_000 \
+  --max_steps_per_epoch=25_000 \
   --weight_decay=0.001 \
   --wandb_key=${WANDB_KEY} \
   --continue_from_checkpoint \
-  --checkpoint_path=gs://dutch_clinical_models/CLTL/MedRoBERTa.nl_epoch0_step19999_20250224/model.safetensors \
+  --checkpoint_path=gs://dutch_clinical_models/CLTL/MedRoBERTa.nl_epoch0_step34999_20250227/model.safetensors \
   --num_train_epochs=5 2>&1 | tee ~/logs.txt &" &
 disown
 
