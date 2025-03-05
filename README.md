@@ -48,4 +48,6 @@ Sources:
 
 [Llama3 pre-training](https://github.com/vvr-rao/Training-a-Mini-114M-Parameter-Llama-3-like-Model-from-Scratch/blob/main/model%20and%20training%20code/train.py)
 
+[QAT training](https://github.com/Qualcomm-AI-research/lr-qat)
+
 [Llama3 finetuning](https://huggingface.co/blog/nroggendorff/train-with-llama-architecture)
