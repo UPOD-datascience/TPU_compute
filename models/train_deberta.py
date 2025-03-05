@@ -1,238 +1,562 @@
-print("Importing libraries...")
+"""
+This is the main script to continue pre-training a Roberta model.
+"""
+import argparse
+import torch
+from torch_xla.runtime import world_size, global_ordinal
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.parallel_loader as pl
+import torch_xla.distributed.xla_multiprocessing as xmp
+from transformers import (
+RobertaTokenizer,
+DebertaV2Config,
+DebertaV2ForMaskedLM,
+DataCollatorForLanguageModeling
+)
+from transformers import Trainer, TrainingArguments
+from transformers import get_linear_schedule_with_warmup
+
+from datasets import load_dataset, DatasetDict, DatasetInfo
+from safetensors.torch import load_file as load_safetensors
+
+import wandb
 import os
+import io
+import sys
+import tempfile
+import subprocess
 import copy
+import random
+import math
+import gc
+import datetime
+import shutil
+import numpy as np
+from gcsfs import GCSFileSystem
+from google.cloud import storage
+import fsspec
+
+from functools import partial
+from itertools import chain
+
+from time import sleep
+
 try:
     os.environ.pop('TPU_PROCESS_ADDRESSES')
     os.environ.pop('CLOUD_TPU_TASK_ID')
 except:
     print("No TPU_PROCESS_ADDRESSES or CLOUD_TPU_TASK_ID to remove")
 
-import argparse
-import tempfile
-import subprocess
-import math
-import wandb
-from numpy import true_divide
-import numpy as np
-import torch
-import torch_xla
-from torch_xla.runtime import global_ordinal, world_size
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.test.test_utils as test_utils
-import torch_xla.distributed.parallel_loader as pl
-import torch_xla.distributed.xla_backend
-import torch.distributed as dist
+print("TPU_NUM_DEVICES:", os.environ.get("TPU_NUM_DEVICES"), flush=True)
+print("TPU_CHIPS_PER_HOST_BOUNDS:", os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS"), flush=True)
 
-from tokenizers import ByteLevelBPETokenizer
+worker_id = int(os.environ.get('TPU_WORKER_ID', '0'))
+# Determine total number of shards (for example, from the comma-separated hostnames)
+shards = os.environ.get('TPU_WORKER_HOSTNAMES', '0').split(',')
 
-from transformers import (
-    DebertaConfig,
-    DebertaV2Config,
-    DebertaForMaskedLM,
-    DebertaV2ForMaskedLM,
-    DataCollatorForLanguageModeling,
-    PreTrainedTokenizerFast
-)
+print(f"TPU_WORKER_ID: {worker_id}")
+print(f"TPU_WORKER_HOSTNAMES for {worker_id}: {shards}")
 
-from datasets import load_dataset, load_from_disk, Dataset, DatasetDict
+
+def shuffle_and_save_dataset(dataset, output_path, seed=None):
+    # Shuffle only the training dataset
+    shuffled_train = dataset['train'].shuffle(seed=seed)
+
+    # Save the shuffled training dataset and the original validation dataset
+    shuffled_dataset = DatasetDict({
+        'train': shuffled_train,
+        'validation': dataset['validation']
+    })
+    print("Saving shuffled data to disk", flush=True)
+    shuffled_dataset.save_to_disk(output_path)
+    print(f"Shuffled dataset saved to {output_path}", flush=True)
+
+
+class ShardedShuffleDataset(torch.utils.data.IterableDataset):
+    def __init__(self, dataset, num_shards, shard_id, shuffle_buffer_size, max_steps=None, batch_size=1):
+        self.dataset = dataset
+        self.num_shards = num_shards
+        self.shard_id = shard_id
+        self.shuffle_buffer_size = shuffle_buffer_size
+        self.max_steps = max_steps
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        buffer = []
+        items_yielded = 0
+        max_items = self.max_steps * self.batch_size if self.max_steps is not None else float('inf')
+
+        for i, item in enumerate(self.dataset):
+            if items_yielded >= max_items:
+                break
+            if i % self.num_shards == self.shard_id:
+                buffer.append(item)
+                if len(buffer) >= self.shuffle_buffer_size:
+                    random.shuffle(buffer)
+                    while buffer and items_yielded < max_items:
+                        items_yielded += 1
+                        yield buffer.pop(0)
+
+        # Yield remaining items
+        random.shuffle(buffer)
+        while buffer and items_yielded < max_items:
+            items_yielded += 1
+            yield buffer.pop(0)
+
+def tokenize_function(examples, tokenizer, max_seq_length):
+    # here you can actually add a chunker to split the text into smaller parts, of max_len
+    return tokenizer(examples["text"],
+                    truncation=True,
+                    max_length=max_seq_length,
+                    padding=True)
+
+def load_from_gcs(bucket_name, blob_name, local_path, device):
+    # Initialize a client
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+
+    # Download the blob to a local file
+    try:
+        blob.download_to_filename(local_path)
+        print(f"Succesfully downloaded checkpoint to: {local_path}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to download checkpoint to {local_path}: {e}")
+
+    # Load the checkpoint based on the file extension
+    if local_path.endswith('.safetensors'):
+        checkpoint = load_safetensors(local_path, device='cpu')
+        checkpoint = {k: v.to(xm.xla_device()) for k, v in checkpoint.items()}
+    else:
+        checkpoint = torch.load(local_path, map_location=device)
+
+    return checkpoint
+
+def load_sharded_dataset(datasets, dformat):
+    num_shards = max(world_size() , 16)
+    shard_idx = global_ordinal()
+
+    print(f"Sharding for shard index:{shard_idx} / {num_shards}")
+
+    dataset_dict = load_dataset(
+        dformat,
+        data_files=datasets,
+        streaming=False,
+        keep_in_memory=True
+    )
+
+    # Apply sharding to each split
+    sharded_dataset = {}
+    for split in dataset_dict.keys():
+        sharded_dataset[split] = dataset_dict[split].shard(num_shards=num_shards, index=shard_idx)
+
+    del dataset_dict
+    gc.collect()
+    # Combine sharded splits back into a DatasetDict
+    return DatasetDict(sharded_dataset)
+
+
+def group_texts(examples, max_seq_length):
+    # Concatenate all texts.
+    concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+    total_length = len(concatenated_examples[list(examples.keys())[0]])
+    total_length = (total_length // max_seq_length) * max_seq_length
+    # Split by chunks of max_len.
+    # TODO: add sentence/paragraph boundary respecter..
+    # TODO: add a chunker that also store the last part of the previous chunk
+    result = {
+        k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+        for k, t in concatenated_examples.items()
+    }
+    return result
 
 def prep_fn(args):
-    # Each process has its own device (TPU core)
-    #rank = global_ordinal()
-
-    # Load dataset
-    print("Loading dataset...")
-    raw_datasets = load_from_disk(args.dataset_dir,keep_in_memory=args.keep_in_memory)
-
-    print("Loading tokenizer...")
-    _tokenizer = ByteLevelBPETokenizer.from_file(merges_filename=os.path.join(args.tokenizer_name_or_path, 'merges.txt'),
-        vocab_filename=os.path.join(args.tokenizer_name_or_path, 'vocab.json'))
-
-    tokenizer = PreTrainedTokenizerFast(tokenizer_object=_tokenizer._tokenizer, model_max_length=args.max_seq_length, truncation=True)
-    tokenizer.add_special_tokens({'pad_token': '<pad>'})
-    tokenizer.add_special_tokens({'bos_token': '<s>'})
-    tokenizer.add_special_tokens({'eos_token': '</s>'})
-    tokenizer.add_special_tokens({'unk_token': '<unk>'})
-    tokenizer.add_special_tokens({'mask_token': '<mask>'})
-
-    if args.pre_tokenized == False:
-        # Load tokenizer
-
-        def tokenize_fn(examples):
-            return tokenizer(
-                examples["text"],
-                truncation=True,
-                max_length=args.max_seq_length,
-                padding="max_length"
+    # Load and tokenize dataset
+    if args.pre_tokenized:
+        datasets = {
+            "train": args.dataset_dir + f"/train_{args.max_seq_length}.{args.dataset_format}",
+            "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.{args.dataset_format}"
+        }
+        if args.streaming_data:
+            print("Loading pre-tokenized dataset, streaming with shuffle..", flush=True)
+            tokenized_dataset = load_dataset(
+                    args.dataset_format,
+                    data_files=datasets,
+                    streaming=True,
+                    keep_in_memory=False,
+                ).shuffle(buffer_size=args.shuffle_buffer_size)
+        else:
+            print("Loading pre-tokenized dataset, no streaming", flush=True)
+            tokenized_dataset = load_dataset(
+                args.dataset_format,
+                data_files=datasets,
+                streaming=False,
+                keep_in_memory=True,
             )
-
-        print("Tokenizing datasets...")
-        next(iter(raw_datasets["train"]))
-        # maybe use forkserver
-        tokenized_datasets = raw_datasets.map(
-            tokenize_fn,
-            batched=True,
-            num_proc=1,
-            remove_columns=["text"],
-        )
-
-        print("Getting train and eval datasets...")
-        train_dataset = tokenized_datasets["train"]
-        eval_dataset = tokenized_datasets.get("validation", None)
-
-        return DatasetDict({'train': train_dataset, 'validation': eval_dataset}), tokenizer
     else:
-        return raw_datasets, tokenizer
+        print(f"Tokenizing dataset... with streaming: {args.streaming_data} and keep_in_memory: {args.keep_in_memory}", flush=True)
+        print(f"Dataset location: {args.dataset_dir}", flush=True)
 
+        train_loc = "train" if not args.debug else "validation"
 
-def train_fn(index, args):
-    print(f"Process {index} is starting...")
+        datasets = {"train": args.dataset_dir+f"/{train_loc}/*.{args.dataset_format}",
+                    "validation": args.dataset_dir+f"/validation/*.{args.dataset_format}"}
 
-    if xm.is_master_ordinal():
+        if args.streaming_data:
+            try:
+                ds_train_info = DatasetInfo.from_directory(args.dataset_dir+f"/{train_loc}/")
+                num_examples = ds_train_info['num_examples']
+                args.max_steps_per_epoch = num_examples // args.per_device_train_batch_size // max(world_size(), 1)
+            except Exception as e:
+                print(f"Could not obtain datasetinfo:{e}")
+                pass
+
+            print("Init streaming dataset...", flush=True)
+            dataset = load_dataset(
+                    args.dataset_format,
+                    data_files=datasets,
+                    streaming=True,
+                    keep_in_memory=False
+                )#.shuffle(buffer_size=args.shuffle_buffer_size)
+        else:
+            print("Init non-streaming dataset...", flush=True)
+            if args.sharded_data:
+                print("Sharding data...", flush=True)
+                dataset = load_sharded_dataset(datasets, args.dataset_format)
+            else:
+                dataset = load_dataset(
+                        args.dataset_format,
+                        data_files=datasets,
+                        streaming=False,
+                        keep_in_memory=True
+                    )
+
+        opt_kwargs = {'num_proc': args.num_cores} if args.streaming_data==False else {}
+        print("Tokenizing dataset...", flush=True)
+        tokenize_fn = partial(tokenize_function, tokenizer=args.tokenizer, max_seq_length=args.max_seq_length)
+        tokenized_dataset_raw = dataset.map(tokenize_fn,
+                                         batched=True,
+                                         remove_columns=["text",
+                                                         "id",
+                                                         "source",
+                                                         "approx_token_counts_translated",
+                                                         "approx_token_counts_original"],
+                                         **opt_kwargs)
+
+        opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
+        print("Performing chunking tokenized data...", flush=True)
+        group_fn = partial(group_texts, max_seq_length=args.max_seq_length)
+        tokenized_dataset = tokenized_dataset_raw.map(
+                group_fn,
+                batched=True,
+                **opt_kwargs
+            )
+        del tokenized_dataset_raw
+    return tokenized_dataset
+
+def safe_iter(iterable):
+    iterator = iter(iterable)
+    while True:
+        try:
+            yield next(iterator)
+        except StopIteration:
+            break
+        except Exception as e:
+            print(f"Error encountered in iteration: {e}")
+            continue
+
+def train_fn(tokenized_dataset, device, args):
+    # Initialize wandb for the master process
+    if global_ordinal() == 0: #.is_master_ordinal():
         wandb.login(key=args.wandb_key)
         wandb.init(
-            # set the wandb project where this run will be logged
-            project="DeBERTa TPU testing",
-            # track hyperparameters and run metadata
+            project="RoBERTa TPU pretraining",
             config={
-            "learning_rate": args.learning_rate,
-            "architecture": "DeBERTa",
-            "dataset": "testing",
-            "epochs": args.num_train_epochs,
-            "weight_decacy": args.weight_decay,
-            }
+                "learning_rate": args.learning_rate,
+                "architecture": "DeBERTaV2",
+                "dataset": args.dataset_dir,
+                "epochs": args.num_train_epochs,
+                "weight_decay": args.weight_decay,
+                "max_seq_length": args.max_seq_length,
+                "batch_size": args.per_device_train_batch_size,
+            },
+            mode="offline",
+            dir="/home/bes3/temp"
         )
 
+    # Load model configuration
+    #config = RobertaConfig.from_pretrained(args.model_name)
 
-    xm.master_print("Creating the model...")
-    device = xm.xla_device()
-    # Create the model on the XLA device
-    config = DebertaConfig()
-    config.vocab_size = args.tokenizer.get_vocab_size()
-    config.max_position_embeddings = args.max_seq_length
-    config.num_hidden_layers = args.num_hidden_layers
-    config.hidden_size = args.hidden_size
-    config.num_attention_heads = args.num_attention_heads
-
-    model = DebertaForMaskedLM(config).to(device)
-
-    xm.master_print(f"Model config: {config}")
-
-    xm.master_print("Creating the data collator...")
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=args.tokenizer,
-        mlm=True,
-        mlm_probability=0.15
-    )
-
-    # Dataloaders with Distributed Sampler
-    xm.master_print("Creating training data loader...")
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        args.tokenized_datasets["train"],
-        num_replicas=world_size(),
-        rank=global_ordinal(),
-        shuffle=True
-    )
-    train_loader = torch.utils.data.DataLoader(
-        args.tokenized_datasets["train"],
-        batch_size=args.per_device_train_batch_size,
-        sampler=train_sampler,
-        collate_fn=data_collator
-    )
-    xla_train_loader = pl.MpDeviceLoader(train_loader, xm.xla_device())
-
-    if args.tokenized_datasets["validation"] is not None:
-        xm.master_print("Creating validation data loader...")
-        validation_sampler = torch.utils.data.distributed.DistributedSampler(
-            args.tokenized_datasets["validation"],
-            num_replicas=world_size(),
-            rank=global_ordinal(),
-            shuffle=False
-        )
-        validation_loader = torch.utils.data.DataLoader(
-            args.tokenized_datasets["validation"],
-            batch_size=args.per_device_train_batch_size,
-            sampler=validation_sampler,
-            collate_fn=data_collator
-        )
-        xla_val_loader = pl.MpDeviceLoader(validation_loader, xm.xla_device())
-
-    # Set up optimizer, etc.
-    optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-
-    # maybe use standard Training functions from transformers library..
-    # Example training loop (simplistic)
-    xm.master_print("Starting model training..")
-    model.train()
-    total_step = 0
-    for epoch in range(args.num_train_epochs):
-        total_loss = 0.
-        xm.master_print(f"Starting epoch {epoch+1}")
-        for step, batch in enumerate(xla_train_loader):
-            # Move batch to the XLA device
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
-            loss = outputs.loss
-            loss.backward()
-
-            xm.optimizer_step(optimizer)
-            #optimizer.step()
-            optimizer.zero_grad()
-
-            total_loss+=loss.item()
-            total_step += 1
-            if step % args.logging_steps == 0:
-                local_avg_loss = total_loss / args.logging_steps
-                global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
-                perplexity = math.exp(global_avg_loss)
-                xm.master_print(f"Epoch {epoch+1}, step {step}, loss: {global_avg_loss}")
-
-                total_loss = 0.
-                if xm.is_master_ordinal():
-                    wandb.log({
-                        "train_global_average_loss": global_avg_loss,
-                        "train_perplexity": perplexity,
-                        "epoch": epoch,
-                        "step": step,
-                        "total_step": total_step
-                    })
-
-        if args.tokenized_datasets["validation"] is not None:
-            val_ppl = evaluate(model, xla_val_loader, device)
-            xm.master_print(f"Epoch {epoch+1} Validation Perplexity: {val_ppl:.3f}")
-            if xm.is_master_ordinal():
-                wandb.log({
-                    "validation_perplexity": val_ppl,
-                    "epoch": epoch
-                })
-
-    # Optionally save on master
-    if xm.is_master_ordinal():
-        xm.master_print("Saving model...")
-        if args.output_dir.startswith("gs://"):
-            with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
-                local_output_dir = tmpdirname
-                xm.master_print(f"Saving model to {local_output_dir}...")
-                model_cpu = copy.deepcopy(model).to("cpu")
-                model_cpu.save_pretrained(local_output_dir, save_serialization=True)
-                xm.master_print(f"Uploading model to {args.output_dir}...")
-                subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
+    # Load pre-trained model
+    xm.master_print("Loading the LM ...")
+    if args.continue_from_checkpoint:
+        model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
+        if args.checkpoint_path.startswith('gs://'):
+            # Parse GCS path
+            bucket_name = args.checkpoint_path.split('/')[2]
+            blob_name = '/'.join(args.checkpoint_path.split('/')[3:])
+            local_path = f'/tmp/checkpoint.{args.checkpoint_path.split(".")[-1]}'  # Temporary local path to store the downloaded file
+            checkpoint = load_from_gcs(bucket_name,
+                                       blob_name,
+                                       local_path,
+                                       device)
         else:
-            model_cpu = copy.deepcopy(model).to("cpu")
-            model_cpu.save_pretrained(args.output_dir, save_serialization=True)
+            if args.checkpoint_path.endswith('.safetensors'):
+                checkpoint = load_safetensors(args.checkpoint_path, device=device)
+            else:
+                checkpoint = torch.load(args.checkpoint_path, map_location=device)
+
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+    else:
+        model_config = DebertaV2Config.from_pretrained(args.model_name)
+        model_config.max_position_embeddings = args.max_seq_length
+        model_config.bos_token_id = args.tokenizer.bos_token_id
+        model_config.eos_token_id = args.tokenizer.eos_token_id
+        model_config.pad_token_id = args.tokenizer.pad_token_id
+        model_config.cls_token_id = args.tokenizer.cls_token_id
+        model_config.sep_token_id = args.tokenizer.sep_token_id
+        model_config.vocab_size = args.tokenizer.vocab_size
+
+        model = DebertaV2ForMaskedLM(model_config)
+
+    model.to(device)
+
+    # Set up data collator
+    xm.master_print("Setting up data collator...")
+    data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
+                                                    mlm=True,
+                                                    mlm_probability=args.mlm_probability)
+
+    # Decide on distributed sampler parameters:
+    if args.num_cores == 1:
+        sampler_rank = 0
+        sampler_replicas = 1
+    else:
+        sampler_rank = global_ordinal()
+        sampler_replicas = world_size()
+
+    # Create sampler
+    distributed_sampler = False
+    if args.streaming_data:
+        xm.master_print("Instantiate sharded dataset...")
+        num_shards = world_size()  # Total number of TPU cores (or processes)
+        shard_id = global_ordinal()  # Unique id for the current process
+        print(f"Num shards: {num_shards}, shard id: {shard_id}")
+        #num_shards = xm.xrt_world_size()
+        #shard_id = xm.get_ordinal()
+        sharded_train_dataset = tokenized_dataset["train"].shard(num_shards=num_shards, index=shard_id)
+
+        xm.master_print("Starting the streaming DataLoader...")
+
+        train_dataloader = torch.utils.data.DataLoader(
+            sharded_train_dataset,
+            batch_size=args.per_device_train_batch_size,
+            collate_fn=data_collator,
+            num_workers=0
+        )
+    else:
+        xm.master_print("Starting the DistributedSampler...")
+        distributed_sampler = True
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            tokenized_dataset["train"],
+            num_replicas=sampler_replicas,
+            rank=sampler_rank,
+            shuffle=True
+        )
+        # Create dataloaders
+        xm.master_print("Starting the DataLoader...")
+        train_dataloader = torch.utils.data.DataLoader(
+            tokenized_dataset["train"],
+            batch_size=args.per_device_train_batch_size,
+            collate_fn=data_collator,
+            sampler=train_sampler
+        )
+    #################
+    validation_dataloader = torch.utils.data.DataLoader(
+        tokenized_dataset["validation"],
+        batch_size=args.per_device_train_batch_size,
+        collate_fn=data_collator)
+
+    if not args.streaming_data:
+        del tokenized_dataset
+        gc.collect()
+
+    xla_train_loader = pl.MpDeviceLoader(train_dataloader, xm.xla_device())
+    xla_validation_loader = pl.MpDeviceLoader(validation_dataloader, xm.xla_device())
+
+    # Set up optimizer and scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    steps_per_epoch = args.max_steps_per_epoch if args.streaming_data else len(train_dataloader)
+    save_steps = int(steps_per_epoch * args.save_epoch_percentage)
+    total_steps = steps_per_epoch * args.num_train_epochs
+    #scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=total_steps)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
+
+    if global_ordinal() == 0: # xm.is_master_ordinal():
+        print("Starting training...", flush=True)
+        print(f"Total steps: {total_steps}", flush=True)
+        print(f"Total epochs: {args.num_train_epochs}", flush=True)
+        print(f"Total warmup steps: {args.num_warmup_steps}", flush=True)
+
+    # Training loop
+    total_step = 0
+    miss_steps = 0
+    print(f"ENTERING THE TRAINING LOOP with: {args.num_train_epochs} epochs", flush=True)
+    for epoch in range(args.num_train_epochs):
+        print(f"Starting with epoch {epoch}...", flush=True)
+        total_loss = 0.
+        sub_total_loss = 0.
+        sub_step = 0
+        model.train()
+        if distributed_sampler:
+            print(f"Starting with epoch {epoch}...", flush=True)
+            train_sampler.set_epoch(epoch)
+            print("done with setting epoch..", flush=True)
+
+        print(f"Entering data loader iterator for epoch {epoch}...", flush=True)
+        step = -1
+        for step, batch in enumerate(safe_iter(xla_train_loader)):
+            try:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                outputs = model(**batch)
+                loss = outputs.loss
+                loss.backward()
+
+                total_loss += loss.item()
+                sub_total_loss += loss.item()
+
+                if  (step+1) % args.gradient_accumulation_steps == 0:
+                    xm.optimizer_step(optimizer)
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                    total_step += args.gradient_accumulation_steps
+
+                if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
+                    xm.rendezvous("logging")
+
+                    local_avg_loss = total_loss / step
+                    local_avg_loss_N = sub_total_loss / sub_step
+                    global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
+                    global_avg_loss_N = xm.mesh_reduce("loss_N", local_avg_loss_N, np.mean)
+
+                    perplexity = math.exp(global_avg_loss)
+                    perplexity_N = math.exp(global_avg_loss_N)
+
+                    sub_step = 0
+                    sub_total_loss = 0.
+
+                    if global_ordinal() ==0:
+                        print(f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}", flush=True)
+                        wandb.log({
+                            "train_global_average_loss": global_avg_loss,
+                            "train_global_average_loss_N": global_avg_loss_N,
+                            "train_perplexity": perplexity,
+                            "train_perplexity_N": perplexity_N,
+                            "epoch": epoch,
+                            "step": step,
+                            "total_step": total_step
+                        })
+
+                if args.debug:
+                    break
+
+                total_step += 1
+                sub_step +=1
+
+
+                if (global_ordinal() ==0) & ((step+1) % save_steps == 0):
+                    xm.rendezvous("before_save")
+                    print("Saving model...", flush=True)
+                    if args.output_dir.startswith("gs://"):
+                        with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
+                            local_output_dir = tmpdirname
+                            print(f"Saving model to {local_output_dir}...", flush=True)
+                            model_cpu = copy.deepcopy(model).to("cpu")
+                            model_cpu.save_pretrained(local_output_dir, save_serialization=True)
+                            print(f"Uploading model to {args.output_dir}...", flush=True)
+                            subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
+                            # rename the directory on GCS to the model name, date, and epoch_step
+                            # Generate a new directory name with model name, date, and epoch_step
+                            current_time = datetime.datetime.now().strftime("%Y%m%d")
+                            new_dir_name = f"{args.model_name}_epoch{epoch}_step{step}_{current_time}"
+                            new_gcs_path = os.path.join(args.output_dir, new_dir_name)
+                            # Rename the directory on GCS
+                            subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
+
+                    else:
+                        model_cpu = copy.deepcopy(model).to("cpu")
+                        model_cpu.save_pretrained(args.output_dir, save_serialization=True)
+                    xm.rendezvous("after_save")
+                else:
+                    xm.rendezvous("before_save")
+                    xm.rendezvous("after_save")
+
+            except Exception as e:
+                print(f"Error occurred during processing batch {step}: {e}", flush=True)
+                miss_steps += 1
+                continue
+
+            if (step+1) % steps_per_epoch == 0:
+                break
+
+        val_ppl = evaluate(model, xla_validation_loader, device)
+
+        if global_ordinal() == 0:
+            wandb.log({
+                "val_perplexity": val_ppl,
+                "epoch": epoch,
+                "miss_steps": miss_steps
+            })
+
+        xm.rendezvous("syncing for next epoch.")
+
+        # Save model checkpoint
+        if global_ordinal() == 0:
+            xm.rendezvous("before_epoch_save")
+            print("Saving model...", flush=True)
+            if args.output_dir.startswith("gs://"):
+                with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
+                    local_output_dir = tmpdirname
+                    print(f"Saving model to {local_output_dir}...", flush=True)
+                    model_cpu = copy.deepcopy(model).to("cpu")
+                    model_cpu.save_pretrained(local_output_dir, save_serialization=True)
+                    print(f"Uploading model to {args.output_dir}...", flush=True)
+                    subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
+                    # rename the directory on GCS to the model name, date, and epoch_step
+                    # Generate a new directory name with model name, date, and epoch_step
+                    current_time = datetime.datetime.now().strftime("%Y%m%d")
+                    new_dir_name = f"{args.model_name}_epoch{epoch}_{current_time}"
+                    new_gcs_path = os.path.join(args.output_dir, new_dir_name)
+                    # Rename the directory on GCS
+                    subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
+            else:
+                model_cpu = copy.deepcopy(model).to("cpu")
+                model_cpu.save_pretrained(args.output_dir, save_serialization=True)
+            xm.rendezvous("after_epoch_save")
+        else:
+            xm.rendezvous("before_epoch_save")
+            xm.rendezvous("after_epoch_save")
+
+    # Finish wandb run
+    if global_ordinal() == 0:
+        wandb.finish()
+
+def prep_and_train_fn(index, args):
+    device = xm.xla_device()
+    tokenized_dataset = prep_fn(args)
+    train_fn(tokenized_dataset, device, args)
 
 def evaluate(model, dataloader, device):
     model.eval()
     total_loss = 0.0
     total_steps = 0
+
+    # Synchronize all TPU cores before starting evaluation
+    xm.rendezvous("evaluation")
 
     # Loop over the validation set
     for batch in dataloader:
@@ -269,34 +593,103 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--dataset_dir", type=str, required=True)
+    parser.add_argument("--dataset_format", default="json", choices=["json", "parquet", "arrow"])
     parser.add_argument("--tmp_dir", type=str, required=True)
     parser.add_argument("--tokenizer_name_or_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--pre_tokenized", action='store_true', default=False)
-    parser.add_argument("--max_seq_length", type=int, default=1024)
-    parser.add_argument("--num_hidden_layers", type=int, default=28)
-    parser.add_argument("--hidden_size", type=int, default=1024)
-    parser.add_argument("--num_attention_heads", type=int, default=24)
-    parser.add_argument("--max_seq_length", type=int, default=1024)
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
+    parser.add_argument("--mlm_probability", type=float, default=0.25)
+    parser.add_argument("--max_seq_length", type=int, default=512)
     parser.add_argument("--num_train_epochs", type=int, default=1)
+    parser.add_argument("--num_warmup_steps", type=int, default=1000)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.001)
     parser.add_argument("--logging_steps", type=int, default=100)
+    parser.add_argument("--save_epoch_percentage", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_cores", type=int, default=8)
     parser.add_argument("--keep_in_memory", action='store_true')
     parser.add_argument("--streaming_data", action='store_true')
+    parser.add_argument("--sharded_data", action='store_true')
+    parser.add_argument("--max_steps_per_epoch", type=int, default=None)
+    parser.add_argument("--shuffle_buffer_size", type=int, default=10_000)
+    parser.add_argument("--shuffle_dataset_path", type=str, default="/home/bob/tmp/shuffle.parquet")
+    parser.add_argument("--shuffle_dataset", action='store_true')
+    parser.add_argument("--shuffle_force_update", action='store_true')
+    parser.add_argument("--debug", action='store_true')
+    parser.add_argument("--continue_from_checkpoint", action='store_true')
+    parser.add_argument("--checkpoint_path", type=str)
+    parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
     args = parser.parse_args()
 
+    # give error if both keep_in_memory and streaming_data are set to True
+    # as they are mutually exclusive
+    if args.keep_in_memory and args.streaming_data:
+        raise ValueError("keep_in_memory and streaming_data are mutually exclusive. Please set only one of them to True.")
+
+    if args.streaming_data==True and args.shuffle_buffer_size is None:
+        raise ValueError("shuffle_buffer_size is required when streaming_data is set to True.")
+
     # Set the same seed for all processes
     torch.manual_seed(args.seed)
-    tokenized_dataset, tokenizer = prep_fn(args)
 
-    # update args with traindata, valdata, tokenizer
-    args.tokenized_datasets = tokenized_dataset
-    args.tokenizer = tokenizer
+    if args.shuffle_dataset:
+        shuffle_dir = args.shuffle_dataset_path
+        if (os.path.exists(shuffle_dir)) and (args.shuffle_force_update==False):
+            print(f"Shuffled dataset exists, skipping creation: {shuffle_dir}", flush=True)
+        else:
+            if (os.path.exists(shuffle_dir)):
+                print(f"Removing shuffled dataset: {shuffle_dir}", flush=True)
+                shutil.rmtree(shuffle_dir)
+
+            print("Loading dataset for shuffling...", flush=True)
+            dataset = load_dataset(args.dataset_format, data_files={
+                "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
+                "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
+            }, keep_in_memory=True)
+
+            print("Clearing cache!", flush=True)
+            cache_dir = os.path.expanduser("~/.cache/huggingface")
+            if os.path.exists(cache_dir):
+                print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
+                shutil.rmtree(cache_dir)
+            else:
+                print("Hugging Face cache directory not found.", flush=True)
+
+            print("Shuffling and saving dataset...", flush=True)
+            shuffle_and_save_dataset(dataset, args.shuffle_dataset_path)
+
+            print("Clearing cache a-posteriori !", flush=True)
+            cache_dir = os.path.expanduser("~/.cache/huggingface")
+            if os.path.exists(cache_dir):
+                print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
+                shutil.rmtree(cache_dir)
+            else:
+                print("Hugging Face cache directory not found.", flush=True)
+
+            # Update the dataset directory to the shuffled dataset path
+            # Clear the dataset from memory
+            del dataset
+            gc.collect()
+            print("Cleared shuffled dataset from master's memory", flush=True)
+    else:
+        shuffle_dir = args.shuffle_dataset_path
+        if os.path.exists(shuffle_dir):
+            print(f"Removing shuffled dataset: {shuffle_dir}", flush=True)
+            shutil.rmtree(shuffle_dir)
+
+    args.tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name_or_path)
+    args.tokenizer.model_max_length = args.max_seq_length
+
+    if args.shuffle_dataset:
+            args.dataset_dir = args.shuffle_dataset_path
+            args.dataset_format = 'arrow'
+            print("Continuing with Arrow format", flush=True)
+
+    sleep(20)
 
     # Spawn processes
     print(f"Initializing TPU...with {args.num_cores} cores")
@@ -304,15 +697,9 @@ def main():
 
     if args.num_cores == 1:
         print("Running single process...")
-        train_fn(0, args)
+        prep_and_train_fn(0, args)
     else:
-        xmp.spawn(train_fn, args=(args,))
-    # debug_single_process = args.num_cores == 1
-    # print(f"debug_single_process: {debug_single_process}")
-    # torch_xla.launch(
-    #     train_fn, args=(args,),
-    #     debug_single_process=debug_single_process)
-
+        xmp.spawn(prep_and_train_fn, args=(args,))
 
 if __name__ == "__main__":
     print("Starting...")

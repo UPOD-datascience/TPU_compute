@@ -45,7 +45,6 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --max_seq_length=${MAX_SEQ_LEN} \
   --learning_rate=0.0002 \
   --streaming_data \
-  --shuffle_force_update \
   --shuffle_dataset \
   --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
   --max_steps_per_epoch=25_000 \

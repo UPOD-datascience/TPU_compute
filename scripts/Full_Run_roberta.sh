@@ -1,0 +1,19 @@
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# Export variables from .env file
+set -o allexport
+source ../.env
+set +o allexport
+
+./Step2a_startup_pod.sh
+./Step2b_install_prequisites.sh
+#./Step3a_normalize_data.sh
+#./Step3b_tokenize_data.sh
+./Step4_upload_scripts.sh
+./Step5a_tpu_cpt_roberta.sh
+#./Step5b_tpu_train_deberta.sh
+#./Step5c_tpu_cpt_modernbert.sh
+
+#gcloud compute tpus tpu-vm delete  \
+#  --zone=${ZONE}

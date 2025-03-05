@@ -15,7 +15,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
     --worker=all \
-    --command="rm -rf /home/bes3/.cache/huggingface/datasets/json/*"
+    --command="rm -rf /home/bes3/.cache/*; rm /home/bes3/logs.txt"
 
 echo "Stopping all running processes..."
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -29,20 +29,29 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="python3 /home/${USERNAME}/models/train_deberta.py  \
-  --dataset_dir=${LOCAL_DATA} \
+  --command="nohup python3 /home/${USERNAME}/models/train_deberta.py  \
+  --dataset_dir=${DATASET_FOLDER} \
+  --dataset_format=${DATASET_FORMAT} \
   --tmp_dir=${TMP_DIR} \
   --output_dir=${MODEL_BUCKET} \
+  --model_name=${MODEL_NAME} \
   --tokenizer_name_or_path=/home/${USERNAME}/tokenizer \
-  --per_device_train_batch_size=16 \
-  --max_seq_length=${MAX_SEQ_LEN} \
+  --per_device_train_batch_size=32 \
+  --gradient_accumulation_steps=10 \
+  --save_epoch_percentage=0.05 \
+  --logging_steps=250 \
+  --num_warmup_steps=10_000 \
   --num_cores=8 \
-  --pre_tokenized \
-  --learning_rate=0.0001 \
-  --weight_decay=0.001 \
+  --max_seq_length=${MAX_SEQ_LEN} \
+  --learning_rate=0.0002 \
   --streaming_data \
+  --shuffle_dataset \
+  --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
+  --max_steps_per_epoch=50_000 \
+  --weight_decay=0.001 \
   --wandb_key=${WANDB_KEY} \
-  --num_train_epochs=20 2>&1 | tee ~/logs.txt"
+  --num_train_epochs=5 2>&1 | tee ~/logs.txt &" &
+disown
 
 # ideally you would launch a shell script on the workers like
 # nohup some_script.sh & exit

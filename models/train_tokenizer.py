@@ -1,5 +1,6 @@
 # train_tokenizer.py
-from tokenizers import ByteLevelBPETokenizer, SentencePieceBPETokenizer
+from tokenizers import ByteLevelBPETokenizer, SentencePieceBPETokenizer,BertWordPieceTokenizer
+from transformers import DebertaV2TokenizerFast
 import os
 import argparse
 import json
@@ -30,7 +31,7 @@ def clean_text(text):
 def read_jsonl(file_path):
     texts = []
     if file_path.startswith("gs://"):
-        client = storage.Client()
+        client = storage.Client.from_service_account_json('../gsa.json')
         bucket_name = file_path.split("/")[2]
         blob_name = "/".join(file_path.split("/")[3:])
         bucket = client.get_bucket(bucket_name)
@@ -52,7 +53,7 @@ def read_jsonl(file_path):
 def read_txt(file_path):
     texts = []
     if file_path.startswith("gs://"):
-        client = storage.Client()
+        client = storage.Client.from_service_account_json('../gsa.json')
         bucket_name = file_path.split("/")[2]
         blob_name = "/".join(file_path.split("/")[3:])
         bucket = client.get_bucket(bucket_name)
@@ -67,7 +68,7 @@ def read_txt(file_path):
 def read_parquet(file_path):
     texts = []
     if file_path.startswith("gs://"):
-        client = storage.Client()
+        client = storage.Client.from_service_account_json('../gsa.json')
         bucket_name = file_path.split("/")[2]
         blob_name = "/".join(file_path.split("/")[3:])
         bucket = client.get_bucket(bucket_name)
@@ -84,11 +85,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default='~/tokenizer', required=True)
+    parser.add_argument("--vocab_size", type=int, default=50_368)
+    parser.add_argument("--min_frequency", type=int, default=100)
+    parser.add_argument("--tokenizer_type", type=str, choices=['bbpe', 'sentencebpe', 'debertav2', 'bertwordpiece'], default='bbpe')
     args = parser.parse_args()
 
     print("Getting file list..")
     if args.data_dir.startswith("gs://"):
-        client = storage.Client()
+        client = storage.Client.from_service_account_json('../gsa.json')
         bucket_name = args.data_dir.split("/")[2]
         prefix = "/".join(args.data_dir.split("/")[3:])
         bucket = client.get_bucket(bucket_name)
@@ -112,21 +116,47 @@ def main():
     print("Cleaning texts..")
     all_texts = [clean_text(text) for text in all_texts]
 
-    # Initialize a ByteLevel BPE tokenizer
-    tokenizer = ByteLevelBPETokenizer()
-
-    tokenizer._tokenizer.post_processor.verbose = True
-    # Train the tokenizer
-    print("Training tokenizer..")
-    tokenizer.train_from_iterator(all_texts, vocab_size=50_000, min_frequency=100, special_tokens=[
-        "<s>", "</s>", "<pad>", "<unk>", "<mask>"
-    ])
-
+    if args.tokenizer_type == 'bbpe':
+        # Initialize a ByteLevel BPE tokenizer
+        tokenizer = ByteLevelBPETokenizer()
+        tokenizer._tokenizer.post_processor.verbose = True
+        # Train the tokenizer
+        print("Training tokenizer..")
+        tokenizer.train_from_iterator(all_texts, vocab_size=args.vocab_size, min_frequency=args.min_frequency, special_tokens=[
+            "<s>", "</s>", "<pad>", "<unk>", "<mask>"
+        ])
+    elif args.tokenizer_type == 'sentencebpe':
+        # Initialize a SentencePiece BPE tokenizer
+        tokenizer = SentencePieceBPETokenizer()
+        # Train the tokenizer
+        print("Training tokenizer..")
+        tokenizer.train_from_iterator(all_texts, vocab_size=args.vocab_size, min_frequency=args.min_frequency, special_tokens=[
+            "<s>", "</s>", "<pad>", "<unk>", "<mask>"
+        ])
+    elif args.tokenizer_type in  ['bertwordpiece', 'debertav2']:
+        # Initialize a DeBERTa V2 tokenizer
+        tokenizer = BertWordPieceTokenizer(lowercase=False)
+        # Train the tokenizer
+        print("Training tokenizer..")
+        tokenizer.train_from_iterator(all_texts, vocab_size=args.vocab_size, min_frequency=args.min_frequency, special_tokens=[
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"
+        ])
+    else:
+        raise ValueError(f"Invalid tokenizer type: {args.tokenizer_type}")
     # Save the tokenizer files
     print("Saving tokenizer..")
     save_dir = args.output_dir
     os.makedirs(save_dir, exist_ok=True)
     tokenizer.save_model(save_dir)
+
+    if args.tokenizer_type == 'debertav2':
+        # Load the tokenizer into transformers as a fast tokenizer
+        tokenizer = DebertaV2TokenizerFast.from_pretrained(save_dir)
+        print("Saving DeBertaV2tokenizer..")
+        save_dir = args.output_dir
+        os.makedirs(save_dir, exist_ok=True)
+        tokenizer.save_model(save_dir)
+
 
 if __name__ == "__main__":
     main()

@@ -9,8 +9,8 @@ import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 from transformers import (
 RobertaTokenizer,
-ModernBertConfig,
-ModernBertForMaskedLM,
+RobertaConfig,
+RobertaForMaskedLM,
 DataCollatorForLanguageModeling
 )
 from transformers import Trainer, TrainingArguments
@@ -270,7 +270,7 @@ def train_fn(tokenized_dataset, device, args):
     if global_ordinal() == 0: #.is_master_ordinal():
         wandb.login(key=args.wandb_key)
         wandb.init(
-            project="ModernBERT TPU pretraining",
+            project="RoBERTa TPU CPT",
             config={
                 "learning_rate": args.learning_rate,
                 "architecture": "RoBERTa",
@@ -290,7 +290,7 @@ def train_fn(tokenized_dataset, device, args):
     # Load pre-trained model
     xm.master_print("Loading the LM ...")
     if args.continue_from_checkpoint:
-        model = ModernBertForMaskedLM.from_pretrained(args.model_name)
+        model = RobertaForMaskedLM.from_pretrained(args.model_name)
         if args.checkpoint_path.startswith('gs://'):
             # Parse GCS path
             bucket_name = args.checkpoint_path.split('/')[2]
@@ -311,24 +311,13 @@ def train_fn(tokenized_dataset, device, args):
         else:
             model.load_state_dict(checkpoint)
     else:
-        model_config = ModernBertConfig.from_pretrained(args.model_name)
-        model_config.max_position_embeddings = args.max_seq_length
-        model_config.bos_token_id = args.tokenizer.bos_token_id
-        model_config.eos_token_id = args.tokenizer.eos_token_id
-        model_config.pad_token_id = args.tokenizer.pad_token_id
-        model_config.cls_token_id = args.tokenizer.cls_token_id
-        model_config.sep_token_id = args.tokenizer.sep_token_id
-        model_config.vocab_size = args.tokenizer.vocab_size
-
-        model = ModernBertForMaskedLM(model_config)
-
+        model = RobertaForMaskedLM.from_pretrained(args.model_name)
     model.to(device)
 
     # Set up data collator
     xm.master_print("Setting up data collator...")
     data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
-                                                    mlm=True,
-                                                    mlm_probability=args.mlm_probability)
+                                                    mlm=True, mlm_probability=0.15)
 
     # Decide on distributed sampler parameters:
     if args.num_cores == 1:
@@ -599,7 +588,6 @@ def main():
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--pre_tokenized", action='store_true', default=False)
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
-    parser.add_argument("--mlm_probability", type=float, default=0.25)
     parser.add_argument("--max_seq_length", type=int, default=512)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--num_warmup_steps", type=int, default=1000)
