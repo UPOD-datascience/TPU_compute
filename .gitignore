@@ -6,6 +6,9 @@ __pycache__/
 # keys
 gsa.json
 
+# data
+*.parquet
+
 # C extensions
 *.so
 
