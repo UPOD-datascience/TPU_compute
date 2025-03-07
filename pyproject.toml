@@ -22,6 +22,7 @@ fsspec = "2023.9.2"
 gcsfs = "2023.9.2"
 torch = "2.6.0"  # { version = "2.6.0", source = "torch" }
 wandb = "^0.19.6"
+tiktoken = "^0.9.0"
 
 [build-system]
 requires = ["poetry-core"]

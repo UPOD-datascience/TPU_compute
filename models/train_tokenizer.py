@@ -157,7 +157,7 @@ def read_parquet(file_path):
         texts = df['text'].tolist()
     return texts
 
-def read_parquet_iterator(file_path, batch_size=1024):
+def read_parquet_iterator(file_path, batch_size=10_000):
     """
     Iterator that reads a Parquet file in batches and yields the 'text' field from each row.
 
@@ -265,15 +265,32 @@ def main():
     print("Saving tokenizer..")
     save_dir = args.output_dir
     os.makedirs(save_dir, exist_ok=True)
-    tokenizer.save_model(save_dir)
+    tokenizer.save_model(os.path.join(save_dir))
 
     if args.tokenizer_type == 'debertav2':
         # Load the tokenizer into transformers as a fast tokenizer
-        tokenizer = DebertaV2TokenizerFast.from_pretrained(save_dir)
+        slow_tokenizer = BertWordPieceTokenizer(os.path.join(save_dir, 'vocab.txt'),
+                                                            unk_token="[UNK]",
+                                                            pad_token="[PAD]",
+                                                            cls_token="[CLS]",
+                                                            sep_token="[SEP]",
+                                                            mask_token="[MASK]")
+        slow_tokenizer.save(os.path.join(save_dir, 'tokenizer.json'))
+
+        tokenizer = DebertaV2TokenizerFast.from_pretrained(
+            save_dir,
+            tokenizer_file=os.path.join(save_dir,"tokenizer.json"),
+            vocab_file=os.path.join(save_dir,"vocab.txt"),
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            cls_token="[CLS]",
+            sep_token="[SEP]",
+            mask_token="[MASK]"
+        )
+
+        # Now save the tokenizer properly for Hugging Face compatibility
         print("Saving DeBertaV2tokenizer..")
-        save_dir = args.output_dir
-        os.makedirs(save_dir, exist_ok=True)
-        tokenizer.save_model(save_dir)
+        tokenizer.save_pretrained(save_dir)
 
 
 if __name__ == "__main__":

@@ -20,14 +20,14 @@ $cmd = 'cd /d ' + $env:FULL_SCRIPT_DIR + ' && poetry run python ../models/cpt_ro
        '--output_dir=' + $env:OUTPUT_DIR + ' ' +
        '--model_name=' + $env:MODEL_NAME + ' ' +
        '--tokenizer_name_or_path=' + $env:TOKENIZER_PATH + ' ' +
-       '--per_device_train_batch_size=24 ' +
-       '--gradient_accumulation_steps=10 ' +
+       '--per_device_train_batch_size=20 ' +
+       '--gradient_accumulation_steps=12 ' +
        '--save_epoch_percentage=0.05 ' +
        '--logging_steps=500 ' +
        '--num_warmup_steps=25_000 ' +
        '--num_cores=8 ' +
        '--max_seq_length=' + $env:MAX_SEQ_LEN + ' ' +
-       '--learning_rate=0.0001 ' +
+       '--learning_rate=5e-5 ' +
        '--keep_in_memory ' +
        '--weight_decay=0.001 ' +
        '--wandb_key=' + $env:WANDB_KEY + ' ' +

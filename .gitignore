@@ -9,6 +9,9 @@ gsa.json
 # data
 *.parquet
 
+# tracking
+*.wandb
+
 # C extensions
 *.so
 
