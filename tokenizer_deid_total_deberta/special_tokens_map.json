@@ -1,5 +1,11 @@
 {
-  "bos_token": "[CLS]",
+  "bos_token": {
+    "content": "[CLS]",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false
+  },
   "cls_token": {
     "content": "[CLS]",
     "lstrip": false,
@@ -7,7 +13,13 @@
     "rstrip": false,
     "single_word": false
   },
-  "eos_token": "[SEP]",
+  "eos_token": {
+    "content": "[SEP]",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false
+  },
   "mask_token": {
     "content": "[MASK]",
     "lstrip": false,
