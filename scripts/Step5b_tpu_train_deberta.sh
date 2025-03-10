@@ -36,8 +36,8 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --output_dir=${MODEL_BUCKET} \
   --model_name=${MODEL_NAME} \
   --tokenizer_name_or_path=/home/${USERNAME}/tokenizer \
-  --per_device_train_batch_size=32 \
-  --gradient_accumulation_steps=10 \
+  --per_device_train_batch_size=${BATCH_SIZE} \
+  --gradient_accumulation_steps=${GRAD_ACCUM_STEPS} \
   --save_epoch_percentage=0.05 \
   --logging_steps=250 \
   --num_warmup_steps=10_000 \

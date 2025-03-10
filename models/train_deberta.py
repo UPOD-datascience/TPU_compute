@@ -3,12 +3,13 @@ This is the main script to continue pre-training a Roberta model.
 """
 import argparse
 import torch
+from transformers.models.deberta_v2.tokenization_deberta_v2_fast import DebertaV2Tokenizer
 from torch_xla.runtime import world_size, global_ordinal
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 from transformers import (
-RobertaTokenizer,
+DebertaV2TokenizerFast,
 DebertaV2Config,
 DebertaV2ForMaskedLM,
 DataCollatorForLanguageModeling
@@ -280,7 +281,7 @@ def train_fn(tokenized_dataset, device, args):
                 "max_seq_length": args.max_seq_length,
                 "batch_size": args.per_device_train_batch_size,
             },
-            mode="offline",
+            mode="online",
             dir="/home/bes3/temp"
         )
 
@@ -681,7 +682,7 @@ def main():
             print(f"Removing shuffled dataset: {shuffle_dir}", flush=True)
             shutil.rmtree(shuffle_dir)
 
-    args.tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name_or_path)
+    args.tokenizer = DebertaV2TokenizerFast.from_pretrained(args.tokenizer_name_or_path)
     args.tokenizer.model_max_length = args.max_seq_length
 
     if args.shuffle_dataset:
