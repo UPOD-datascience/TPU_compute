@@ -19,8 +19,9 @@ def clean_text(text):
     - remove spurious repetitions of words
     '''
     # TODO: Add more/improve cleaning steps as needed
-    re_spurious_chars = re.compile(r'(\s)\1{4,}')
+    re_spurious_chars = re.compile(r'([^\w])\1{3,}')
     re_spurious_words = re.compile(r'(\b\w+\b)\1{4,}')
+
 
     # replace spurious repetitions of characters, punctuation, whitespace and linebreaks with a single instance
     text = re_spurious_chars.sub(r'\1', text)
