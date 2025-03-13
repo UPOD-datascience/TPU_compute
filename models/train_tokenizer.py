@@ -1,6 +1,12 @@
 # train_tokenizer.py
 from tokenizers import ByteLevelBPETokenizer, SentencePieceBPETokenizer,BertWordPieceTokenizer
-from transformers import DebertaV2TokenizerFast
+from transformers import DebertaV2TokenizerFast, PreTrainedTokenizerFast
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors
+from tokenizers.processors import TemplateProcessing
+from tokenizers.normalizers import BertNormalizer
+from tokenizers.pre_tokenizers import WhitespaceSplit
+from tokenizers.models import WordPiece
+
 import os
 import argparse
 import json
@@ -195,7 +201,7 @@ def main():
     parser.add_argument("--vocab_size", type=int, default=50_368)
     parser.add_argument("--min_frequency", type=int, default=100)
     parser.add_argument("--iterative", action='store_true')
-    parser.add_argument("--tokenizer_type", type=str, choices=['bbpe', 'sentencebpe', 'debertav2', 'bertwordpiece'], default='bbpe')
+    parser.add_argument("--tokenizer_type", type=str, choices=['bbpe', 'sentencebpe', 'debertav2', 'bertwordpiece', 'modernbert'], default='bbpe')
     args = parser.parse_args()
 
     print("Getting file list..")
@@ -235,7 +241,10 @@ def main():
 
         all_texts_iterator = combine_iterators(text_iterators)
         all_texts = map(clean_text, all_texts_iterator)
-
+    
+    save_dir = args.output_dir
+    os.makedirs(save_dir, exist_ok=True)
+        
     if args.tokenizer_type == 'bbpe':
         # Initialize a ByteLevel BPE tokenizer
         tokenizer = ByteLevelBPETokenizer()
@@ -245,6 +254,8 @@ def main():
         tokenizer.train_from_iterator(all_texts, vocab_size=args.vocab_size, min_frequency=args.min_frequency, special_tokens=[
             "<s>", "</s>", "<pad>", "<unk>", "<mask>"
         ])
+        print("Saving tokenizer..")
+        tokenizer.save_model(os.path.join(save_dir))
     elif args.tokenizer_type == 'sentencebpe':
         # Initialize a SentencePiece BPE tokenizer
         tokenizer = SentencePieceBPETokenizer()
@@ -253,6 +264,8 @@ def main():
         tokenizer.train_from_iterator(all_texts, vocab_size=args.vocab_size, min_frequency=args.min_frequency, special_tokens=[
             "<s>", "</s>", "<pad>", "<unk>", "<mask>"
         ])
+        print("Saving tokenizer..")
+        tokenizer.save_model(os.path.join(save_dir))
     elif args.tokenizer_type in  ['bertwordpiece', 'debertav2']:
         # Initialize a DeBERTa V2 tokenizer
         tokenizer = BertWordPieceTokenizer(lowercase=False)
@@ -261,13 +274,44 @@ def main():
         tokenizer.train_from_iterator(all_texts, vocab_size=args.vocab_size, min_frequency=args.min_frequency, special_tokens=[
             "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"
         ])
+        # Save the tokenizer files
+        print("Saving tokenizer..")
+        tokenizer.save_model(os.path.join(save_dir))
+    elif args.tokenizer_type=='modernbert':
+        # Initialize a DeBERTa V2 tokenizer
+        tokenizer = BertWordPieceTokenizer(lowercase=False)
+        # Train the tokenizer
+        print("Training tokenizer..")
+        tokenizer.train_from_iterator(all_texts, vocab_size=args.vocab_size, min_frequency=args.min_frequency, special_tokens=[
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"
+        ])
+        # Add special tokens based on your config
+        special_tokens_dict = {
+            "additional_special_tokens": [
+                "<|padding|>",
+                "<|endoftext|>",
+                "|||IP_ADDRESS|||",
+                "|||EMAIL_ADDRESS|||",
+                "|||PHONE_NUMBER|||"
+            ]
+        }
+
+        tokenizer.add_special_tokens(special_tokens_dict=special_tokens)        
+        # Wrap in PreTrainedTokenizerFast for ease of use:
+        tokenizer_fast = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer.backend_tokenizer,
+            model_max_length=1024,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            cls_token="[CLS]",
+            sep_token="[SEP]",
+            mask_token="[MASK]",
+            additional_special_tokens=special_tokens
+        )
+        print("Saving tokenizer..")
+        tokenizer_fast.save_pretrained(os.path.join(save_dir))
     else:
         raise ValueError(f"Invalid tokenizer type: {args.tokenizer_type}")
-    # Save the tokenizer files
-    print("Saving tokenizer..")
-    save_dir = args.output_dir
-    os.makedirs(save_dir, exist_ok=True)
-    tokenizer.save_model(os.path.join(save_dir))
 
     if args.tokenizer_type == 'debertav2':
         # Load the tokenizer into transformers as a fast tokenizer
