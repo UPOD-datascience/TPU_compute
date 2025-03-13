@@ -271,7 +271,7 @@ def train_fn(tokenized_dataset, device, args):
     if global_ordinal() == 0: #.is_master_ordinal():
         wandb.login(key=args.wandb_key)
         wandb.init(
-            project="RoBERTa TPU pretraining",
+            project="DeBERTaV2 TPU pretraining",
             config={
                 "learning_rate": args.learning_rate,
                 "architecture": "DeBERTaV2",
@@ -313,17 +313,21 @@ def train_fn(tokenized_dataset, device, args):
             model.load_state_dict(checkpoint)
     else:
         model_config = DebertaV2Config.from_pretrained(args.model_name)
-        model_config.max_position_embeddings = args.max_seq_length
         model_config.bos_token_id = args.tokenizer.bos_token_id
         model_config.eos_token_id = args.tokenizer.eos_token_id
         model_config.pad_token_id = args.tokenizer.pad_token_id
         model_config.cls_token_id = args.tokenizer.cls_token_id
         model_config.sep_token_id = args.tokenizer.sep_token_id
         model_config.vocab_size = args.tokenizer.vocab_size
+        model_config.num_hidden_layers = args.num_hidden_layers
+        model_config.num_attention_heads = args.num_attention_heads
+        model_config.hidden_size = args.hidden_size
+        model_config.intermediate_size = args.intermediate_size
+        model_config.max_position_embeddings = args.max_seq_length
 
         model = DebertaV2ForMaskedLM(model_config)
 
-    model.to(device)
+    model = model.to(device=device, dtype=torch.bfloat16)
 
     # Set up data collator
     xm.master_print("Setting up data collator...")
@@ -421,7 +425,7 @@ def train_fn(tokenized_dataset, device, args):
         step = -1
         for step, batch in enumerate(safe_iter(xla_train_loader)):
             try:
-                batch = {k: v.to(device) for k, v in batch.items()}
+                batch = {k: v.to(device=device, dtype=torch.bfloat16) if v.dtype==torch.float32 else v.to(device) for k, v in batch.items()}
                 outputs = model(**batch)
                 loss = outputs.loss
                 loss.backward()
@@ -602,6 +606,10 @@ def main():
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
     parser.add_argument("--mlm_probability", type=float, default=0.25)
     parser.add_argument("--max_seq_length", type=int, default=512)
+    parser.add_argument("--hidden_size", type=int, default=768)
+    parser.add_argument("--intermediate_size", type=int, default=3072)
+    parser.add_argument("--num_attention_heads", type=int, default=12)
+    parser.add_argument("--num_hidden_layers", type=int, default=12)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--num_warmup_steps", type=int, default=1000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)

@@ -40,15 +40,19 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --gradient_accumulation_steps=${GRAD_ACCUM_STEPS} \
   --save_epoch_percentage=0.05 \
   --logging_steps=250 \
-  --num_warmup_steps=10_000 \
+  --num_warmup_steps=${NUM_WARMUP} \
   --num_cores=8 \
+  --hidden_size=${HIDDEN_SIZE} \
+  --intermediate_size=${INTERMEDIATE_SIZE} \
+  --num_hidden_layers=${HIDDEN_LAYERS} \
+  --num_attention_heads=${NUM_ATTENTION_HEADS} \
   --max_seq_length=${MAX_SEQ_LEN} \
-  --learning_rate=0.0002 \
+  --learning_rate=${LR} \
   --streaming_data \
   --shuffle_dataset \
   --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
   --max_steps_per_epoch=50_000 \
-  --weight_decay=0.001 \
+  --weight_decay=${WEIGHT_DECAY} \
   --wandb_key=${WANDB_KEY} \
   --num_train_epochs=5 2>&1 | tee ~/logs.txt &" &
 disown

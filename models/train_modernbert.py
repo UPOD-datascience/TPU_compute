@@ -8,7 +8,7 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 from transformers import (
-RobertaTokenizer,
+PreTrainedTokenizerFast,
 ModernBertConfig,
 ModernBertForMaskedLM,
 DataCollatorForLanguageModeling
@@ -273,14 +273,14 @@ def train_fn(tokenized_dataset, device, args):
             project="ModernBERT TPU pretraining",
             config={
                 "learning_rate": args.learning_rate,
-                "architecture": "RoBERTa",
+                "architecture": "ModernBERT",
                 "dataset": args.dataset_dir,
                 "epochs": args.num_train_epochs,
                 "weight_decay": args.weight_decay,
                 "max_seq_length": args.max_seq_length,
                 "batch_size": args.per_device_train_batch_size,
             },
-            mode="offline",
+            mode="online",
             dir="/home/bes3/temp"
         )
 
@@ -290,7 +290,7 @@ def train_fn(tokenized_dataset, device, args):
     # Load pre-trained model
     xm.master_print("Loading the LM ...")
     if args.continue_from_checkpoint:
-        model = ModernBertForMaskedLM.from_pretrained(args.model_name)
+        model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
         if args.checkpoint_path.startswith('gs://'):
             # Parse GCS path
             bucket_name = args.checkpoint_path.split('/')[2]
@@ -312,17 +312,21 @@ def train_fn(tokenized_dataset, device, args):
             model.load_state_dict(checkpoint)
     else:
         model_config = ModernBertConfig.from_pretrained(args.model_name)
-        model_config.max_position_embeddings = args.max_seq_length
         model_config.bos_token_id = args.tokenizer.bos_token_id
         model_config.eos_token_id = args.tokenizer.eos_token_id
         model_config.pad_token_id = args.tokenizer.pad_token_id
         model_config.cls_token_id = args.tokenizer.cls_token_id
         model_config.sep_token_id = args.tokenizer.sep_token_id
         model_config.vocab_size = args.tokenizer.vocab_size
+        model_config.num_hidden_layers = args.num_hidden_layers
+        model_config.num_attention_heads = args.num_attention_heads
+        model_config.hidden_size = args.hidden_size
+        model_config.intermediate_size = args.intermediate_size
+        model_config.max_position_embeddings = args.max_seq_length
 
         model = ModernBertForMaskedLM(model_config)
 
-    model.to(device)
+    model = model.to(device=device, dtype=torch.bfloat16)
 
     # Set up data collator
     xm.master_print("Setting up data collator...")
@@ -420,7 +424,7 @@ def train_fn(tokenized_dataset, device, args):
         step = -1
         for step, batch in enumerate(safe_iter(xla_train_loader)):
             try:
-                batch = {k: v.to(device) for k, v in batch.items()}
+                batch = {k: v.to(device=device, dtype=torch.bfloat16) if v.dtype==torch.float32 else v.to(device) for k, v in batch.items()}
                 outputs = model(**batch)
                 loss = outputs.loss
                 loss.backward()
@@ -601,6 +605,10 @@ def main():
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
     parser.add_argument("--mlm_probability", type=float, default=0.25)
     parser.add_argument("--max_seq_length", type=int, default=512)
+    parser.add_argument("--hidden_size", type=int, default=768)
+    parser.add_argument("--intermediate_size", type=int, default=3072)
+    parser.add_argument("--num_attention_heads", type=int, default=12)
+    parser.add_argument("--num_hidden_layers", type=int, default=12)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--num_warmup_steps", type=int, default=1000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -681,7 +689,8 @@ def main():
             print(f"Removing shuffled dataset: {shuffle_dir}", flush=True)
             shutil.rmtree(shuffle_dir)
 
-    args.tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name_or_path)
+    args.tokenizer = PreTrainedTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
+    args.tokenizer.model_max_length = args.max_seq_length
 
     if args.shuffle_dataset:
             args.dataset_dir = args.shuffle_dataset_path

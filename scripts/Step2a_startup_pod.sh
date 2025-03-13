@@ -18,7 +18,11 @@ grep_exit_code=$?
 set -e
 
 if [ $grep_exit_code -eq 0 ]; then
-    echo "TPU ${TPU_NAME} already exists, skipping creation."
+    echo "TPU ${TPU_NAME} exists, deleting."
+    gcloud compute tpus tpu-vm delete "${TPU_NAME}" \
+        --zone="${ZONE}" \
+        --project="${PROJECT_ID}" \
+        --quiet
 else
 echo "Creating TPU ${TPU_NAME}..."
 if [ "${PRE_EMPTIBLE}" = true ]; then
