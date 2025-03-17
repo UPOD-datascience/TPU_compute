@@ -46,6 +46,8 @@ Sources:
 
 [ModernBERT pre-training](https://github.com/AnswerDotAI/ModernBERT/tree/main)
 
+[EuroBERT pre-training](https://github.com/Nicolas-BZRD/EuroBERT)
+
 [Llama3 pre-training](https://github.com/vvr-rao/Training-a-Mini-114M-Parameter-Llama-3-like-Model-from-Scratch/blob/main/model%20and%20training%20code/train.py)
 
 [QAT training](https://github.com/Qualcomm-AI-research/lr-qat)
