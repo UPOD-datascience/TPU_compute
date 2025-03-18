@@ -6,8 +6,9 @@ set -o allexport
 source ../.env
 set +o allexport
 
+./delete.sh
 ./Step2a_startup_pod.sh
-./Step2b_install_prequisites.sh
+./Step2b_install_prequisites.s`z h
 #./Step3a_normalize_data.sh
 #./Step3b_tokenize_data.sh
 ./Step4_upload_scripts.sh

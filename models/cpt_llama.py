@@ -3,14 +3,15 @@ This is the main script to continue pre-training a Roberta model.
 """
 import argparse
 import torch
+from transformers.models.deberta_v2.tokenization_deberta_v2_fast import DebertaV2Tokenizer
 from torch_xla.runtime import world_size, global_ordinal
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 from transformers import (
-RobertaTokenizer,
-RobertaConfig,
-RobertaForMaskedLM,
+LlamaTokenizerFast,
+LlamaConfig,
+LlamaForCausalLM,
 DataCollatorForLanguageModeling
 )
 from transformers import Trainer, TrainingArguments
@@ -105,10 +106,19 @@ class ShardedShuffleDataset(torch.utils.data.IterableDataset):
 
 def tokenize_function(examples, tokenizer, max_seq_length):
     # here you can actually add a chunker to split the text into smaller parts, of max_len
-    return tokenizer(examples["text"],
-                    truncation=True,
+    output= tokenizer(examples["text"],
+                    truncation=False,
                     max_length=max_seq_length,
-                    padding=True)
+                    return_overflowing_tokens=True,
+                    return_length=True
+    )
+    input_batch = []
+    for length, input_ids in zip(output['length'], output['input_ids']):
+        input_batch.append({
+            "input_ids": input_ids,
+            "attention_mask": [1] * length
+        })
+    return {"input_ids": input_batch}
 
 def load_from_gcs(bucket_name, blob_name, local_path, device):
     # Initialize a client
@@ -156,18 +166,53 @@ def load_sharded_dataset(datasets, dformat):
     return DatasetDict(sharded_dataset)
 
 
-def group_texts(examples, max_seq_length):
-    # Concatenate all texts.
-    concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-    total_length = len(concatenated_examples[list(examples.keys())[0]])
-    total_length = (total_length // max_seq_length) * max_seq_length
-    # Split by chunks of max_len.
-    # TODO: add sentence/paragraph boundary respecter..
-    # TODO: add a chunker that also store the last part of the previous chunk
-    result = {
-        k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
-        for k, t in concatenated_examples.items()
-    }
+def group_texts(examples, max_seq_length, pad_token=0):
+    """
+    Group already tokenized texts into chunks of max_seq_length while respecting sample boundaries.
+
+    Args:
+        examples: Dictionary with keys like 'input_ids', 'attention_mask', etc. where each value
+                 is a list of tokenized examples
+        max_seq_length: Maximum sequence length
+        pad_token: Token to use for padding (default: 0)
+
+    Returns:
+        Dictionary with same keys but values chunked to max_seq_length with padding
+    """
+    result = {k: [] for k in examples.keys()}
+
+    # Get a sample key to determine the number of examples
+    sample_key = list(examples.keys())[0]
+
+    # Loop through each tokenized example
+    for i in range(len(examples[sample_key])):
+        # Extract the current tokenized example for each feature
+        current_example = {k: examples[k][i] for k in examples.keys()}
+
+        # Calculate how many chunks we need for this example
+        example_length = len(current_example[sample_key])
+        num_chunks = (example_length + max_seq_length - 1) // max_seq_length  # Ceiling division
+
+        # Split each feature into chunks
+        for k, tokens in current_example.items():
+            # Create chunks of max_seq_length
+            chunks = []
+            for j in range(0, example_length, max_seq_length):
+                chunk = tokens[j:min(j + max_seq_length, example_length)]
+
+                # Pad if necessary
+                if len(chunk) < max_seq_length:
+                    chunk = chunk + [pad_token] * (max_seq_length - len(chunk))
+
+                chunks.append(chunk)
+
+            # If we don't have enough chunks (unlikely but possible with different length features)
+            while len(chunks) < num_chunks:
+                chunks.append([pad_token] * max_seq_length)
+
+            # Add the chunks to the result
+            result[k].extend(chunks)
+
     return result
 
 def prep_fn(args):
@@ -245,7 +290,7 @@ def prep_fn(args):
 
         opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
         print("Performing chunking tokenized data...", flush=True)
-        group_fn = partial(group_texts, max_seq_length=args.max_seq_length)
+        group_fn = partial(group_texts, max_seq_length=args.max_seq_length, pad_token=args.tokenizer.pad_token_id)
         tokenized_dataset = tokenized_dataset_raw.map(
                 group_fn,
                 batched=True,
@@ -270,17 +315,17 @@ def train_fn(tokenized_dataset, device, args):
     if global_ordinal() == 0: #.is_master_ordinal():
         wandb.login(key=args.wandb_key)
         wandb.init(
-            project="RoBERTa TPU CPT",
+            project="Llama 3.2 - 1B TPU pretraining from scratch",
             config={
                 "learning_rate": args.learning_rate,
-                "architecture": "RoBERTa",
+                "architecture": "Llama 3.2 - 1B",
                 "dataset": args.dataset_dir,
                 "epochs": args.num_train_epochs,
                 "weight_decay": args.weight_decay,
                 "max_seq_length": args.max_seq_length,
                 "batch_size": args.per_device_train_batch_size,
             },
-            mode="offline",
+            mode="online",
             dir="/home/bes3/temp"
         )
 
@@ -290,7 +335,8 @@ def train_fn(tokenized_dataset, device, args):
     # Load pre-trained model
     xm.master_print("Loading the LM ...")
     if args.continue_from_checkpoint:
-        model = RobertaForMaskedLM.from_pretrained(args.model_name)
+        model_config = LlamaConfig.from_pretrained(args.model_name)
+        model = LlamaForCausalLM(model_config)
         if args.checkpoint_path.startswith('gs://'):
             # Parse GCS path
             bucket_name = args.checkpoint_path.split('/')[2]
@@ -311,13 +357,15 @@ def train_fn(tokenized_dataset, device, args):
         else:
             model.load_state_dict(checkpoint)
     else:
-        model = RobertaForMaskedLM.from_pretrained(args.model_name)
-    model.to(device)
+        model = LlamaForCausalLM(args.model_name)
+        pass
+
+    model = model.to(device=device, dtype=torch.bfloat16)
 
     # Set up data collator
     xm.master_print("Setting up data collator...")
     data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
-                                                    mlm=True, mlm_probability=0.15)
+                                                    mlm=False)
 
     # Decide on distributed sampler parameters:
     if args.num_cores == 1:
@@ -409,7 +457,7 @@ def train_fn(tokenized_dataset, device, args):
         step = -1
         for step, batch in enumerate(safe_iter(xla_train_loader)):
             try:
-                batch = {k: v.to(device) for k, v in batch.items()}
+                batch = {k: v.to(device=device, dtype=torch.bfloat16) if v.dtype==torch.float32 else v.to(device) for k, v in batch.items()}
                 outputs = model(**batch)
                 loss = outputs.loss
                 loss.backward()
@@ -470,10 +518,8 @@ def train_fn(tokenized_dataset, device, args):
                             subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
                             # rename the directory on GCS to the model name, date, and epoch_step
                             # Generate a new directory name with model name, date, and epoch_step
-                            current_time = datetime.datetime.now().strftime("%Y%m%d")
-                            new_dir_name = f"{args.model_name}_epoch{epoch}_step{step}_{current_time}"
+                            new_dir_name = f"{args.model_name}_latest"
                             new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                            # Rename the directory on GCS
                             subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
 
                     else:
@@ -585,10 +631,10 @@ def main():
     parser.add_argument("--dataset_format", default="json", choices=["json", "parquet", "arrow"])
     parser.add_argument("--tmp_dir", type=str, required=True)
     parser.add_argument("--tokenizer_name_or_path", type=str, required=True)
+    parser.add_argument("--max_seq_length", type=int, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--pre_tokenized", action='store_true', default=False)
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
-    parser.add_argument("--max_seq_length", type=int, default=512)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--num_warmup_steps", type=int, default=1000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -669,7 +715,8 @@ def main():
             print(f"Removing shuffled dataset: {shuffle_dir}", flush=True)
             shutil.rmtree(shuffle_dir)
 
-    args.tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name_or_path)
+    args.tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
+    args.tokenizer.model_max_length = args.max_seq_length
 
     if args.shuffle_dataset:
             args.dataset_dir = args.shuffle_dataset_path
