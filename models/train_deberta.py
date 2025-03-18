@@ -108,8 +108,7 @@ def tokenize_function(examples, tokenizer, max_seq_length):
     # here you can actually add a chunker to split the text into smaller parts, of max_len
     return tokenizer(examples["text"],
                     truncation=False,
-                    max_length=max_seq_length,
-                    padding=None)
+                    max_length=max_seq_length)
 
 def load_from_gcs(bucket_name, blob_name, local_path, device):
     # Initialize a client

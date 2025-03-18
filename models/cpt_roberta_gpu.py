@@ -105,8 +105,7 @@ def prep_fn(args):
             # here you can actually add a chunker to split the text into smaller parts, of max_len
             return tokenizer(examples["text"],
                              truncation=False,
-                             max_length=args.max_seq_length,
-                             padding=None)
+                             max_length=args.max_seq_length)
         opt_kwargs = {'num_proc': 8} if args.streaming_data==False else {}
 
         tokenized_dataset_raw = dataset.map(tokenize_function,
