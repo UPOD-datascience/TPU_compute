@@ -283,30 +283,29 @@ def main():
         # Train the tokenizer
         print("Training tokenizer..")
         tokenizer.train_from_iterator(all_texts, vocab_size=args.vocab_size, min_frequency=args.min_frequency, special_tokens=[
-            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"
-        ])
-        # Add special tokens based on your config
-        special_tokens_dict = {
-            "additional_special_tokens": [
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", 
                 "<|padding|>",
                 "<|endoftext|>",
                 "|||IP_ADDRESS|||",
                 "|||EMAIL_ADDRESS|||",
                 "|||PHONE_NUMBER|||"
-            ]
-        }
-
-        tokenizer.add_special_tokens(special_tokens_dict=special_tokens)        
+        ])
+        tokenizer.save(os.path.join(save_dir, "tokenizer.json"))
+        
         # Wrap in PreTrainedTokenizerFast for ease of use:
         tokenizer_fast = PreTrainedTokenizerFast(
-            tokenizer_object=tokenizer.backend_tokenizer,
+            tokenizer_file=os.path.join(save_dir, "tokenizer.json"),
             model_max_length=1024,
             unk_token="[UNK]",
             pad_token="[PAD]",
             cls_token="[CLS]",
             sep_token="[SEP]",
             mask_token="[MASK]",
-            additional_special_tokens=special_tokens
+            additional_special_tokens=["<|padding|>",
+                                    "<|endoftext|>",
+                                    "|||IP_ADDRESS|||",
+                                    "|||EMAIL_ADDRESS|||",
+                                    "|||PHONE_NUMBER|||"]
         )
         print("Saving tokenizer..")
         tokenizer_fast.save_pretrained(os.path.join(save_dir))

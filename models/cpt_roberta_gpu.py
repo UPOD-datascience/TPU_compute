@@ -26,22 +26,57 @@ import datetime
 import shutil
 import numpy as np
 from itertools import chain
+from functools import partial
 
 
 def prep_fn(args):
-    def group_texts(examples):
-        # Concatenate all texts.
-        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, and if the total_length < max_seq_length  we exclude this batch and return an empty dict.
-        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
-        total_length = (total_length // args.max_seq_length) * args.max_seq_length
-        # Split by chunks of max_len.
-        # TODO: add sentence/paragraph boundary respecter..
-        result = {
-            k: [t[i : i + args.max_seq_length] for i in range(0, total_length, args.max_seq_length)]
-            for k, t in concatenated_examples.items()
-        }
+    def group_texts(examples, pad_token=0):
+        """
+        Group already tokenized texts into chunks of max_seq_length while respecting sample boundaries.
+
+        Args:
+            examples: Dictionary with keys like 'input_ids', 'attention_mask', etc. where each value
+                     is a list of tokenized examples
+            max_seq_length: Maximum sequence length
+            pad_token: Token to use for padding (default: 0)
+
+        Returns:
+            Dictionary with same keys but values chunked to max_seq_length with padding
+        """
+        result = {k: [] for k in examples.keys()}
+
+        # Get a sample key to determine the number of examples
+        sample_key = list(examples.keys())[0]
+
+        # Loop through each tokenized example
+        for i in range(len(examples[sample_key])):
+            # Extract the current tokenized example for each feature
+            current_example = {k: examples[k][i] for k in examples.keys()}
+
+            # Calculate how many chunks we need for this example
+            example_length = len(current_example[sample_key])
+            num_chunks = (example_length + args.max_seq_length - 1) // args.max_seq_length  # Ceiling division
+
+            # Split each feature into chunks
+            for k, tokens in current_example.items():
+                # Create chunks of max_seq_length
+                chunks = []
+                for j in range(0, example_length, max_seq_length):
+                    chunk = tokens[j:min(j + args.max_seq_length, example_length)]
+
+                    # Pad if necessary
+                    if len(chunk) < args.max_seq_length:
+                        chunk = chunk + [pad_token] * (args.max_seq_length - len(chunk))
+
+                    chunks.append(chunk)
+
+                # If we don't have enough chunks (unlikely but possible with different length features)
+                while len(chunks) < num_chunks:
+                    chunks.append([pad_token] * args.max_seq_length)
+
+                # Add the chunks to the result
+                result[k].extend(chunks)
+
         return result
 
     # Load tokenizer
@@ -69,9 +104,9 @@ def prep_fn(args):
         def tokenize_function(examples):
             # here you can actually add a chunker to split the text into smaller parts, of max_len
             return tokenizer(examples["text"],
-                             truncation=True,
+                             truncation=False,
                              max_length=args.max_seq_length,
-                             padding=True) #"max_length")
+                             padding=None)
         opt_kwargs = {'num_proc': 8} if args.streaming_data==False else {}
 
         tokenized_dataset_raw = dataset.map(tokenize_function,
@@ -84,8 +119,9 @@ def prep_fn(args):
                                          **opt_kwargs)
 
         opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
+        group_fn = partial(group_texts, pad_token=args.tokenizer.pad_token_id)
         tokenized_dataset = tokenized_dataset_raw.map(
-                group_texts,
+                group_fn,
                 batched=True,
                 **opt_kwargs
             )
