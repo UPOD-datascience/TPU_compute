@@ -1,13 +1,13 @@
 #!/bin/bash
 gcloud components update
 
-# Exit immediately if a command exits with a non-zero status
-set -e
+# # Exit immediately if a command exits with a non-zero status
+# set -e
 
-# Export variables from .env file
-set -o allexport
-source ../.env
-set +o allexport
+# # Export variables from .env file
+# set -o allexport
+# source ../.env
+# set +o allexport
 
 echo "Checking if TPU ${TPU_NAME} exists..."
 

@@ -1,10 +1,10 @@
 # Exit immediately if a command exits with a non-zero status
-set -e
+# set -e
 
-# Export variables from .env file
-set -o allexport
-source ../.env
-set +o allexport
+# # Export variables from .env file
+# set -o allexport
+# source ../.env
+# set +o allexport
 
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \

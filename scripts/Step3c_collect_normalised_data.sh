@@ -1,7 +1,7 @@
 #!/bin/bash
-set -o allexport
-source ../.env
-set +o allexport
+# set -o allexport
+# source ../.env
+# set +o allexport
 
 echo "Download, normalize and re-upload the GCS data..locally!"
 python3 normalised_dataset_collector.py \

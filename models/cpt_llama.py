@@ -110,7 +110,8 @@ def tokenize_function(examples, tokenizer, max_seq_length):
                     truncation=False,
                     max_length=max_seq_length,
                     return_overflowing_tokens=True,
-                    return_length=True
+                    return_length=True,
+                    padding=None
     )
     input_batch = []
     for length, input_ids in zip(output['length'], output['input_ids']):

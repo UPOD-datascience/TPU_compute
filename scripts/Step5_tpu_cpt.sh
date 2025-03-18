@@ -18,7 +18,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --command="rm -rf /home/${USERNAME}/.cache/*; rm ~/logs.txt"
 
 echo "Uploading .env and training wrapper script..."
-gcloud compute tpus tpu-vm scp ../.env train_wrapper.sh ${TPU_NAME}:/home/${USERNAME}/ \
+gcloud compute tpus tpu-vm scp ../.cpt.env cpt_wrapper.sh ${TPU_NAME}:/home/${USERNAME}/ \
     --zone=${ZONE} --project=${PROJECT_ID} --worker=all
 
 echo "Stopping all running processes..."
@@ -40,7 +40,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all \
-  --command="chmod +x ~/train_wrapper.sh && tmux new-session -d -s train_session '~/train_wrapper.sh'"
+  --command="chmod +x ~/cpt_wrapper.sh && tmux new-session -d -s train_session '~/cpt_wrapper.sh'"
 
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --worker=all \

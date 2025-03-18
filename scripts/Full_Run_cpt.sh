@@ -3,18 +3,14 @@ set -e
 
 # Export variables from .env file
 set -o allexport
-source ../.env
+source ../.cpt.env
 set +o allexport
 
 ./delete.sh
 ./Step2a_startup_pod.sh
-./Step2b_install_prequisites.s`z h
-#./Step3a_normalize_data.sh
-#./Step3b_tokenize_data.sh
+./Step2b_install_prequisites
 ./Step4_upload_scripts.sh
-./Step5a_tpu_cpt_roberta.sh
-#./Step5b_tpu_train_deberta.sh
-#./Step5c_tpu_cpt_modernbert.sh
+./Step5_tpu_cpt.sh
 
 #gcloud compute tpus tpu-vm delete  \
 #  --zone=${ZONE}

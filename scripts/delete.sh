@@ -1,10 +1,10 @@
 # Exit immediately if a command exits with a non-zero status
-set -e
+# set -e
 
-# Export variables from .env file
-set -o allexport
-source ../.env
-set +o allexport
+# # Export variables from .env file
+# set -o allexport
+# source ../.env
+# set +o allexport
 
 gcloud compute tpus tpu-vm list --zone="${ZONE}" --project="${PROJECT_ID}" | grep -q "${TPU_NAME}"
 grep_exit_code=$?

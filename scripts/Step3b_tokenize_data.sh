@@ -1,7 +1,7 @@
 #!/bin/bash
-set -o allexport
-source ../.env
-set +o allexport
+# set -o allexport
+# source ../.env
+# set +o allexport
 
 echo "Preloading data into the dataset folder"
 python3 preloading_dataset.py  \
