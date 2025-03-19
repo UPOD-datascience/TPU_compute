@@ -109,6 +109,7 @@ def tokenize_function(examples, tokenizer, max_seq_length):
     output= tokenizer(examples["text"],
                     truncation=False,
                     max_length=max_seq_length,
+                    padding="max_length",
                     return_overflowing_tokens=True,
                     return_length=True
     )
