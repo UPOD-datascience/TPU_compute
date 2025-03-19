@@ -61,7 +61,7 @@ def prep_fn(args):
             for k, tokens in current_example.items():
                 # Create chunks of max_seq_length
                 chunks = []
-                for j in range(0, example_length, max_seq_length):
+                for j in range(0, example_length, args.max_seq_length):
                     chunk = tokens[j:min(j + args.max_seq_length, example_length)]
 
                     # Pad if necessary
@@ -118,7 +118,7 @@ def prep_fn(args):
                                          **opt_kwargs)
 
         opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
-        group_fn = partial(group_texts, pad_token=args.tokenizer.pad_token_id)
+        group_fn = partial(group_texts, pad_token=tokenizer.pad_token_id)
         tokenized_dataset = tokenized_dataset_raw.map(
                 group_fn,
                 batched=True,
