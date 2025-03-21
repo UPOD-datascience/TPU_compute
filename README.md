@@ -50,7 +50,7 @@ Sources:
 
 [FANFormer pre-training](https://github.com/YihongDong/FANformer/blob/main/configs/FANformer-1B-pretrain.yaml)
 
-[Llama3 pre-training](https://github.com/vvr-rao/Training-a-Mini-114M-Parameter-Llama-3-like-Model-from-Scratch/blob/main/model%20and%20training%20code/train.py)
+[Llama3 pre-training](https://github.com/vvr-rao/Training-a-Mini-114M-Parameter-Llama-3-like-Model-from-Scratch/blob/main/model%20and%20training%20code/train.py), [Llama3 base](https://github.com/meta-llama/llama-models/tree/main/models/llama3)
 
 [QAT training](https://github.com/Qualcomm-AI-research/lr-qat)
 
