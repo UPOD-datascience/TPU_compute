@@ -1,0 +1,14 @@
+{
+  "additional_special_tokens": [
+    "<|padding|>",
+    "<|endoftext|>",
+    "|||IP_ADDRESS|||",
+    "|||EMAIL_ADDRESS|||",
+    "|||PHONE_NUMBER|||"
+  ],
+  "cls_token": "[CLS]",
+  "mask_token": "[MASK]",
+  "pad_token": "[PAD]",
+  "sep_token": "[SEP]",
+  "unk_token": "[UNK]"
+}
