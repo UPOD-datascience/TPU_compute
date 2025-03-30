@@ -8,7 +8,7 @@ set +o allexport
 
 ./delete.sh
 ./Step2a_startup_pod.sh
-./Step2b_install_prequisites
+./Step2b_install_prequisites.sh
 ./Step4_upload_scripts.sh
 ./Step5_tpu_cpt.sh
 

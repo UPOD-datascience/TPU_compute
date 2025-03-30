@@ -3,7 +3,6 @@ This is the main script to continue pre-training a Roberta model.
 """
 import argparse
 import torch
-from transformers.models.deberta_v2.tokenization_deberta_v2_fast import DebertaV2Tokenizer
 from torch_xla.runtime import world_size, global_ordinal
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
