@@ -340,7 +340,7 @@ def train_fn(tokenized_dataset, device, args):
 
     model = DebertaV2ForMaskedLM(model_config)
 
-    if args.continue_from_checkpoint:
+    if isinstance(args.checkpoint_path, str) & (args.checkpoint_path != ""):
         if args.checkpoint_path.startswith('gs://'):
             # Parse GCS path
             bucket_name = args.checkpoint_path.split('/')[2]
@@ -662,7 +662,6 @@ def main():
     parser.add_argument("--shuffle_dataset", action='store_true')
     parser.add_argument("--shuffle_force_update", action='store_true')
     parser.add_argument("--debug", action='store_true')
-    parser.add_argument("--continue_from_checkpoint", action='store_true')
     parser.add_argument("--checkpoint_path", type=str)
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")

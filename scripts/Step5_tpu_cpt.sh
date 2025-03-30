@@ -46,5 +46,4 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --worker=all \
     --command="tmux ls"
 
-
 echo "Training session launched successfully!"

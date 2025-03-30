@@ -335,7 +335,7 @@ def train_fn(tokenized_dataset, device, args):
 
     # Load pre-trained model
     xm.master_print("Loading the LM ...")
-    if args.continue_from_checkpoint:
+    if isinstance(args.checkpoint_path, str) & (args.checkpoint_path != ""):
         model_config = LlamaConfig.from_pretrained(args.model_name)
         model = LlamaForCausalLM(model_config)
         if args.checkpoint_path.startswith('gs://'):
@@ -654,7 +654,6 @@ def main():
     parser.add_argument("--shuffle_dataset", action='store_true')
     parser.add_argument("--shuffle_force_update", action='store_true')
     parser.add_argument("--debug", action='store_true')
-    parser.add_argument("--continue_from_checkpoint", action='store_true')
     parser.add_argument("--checkpoint_path", type=str)
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")

@@ -1,7 +1,7 @@
 #!/bin/bash
-# set -o allexport
-# source ../.env
-# set +o allexport
+#set -o allexport
+#source ../.env
+#set +o allexport
 
 echo "Setting environment variables..."
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \

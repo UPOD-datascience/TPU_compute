@@ -156,18 +156,53 @@ def load_sharded_dataset(datasets, dformat):
     return DatasetDict(sharded_dataset)
 
 
-def group_texts(examples, max_seq_length):
-    # Concatenate all texts.
-    concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-    total_length = len(concatenated_examples[list(examples.keys())[0]])
-    total_length = (total_length // max_seq_length) * max_seq_length
-    # Split by chunks of max_len.
-    # TODO: add sentence/paragraph boundary respecter..
-    # TODO: add a chunker that also store the last part of the previous chunk
-    result = {
-        k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
-        for k, t in concatenated_examples.items()
-    }
+def group_texts(examples, max_seq_length, pad_token=0):
+    """
+    Group already tokenized texts into chunks of max_seq_length while respecting sample boundaries.
+
+    Args:
+        examples: Dictionary with keys like 'input_ids', 'attention_mask', etc. where each value
+                 is a list of tokenized examples
+        max_seq_length: Maximum sequence length
+        pad_token: Token to use for padding (default: 0)
+
+    Returns:
+        Dictionary with same keys but values chunked to max_seq_length with padding
+    """
+    result = {k: [] for k in examples.keys()}
+
+    # Get a sample key to determine the number of examples
+    sample_key = list(examples.keys())[0]
+
+    # Loop through each tokenized example
+    for i in range(len(examples[sample_key])):
+        # Extract the current tokenized example for each feature
+        current_example = {k: examples[k][i] for k in examples.keys()}
+
+        # Calculate how many chunks we need for this example
+        example_length = len(current_example[sample_key])
+        num_chunks = (example_length + max_seq_length - 1) // max_seq_length  # Ceiling division
+
+        # Split each feature into chunks
+        for k, tokens in current_example.items():
+            # Create chunks of max_seq_length
+            chunks = []
+            for j in range(0, example_length, max_seq_length):
+                chunk = tokens[j:min(j + max_seq_length, example_length)]
+
+                # Pad if necessary
+                if len(chunk) < max_seq_length:
+                    chunk = chunk + [pad_token] * (max_seq_length - len(chunk))
+
+                chunks.append(chunk)
+
+            # If we don't have enough chunks (unlikely but possible with different length features)
+            while len(chunks) < num_chunks:
+                chunks.append([pad_token] * max_seq_length)
+
+            # Add the chunks to the result
+            result[k].extend(chunks)
+
     return result
 
 def prep_fn(args):
@@ -245,7 +280,8 @@ def prep_fn(args):
 
         opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
         print("Performing chunking tokenized data...", flush=True)
-        group_fn = partial(group_texts, max_seq_length=args.max_seq_length)
+        group_fn = partial(group_texts, max_seq_length=args.max_seq_length,
+            pad_token=args.tokenizer.pad_token_id)
         tokenized_dataset = tokenized_dataset_raw.map(
                 group_fn,
                 batched=True,
@@ -270,7 +306,7 @@ def train_fn(tokenized_dataset, device, args):
     if global_ordinal() == 0: #.is_master_ordinal():
         wandb.login(key=args.wandb_key)
         wandb.init(
-            project="ModernBERT TPU pretraining",
+            project="ModernBERT TPU Training",
             config={
                 "learning_rate": args.learning_rate,
                 "architecture": "ModernBERT",
@@ -289,8 +325,8 @@ def train_fn(tokenized_dataset, device, args):
 
     # Load pre-trained model
     xm.master_print("Loading the LM ...")
-    if args.continue_from_checkpoint:
-        model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
+    if isinstance(args.checkpoint_path, str) & (args.checkpoint_path != ""):
+        model = ModernBertForMaskedLM.from_pretrained(args.model_name)
         if args.checkpoint_path.startswith('gs://'):
             # Parse GCS path
             bucket_name = args.checkpoint_path.split('/')[2]
@@ -485,11 +521,9 @@ def train_fn(tokenized_dataset, device, args):
                             subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
                             # rename the directory on GCS to the model name, date, and epoch_step
                             # Generate a new directory name with model name, date, and epoch_step
-                            current_time = datetime.datetime.now().strftime("%Y%m%d")
-                            new_dir_name = f"{args.model_name}_epoch{epoch}_step{step}_{current_time}"
+                            new_dir_name = f"{args.model_name}_latest"
                             new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                            # Rename the directory on GCS
-                            subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
+                            subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir, "*"), new_gcs_path], check=True)
 
                     else:
                         model_cpu = copy.deepcopy(model).to("cpu")
@@ -627,8 +661,7 @@ def main():
     parser.add_argument("--shuffle_dataset", action='store_true')
     parser.add_argument("--shuffle_force_update", action='store_true')
     parser.add_argument("--debug", action='store_true')
-    parser.add_argument("--continue_from_checkpoint", action='store_true')
-    parser.add_argument("--checkpoint_path", type=str)
+    parser.add_argument("--checkpoint_path", default="", type=str)
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
     args = parser.parse_args()

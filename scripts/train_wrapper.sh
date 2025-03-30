@@ -29,9 +29,8 @@ while true; do
     --streaming_data \
     --shuffle_dataset \
     --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
-    --continue_from_checkpoint \
     --checkpoint_path=${MODEL_CHECKPOINT} \
-    --max_steps_per_epoch=50000 \
+    --max_steps_per_epoch=${NUM_EPOCHS} \
     --weight_decay=${WEIGHT_DECAY} \
     --wandb_key=${WANDB_KEY} \
     --num_train_epochs=5 2>&1 | tee -a ~/logs.txt
