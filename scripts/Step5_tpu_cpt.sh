@@ -1,6 +1,6 @@
 #!/bin/bash
 set -o allexport
-source ../.env
+source ../.cpt.env
 set +o allexport
 
 echo "Setting environment variables..."
@@ -43,6 +43,8 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --command="chmod +x ~/cpt_wrapper.sh && tmux new-session -d -s train_session '~/cpt_wrapper.sh'"
 
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+    --zone=${ZONE} \
+    --project=${PROJECT_ID} \
     --worker=all \
     --command="tmux ls"
 

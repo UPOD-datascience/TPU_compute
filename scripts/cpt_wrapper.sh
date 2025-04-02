@@ -2,7 +2,7 @@
 
 # Source environment variables from .env file
 set -o allexport
-source ~/.env
+source ~/.cpt.env
 set +o allexport
 
 while true; do
@@ -20,6 +20,7 @@ while true; do
     --logging_steps=100 \
     --num_warmup_steps=${NUM_WARMUP} \
     --num_cores=16 \
+    --max_seq_len=${MAX_SEQ_LEN} \
     --learning_rate=${LR} \
     --streaming_data \
     --shuffle_dataset \
