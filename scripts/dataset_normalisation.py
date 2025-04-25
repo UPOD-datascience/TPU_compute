@@ -143,7 +143,27 @@ meta_data = {
     'COMBINED_DEID_cleaned.parquet':{
                             'id_field': None,
                             'text_field': 'text'
-    }
+    },
+    'GeminiFlash15_*.jsonl': {
+                            'id_field': 'id',
+                            'text_field': 'text'
+    },
+    'GeminiFlash15_*.json': {
+                            'id_field': 'id',
+                            'text_field': 'text'
+    },
+    'MIMICIII_*.jsonl':{
+                            'id_field': 'HADM_ID',
+                            'text_field': 'text'
+    },
+    'GeminiFlash2_*':{
+                            'id_field': 'id',
+                            'text_field': 'text'
+    },
+    'MIMIC3_Gemini15_*.jsonl':{
+                            'id_field': 'HADM_ID',
+                            'text_field': 'text'
+    },
 }
 
 def regexifyer(tdict: dict)->List[Tuple[str,str]]:
@@ -244,7 +264,7 @@ def load_datafiles_from_local(in_dir, out_dir, seperator=None):
 
     namer = lambda x: x.name.split('/')[-1].split('.')[0]
 
-    files = [file for file in files if  not any([file.split('.')[0] in _existing_file 
+    files = [file for file in files if  not any([file.split('.')[0] in _existing_file
                                                  for _existing_file in existing_files])]
 
     failed_lines = []
@@ -403,4 +423,3 @@ if __name__=="__main__":
             normalised_data, word_count = normalise_data(data, file_type, file_name)
             data_transfer_local(normalised_data, args.output_dir.strip("gs://"), file_name)
             print(f"Normalised and saved {file_name}, Wordcount: {word_count}.")
-

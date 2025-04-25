@@ -5,6 +5,8 @@ set -o allexport
 source ~/.cpt.env
 set +o allexport
 
+huggingface-cli login ${HF_TOKEN}
+
 while true; do
   echo "Training started at $(date)."
   python3 /home/${USERNAME}/models/cpt_${BASE_MODEL}.py \
@@ -13,7 +15,7 @@ while true; do
     --tmp_dir=${TMP_DIR} \
     --output_dir=${MODEL_BUCKET} \
     --model_name=${MODEL_NAME} \
-    --tokenizer_name_or_path=/home/${USERNAME}/tokenizer \
+    --tokenizer_name_or_path=${MODEL_NAME} \
     --per_device_train_batch_size=${BATCH_SIZE} \
     --gradient_accumulation_steps=${GRAD_ACCUM_STEPS} \
     --save_epoch_percentage=0.05 \
