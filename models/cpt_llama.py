@@ -335,8 +335,8 @@ def train_fn(tokenized_dataset, device, args):
     # Load pre-trained model
     xm.master_print("Loading the LM ...")
     if isinstance(args.checkpoint_path, str) & (args.checkpoint_path != ""):
-        model_config = LlamaConfig.from_pretrained(args.model_name)
-        model = LlamaForCausalLM(model_config)
+        #model_config = LlamaConfig.from_pretrained(args.model_name)
+        model = LlamaForCausalLM.from_pretrained(args.model_name)
         if args.checkpoint_path.startswith('gs://'):
             # Parse GCS path
             bucket_name = args.checkpoint_path.split('/')[2]
@@ -357,7 +357,7 @@ def train_fn(tokenized_dataset, device, args):
         else:
             model.load_state_dict(checkpoint)
     else:
-        model = LlamaForCausalLM(args.model_name)
+        model = LlamaForCausalLM.from_pretrained(args.model_name)
         pass
 
     model = model.to(device=device, dtype=torch.bfloat16)
@@ -716,6 +716,7 @@ def main():
 
     args.tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
     args.tokenizer.model_max_length = args.max_seq_length
+    args.tokenizer.special_tokens_map({'pad_token': '<pad>'})
 
     if args.shuffle_dataset:
             args.dataset_dir = args.shuffle_dataset_path
