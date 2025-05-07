@@ -152,6 +152,11 @@ meta_data = {
                             'id_field': 'id',
                             'text_field': 'text'
     },
+     
+    'GeminiFlash2_*.jsonl' :{
+			    'id_field': 'id',
+           		    'text_field': 'text'
+    },
     'MIMICIII_*.jsonl':{
                             'id_field': 'HADM_ID',
                             'text_field': 'text'

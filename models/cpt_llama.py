@@ -716,7 +716,7 @@ def main():
 
     args.tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
     args.tokenizer.model_max_length = args.max_seq_length
-    args.tokenizer.special_tokens_map({'pad_token': '<pad>'})
+    args.tokenizer.add_special_tokens({'pad_token': '<pad>'})
 
     if args.shuffle_dataset:
             args.dataset_dir = args.shuffle_dataset_path
