@@ -55,3 +55,8 @@ Sources:
 [QAT training](https://github.com/Qualcomm-AI-research/lr-qat)
 
 [Llama3 finetuning](https://huggingface.co/blog/nroggendorff/train-with-llama-architecture)
+
+
+# Post-training quantisation
+
+https://github.com/microsoft/VPTQ
