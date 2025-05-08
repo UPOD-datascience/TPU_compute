@@ -650,6 +650,7 @@ def main():
     parser.add_argument("--max_steps_per_epoch", type=int, default=None)
     parser.add_argument("--shuffle_buffer_size", type=int, default=10_000)
     parser.add_argument("--shuffle_dataset_path", type=str, default="/home/bob/tmp/shuffle.parquet")
+    parser.add_argument("--shuffle_dataset_gc", type=str, default=None)
     parser.add_argument("--shuffle_dataset", action='store_true')
     parser.add_argument("--shuffle_force_update", action='store_true')
     parser.add_argument("--debug", action='store_true')
@@ -678,30 +679,55 @@ def main():
                 print(f"Removing shuffled dataset: {shuffle_dir}", flush=True)
                 shutil.rmtree(shuffle_dir)
 
-            print("Loading dataset for shuffling...", flush=True)
-            dataset = load_dataset(args.dataset_format, data_files={
-                "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
-                "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
-            }, keep_in_memory=True)
+            if args.shuffle_dataset_gc is not None:
+                # download parquet at args.shuffle_dataset_gc to args.shuffle_dataset_path
+                print(f"Downloading shuffled dataset from GCS: {args.shuffle_dataset_gc} to {args.shuffle_dataset_path}", flush=True)
+                # Create the local directory if it doesn't exist
+                os.makedirs(args.shuffle_dataset_path, exist_ok=True)
 
-            print("Clearing cache!", flush=True)
-            cache_dir = os.path.expanduser("~/.cache/huggingface")
-            if os.path.exists(cache_dir):
-                print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
-                shutil.rmtree(cache_dir)
+                # Parse the GCS path
+                if args.shuffle_dataset_gc.startswith('gs://'):
+                    bucket_name = args.shuffle_dataset_gc.split('/')[2]
+                    blob_name = '/'.join(args.shuffle_dataset_gc.split('/')[3:])
+
+                    # Initialize GCS client
+                    client = storage.Client()
+                    bucket = client.bucket(bucket_name)
+                    blob = bucket.blob(blob_name)
+
+                    # Download the blob to a local file
+                    try:
+                        blob.download_to_filename(args.shuffle_dataset_path)
+                        print(f"Succesfully downloaded checkpoint to: {args.shuffle_dataset_path}")
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to download checkpoint to {args.shuffle_dataset_path}: {e}")
+
+                print(f"Successfully downloaded shuffled dataset from GCS", flush=True)
             else:
-                print("Hugging Face cache directory not found.", flush=True)
+                print("Loading dataset for shuffling...", flush=True)
+                dataset = load_dataset(args.dataset_format, data_files={
+                    "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
+                    "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
+                }, keep_in_memory=True)
 
-            print("Shuffling and saving dataset...", flush=True)
-            shuffle_and_save_dataset(dataset, args.shuffle_dataset_path)
+                print("Clearing cache!", flush=True)
+                cache_dir = os.path.expanduser("~/.cache/huggingface")
+                if os.path.exists(cache_dir):
+                    print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
+                    shutil.rmtree(cache_dir)
+                else:
+                    print("Hugging Face cache directory not found.", flush=True)
 
-            print("Clearing cache a-posteriori !", flush=True)
-            cache_dir = os.path.expanduser("~/.cache/huggingface")
-            if os.path.exists(cache_dir):
-                print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
-                shutil.rmtree(cache_dir)
-            else:
-                print("Hugging Face cache directory not found.", flush=True)
+                print("Shuffling and saving dataset...", flush=True)
+                shuffle_and_save_dataset(dataset, args.shuffle_dataset_path)
+
+                print("Clearing cache a-posteriori !", flush=True)
+                cache_dir = os.path.expanduser("~/.cache/huggingface")
+                if os.path.exists(cache_dir):
+                    print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
+                    shutil.rmtree(cache_dir)
+                else:
+                    print("Hugging Face cache directory not found.", flush=True)
 
             # Update the dataset directory to the shuffled dataset path
             # Clear the dataset from memory
