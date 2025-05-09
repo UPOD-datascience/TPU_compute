@@ -10,14 +10,15 @@ import random
 
 def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_dir=None, seed=None, iterations=1):
     """
-    Shuffles a Parquet file using a simpler, batch-based approach optimized for low memory usage.
+    Shuffles a Parquet file using a batch-based approach with minimal disk usage.
 
     Process:
     1. Read batches from input file and shuffle each batch internally
     2. Write each shuffled batch to a temporary file
-    3. Shuffle the order of batch files
-    4. Recombine the batches in shuffled order to the output file
-    5. Repeat the process for specified number of iterations
+    3. Immediately after writing, add the batch file path to a list
+    4. Shuffle the list of batch files
+    5. Read each batch file in shuffled order, append to output, and immediately delete
+    6. Repeat the process for specified number of iterations
 
     Parameters:
     -----------
@@ -49,126 +50,93 @@ def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_d
         parquet_file = pq.ParquetFile(input_path)
         total_rows = parquet_file.metadata.num_rows
 
-        # Extract the original schema to maintain consistency
+        # Get original schema
         original_schema = parquet_file.schema_arrow
-        print(f"Original schema: {original_schema}")
 
         print(f"Total rows in the file: {total_rows}")
         print(f"Using temporary directory: {temp_dir}")
 
-        # Use the input path for first iteration, then use intermediate outputs for subsequent iterations
+        # Use the input path for first iteration, then use output_path for subsequent iterations
         current_input = input_path
 
         for iteration in range(iterations):
             print(f"Starting shuffle iteration {iteration+1}/{iterations}")
 
-            # Step 1: Read batches, shuffle each batch, and write to temporary files
-            batch_files = []
-            batch_count = 0
-
-            # Create sub-directory for this iteration's batch files
-            iter_temp_dir = os.path.join(temp_dir, f"iteration_{iteration}")
-            os.makedirs(iter_temp_dir, exist_ok=True)
-
-            print("Step 1: Reading and shuffling batches...")
-            current_parquet_file = pq.ParquetFile(current_input)
-
-            # For the first iteration, use the original schema
-            # For subsequent iterations, get the schema from the current file
+            # Determine the current schema
             if iteration == 0:
                 current_schema = original_schema
+                current_file = parquet_file
             else:
-                current_schema = current_parquet_file.schema_arrow
+                current_file = pq.ParquetFile(current_input)
+                current_schema = current_file.schema_arrow
 
-            # Keep track of total rows processed to ensure accurate progress
-            actual_total_rows = 0
+            # Create a temporary output file for this iteration
+            iter_output = os.path.join(temp_dir, f"iter_{iteration}_output.parquet")
 
-            # Process each batch
+            # Step 1 & 2: Create batches and write to temp files
+            print("Step 1: Creating and shuffling batches...")
+
+            # Keep track of batch files
+            batch_files = []
+
+            # Process each batch from the input file
             for i, batch in enumerate(tqdm(
-                current_parquet_file.iter_batches(batch_size=window_size),
+                current_file.iter_batches(batch_size=window_size),
                 desc="Processing batches",
                 total=(total_rows + window_size - 1) // window_size
             )):
-                # Convert to pandas for efficient shuffling
+                # Convert to pandas, shuffle, and convert back
                 df = batch.to_pandas()
-                actual_total_rows += len(df)
-
-                # Shuffle the batch internally
                 df = df.sample(frac=1.0)
 
-                # Write to a temporary file
-                batch_path = os.path.join(iter_temp_dir, f"batch_{batch_count}.parquet")
+                # Create a temporary file for this batch
+                batch_file = os.path.join(temp_dir, f"batch_{i}_{random.randint(1000000, 9999999)}.parquet")
 
-                # Convert back to PyArrow table with explicit schema to maintain consistency
+                # Use compression to save disk space
                 table = pa.Table.from_pandas(df, schema=current_schema)
+                pq.write_table(table, batch_file, compression='snappy')
 
-                # Write with schema preservation
-                pq.write_table(table, batch_path, compression='snappy')
+                # Add to our list of batch files
+                batch_files.append(batch_file)
 
-                # Release memory by deleting references
+                # Clean up memory
                 del df
                 del table
 
-                batch_files.append(batch_path)
-                batch_count += 1
-
-            # Update total rows for future iterations
-            total_rows = actual_total_rows
-
-            # Step 2: Shuffle the order of batch files
+            # Step 3: Shuffle the order of batch files
             print(f"Step 2: Shuffling order of {len(batch_files)} batch files...")
             random.shuffle(batch_files)
 
-            # Step 3: Recombine batches in shuffled order
-            print("Step 3: Recombining batches in shuffled order...")
-            temp_output_path = os.path.join(temp_dir, f"temp_output_{iteration}.parquet")
+            # Step 4: Recombine batches in shuffled order with immediate cleanup
+            print("Step 3: Recombining batches and cleaning up...")
 
-            # Start with an empty table of the correct schema
-            if batch_files:
-                # Use the schema from the current iteration to maintain consistency
-                with pq.ParquetWriter(temp_output_path, current_schema) as writer:
-                    # Read each batch in shuffled order and write to the output file
-                    for batch_path in tqdm(batch_files, desc="Recombining batches"):
-                        # Read the entire file as a table to ensure schema compatibility
-                        table = pq.read_table(batch_path)
-
-                        # Cast the table to the required schema to ensure consistency
-                        table = table.cast(current_schema)
-
-                        # Write the table
+            # Create a writer for the output
+            with pq.ParquetWriter(iter_output, current_schema, compression='snappy') as writer:
+                for batch_file in tqdm(batch_files, desc="Combining batches"):
+                    try:
+                        # Read this batch, write to output, and immediately delete
+                        table = pq.read_table(batch_file)
+                        table = table.cast(current_schema)  # Ensure schema compatibility
                         writer.write_table(table)
 
-                        # Release memory
+                        # Clean up memory and disk
                         del table
+                        os.remove(batch_file)
+                    except Exception as e:
+                        print(f"Warning: Error processing batch file {batch_file}: {e}")
+
+            # Update for next iteration
+            if iteration < iterations - 1:
+                current_input = iter_output
             else:
-                # Handle the case where there are no batch files (unlikely but possible)
-                print("Warning: No batch files were created. Creating an empty output file.")
+                # Final iteration - copy to output_path
+                shutil.copy2(iter_output, output_path)
 
-                # Create an empty table with the same schema as the input
-                empty_table = pa.Table.from_arrays(
-                    [pa.array([], type=field.type) for field in current_schema],
-                    schema=current_schema
-                )
-                pq.write_table(empty_table, temp_output_path)
-
-            # Update the current input for the next iteration
-            current_input = temp_output_path
-
-            # Clean up this iteration's batch files
-            for batch_path in batch_files:
+                # Clean up the final iteration file
                 try:
-                    os.remove(batch_path)
+                    os.remove(iter_output)
                 except Exception as e:
-                    print(f"Warning: Failed to remove temporary file {batch_path}: {e}")
-
-            # Clean up the iteration directory
-            try:
-                os.rmdir(iter_temp_dir)
-            except Exception as e:
-                print(f"Warning: Failed to remove temporary directory {iter_temp_dir}: {e}")
-
-        # After all iterations, move the final shuffled file to the output path
-        shutil.copy2(current_input, output_path)
+                    print(f"Warning: Could not remove final iteration file: {e}")
 
         print(f"Shuffled parquet file saved to: {output_path}")
 

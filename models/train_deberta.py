@@ -59,9 +59,12 @@ print(f"TPU_WORKER_ID: {worker_id}")
 print(f"TPU_WORKER_HOSTNAMES for {worker_id}: {shards}")
 
 
-def shuffle_and_save_dataset(dataset, output_path, seed=None):
+def shuffle_and_save_dataset(dataset, output_path, seed=None, shuffle=True):
     # Shuffle only the training dataset
-    shuffled_train = dataset['train'].shuffle(seed=seed)
+    if shuffle:
+        shuffled_train = dataset['train'].shuffle(seed=seed)
+    else:
+        shuffled_train = dataset['train']
 
     # Save the shuffled training dataset and the original validation dataset
     shuffled_dataset = DatasetDict({
@@ -689,29 +692,13 @@ def main():
                 shutil.rmtree(shuffle_dir)
 
             if args.shuffle_dataset_gc is not None:
-                # download parquet at args.shuffle_dataset_gc to args.shuffle_dataset_path
-                print(f"Downloading shuffled dataset from GCS: {args.shuffle_dataset_gc} to {args.shuffle_dataset_path}", flush=True)
-                # Create the local directory if it doesn't exist
-                os.makedirs(args.shuffle_dataset_path, exist_ok=True)
+                print("Loading pre-shuffled dataset...", flush=True)
+                dataset = load_dataset(args.dataset_format, data_files={
+                    "train": args.shuffle_dataset_gc,
+                    "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
+                }, keep_in_memory=True)
 
-                # Parse the GCS path
-                if args.shuffle_dataset_gc.startswith('gs://'):
-                    bucket_name = args.shuffle_dataset_gc.split('/')[2]
-                    blob_name = '/'.join(args.shuffle_dataset_gc.split('/')[3:])
-
-                    # Initialize GCS client
-                    client = storage.Client()
-                    bucket = client.bucket(bucket_name)
-                    blob = bucket.blob(blob_name)
-
-                    # Download the blob to a local file
-                    try:
-                        blob.download_to_filename(args.shuffle_dataset_path)
-                        print(f"Succesfully downloaded checkpoint to: {args.shuffle_dataset_path}")
-                    except Exception as e:
-                        raise RuntimeError(f"Failed to download checkpoint to {args.shuffle_dataset_path}: {e}")
-
-                print(f"Successfully downloaded shuffled dataset from GCS", flush=True)
+                shuffle_and_save_dataset(dataset, args.shuffle_dataset_path, shuffle=False)
             else:
                 print("Loading dataset for shuffling...", flush=True)
                 dataset = load_dataset(args.dataset_format, data_files={
