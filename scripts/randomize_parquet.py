@@ -8,9 +8,16 @@ import shutil
 from tqdm import tqdm
 import random
 
-def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_dir=None, seed=None):
+def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_dir=None, seed=None, iterations=1):
     """
-    Thoroughly shuffle a Parquet file using a recursive, out-of-core approach.
+    Shuffles a Parquet file using a simpler, batch-based approach optimized for low memory usage.
+
+    Process:
+    1. Read batches from input file and shuffle each batch internally
+    2. Write each shuffled batch to a temporary file
+    3. Shuffle the order of batch files
+    4. Recombine the batches in shuffled order to the output file
+    5. Repeat the process for specified number of iterations
 
     Parameters:
     -----------
@@ -19,11 +26,13 @@ def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_d
     output_path : str
         Path for the output shuffled Parquet file
     window_size : int
-        Number of rows to process in each window/buffer
+        Number of rows to process in each batch
     temp_dir : str, optional
         Directory to store temporary files. If None, a system temp directory is used.
     seed : int, optional
         Random seed for reproducibility
+    iterations : int
+        Number of times to repeat the shuffling process
     """
     if seed is not None:
         random.seed(seed)
@@ -35,157 +44,165 @@ def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_d
     else:
         os.makedirs(temp_dir, exist_ok=True)
 
-    first_level_dir = os.path.join(temp_dir, "level1")
-    second_level_dir = os.path.join(temp_dir, "level2")
-    os.makedirs(first_level_dir, exist_ok=True)
-    os.makedirs(second_level_dir, exist_ok=True)
-
     try:
         print("Reading Parquet file metadata...")
         parquet_file = pq.ParquetFile(input_path)
         total_rows = parquet_file.metadata.num_rows
-        schema = parquet_file.schema_arrow if hasattr(parquet_file, 'schema_arrow') else parquet_file.schema
+
+        # Extract the original schema to maintain consistency
+        original_schema = parquet_file.schema_arrow
+        print(f"Original schema: {original_schema}")
 
         print(f"Total rows in the file: {total_rows}")
         print(f"Using temporary directory: {temp_dir}")
 
-        # Step 1: First level of shuffling - divide into M pieces of size N
-        print("Step 1: First level shuffling - creating initial chunks...")
-        m_chunks = []
-        chunk_count = 0
+        # Use the input path for first iteration, then use intermediate outputs for subsequent iterations
+        current_input = input_path
 
-        # Process the file in windows and shuffle each window
-        for batch in tqdm(parquet_file.iter_batches(batch_size=window_size),
-                         desc="Creating shuffled chunks",
-                         total=(total_rows + window_size - 1) // window_size):
-            df = batch.to_pandas()
+        for iteration in range(iterations):
+            print(f"Starting shuffle iteration {iteration+1}/{iterations}")
 
-            # Shuffle the current window
-            df = df.sample(frac=1.0)
+            # Step 1: Read batches, shuffle each batch, and write to temporary files
+            batch_files = []
+            batch_count = 0
 
-            # Write to a temporary file
-            chunk_path = os.path.join(first_level_dir, f"chunk_{chunk_count}.parquet")
-            df.to_parquet(chunk_path, index=False)
-            m_chunks.append(chunk_path)
-            chunk_count += 1
+            # Create sub-directory for this iteration's batch files
+            iter_temp_dir = os.path.join(temp_dir, f"iteration_{iteration}")
+            os.makedirs(iter_temp_dir, exist_ok=True)
 
-        # Step 2: Second level of shuffling - combine M readers randomly
-        print(f"Step 2: Second level shuffling - combining {len(m_chunks)} chunks...")
+            print("Step 1: Reading and shuffling batches...")
+            current_parquet_file = pq.ParquetFile(current_input)
 
-        # For each chunk, divide it into smaller pieces for random access
-        chunk_pieces = []
-        for i, chunk_path in enumerate(m_chunks):
-            # Load the entire chunk
-            df = pd.read_parquet(chunk_path)
-            # Divide into smaller pieces for random access
-            piece_size = min(window_size // 10, len(df))  # Use smaller pieces
-            if piece_size <= 0:  # Handle very small dataframes
-                piece_size = len(df)
+            # For the first iteration, use the original schema
+            # For subsequent iterations, get the schema from the current file
+            if iteration == 0:
+                current_schema = original_schema
+            else:
+                current_schema = current_parquet_file.schema_arrow
 
-            # Divide the dataframe into pieces and store each piece
-            for j in range(0, len(df), piece_size):
-                end = min(j + piece_size, len(df))
-                piece = df.iloc[j:end]
-                piece_path = os.path.join(first_level_dir, f"chunk_{i}_piece_{j//piece_size}.parquet")
-                piece.to_parquet(piece_path, index=False)
-                chunk_pieces.append(piece_path)
+            # Keep track of total rows processed to ensure accurate progress
+            actual_total_rows = 0
 
-        # Shuffle the order of pieces to randomize access
-        random.shuffle(chunk_pieces)
+            # Process each batch
+            for i, batch in enumerate(tqdm(
+                current_parquet_file.iter_batches(batch_size=window_size),
+                desc="Processing batches",
+                total=(total_rows + window_size - 1) // window_size
+            )):
+                # Convert to pandas for efficient shuffling
+                df = batch.to_pandas()
+                actual_total_rows += len(df)
 
-        # Calculate total number of rows across all pieces
-        total_shuffled_rows = sum(pd.read_parquet(piece).shape[0] for piece in chunk_pieces)
+                # Shuffle the batch internally
+                df = df.sample(frac=1.0)
 
-        # Create second level shuffle files
-        second_level_chunks = []
-        second_chunk_count = 0
+                # Write to a temporary file
+                batch_path = os.path.join(iter_temp_dir, f"batch_{batch_count}.parquet")
 
-        # Continue until we've processed all rows
-        rows_processed = 0
-        remaining_pieces = chunk_pieces.copy()
-        pbar = tqdm(total=total_shuffled_rows, desc="Creating second-level shuffle")
+                # Convert back to PyArrow table with explicit schema to maintain consistency
+                table = pa.Table.from_pandas(df, schema=current_schema)
 
-        while remaining_pieces and rows_processed < total_shuffled_rows:
-            # Create a new output chunk
-            output_chunk_path = os.path.join(second_level_dir, f"shuffled_{second_chunk_count}.parquet")
-            second_level_chunks.append(output_chunk_path)
+                # Write with schema preservation
+                pq.write_table(table, batch_path, compression='snappy')
 
-            # Determine how many rows to take for this chunk
-            rows_for_chunk = min(window_size, total_shuffled_rows - rows_processed)
+                # Release memory by deleting references
+                del df
+                del table
 
-            # Collect rows from random pieces until we have enough
-            collected_dfs = []
-            collected_rows_count = 0
+                batch_files.append(batch_path)
+                batch_count += 1
 
-            while collected_rows_count < rows_for_chunk and remaining_pieces:
-                # Choose a random piece
-                piece_idx = random.randrange(len(remaining_pieces))
-                piece_path = remaining_pieces.pop(piece_idx)
+            # Update total rows for future iterations
+            total_rows = actual_total_rows
 
-                # Read the piece
-                df_piece = pd.read_parquet(piece_path)
+            # Step 2: Shuffle the order of batch files
+            print(f"Step 2: Shuffling order of {len(batch_files)} batch files...")
+            random.shuffle(batch_files)
 
-                # Add to our collection
-                collected_dfs.append(df_piece)
-                collected_rows_count += len(df_piece)
+            # Step 3: Recombine batches in shuffled order
+            print("Step 3: Recombining batches in shuffled order...")
+            temp_output_path = os.path.join(temp_dir, f"temp_output_{iteration}.parquet")
 
-            if collected_dfs:
-                # Combine collected rows and shuffle again
-                combined_df = pd.concat(collected_dfs, ignore_index=True)
-                combined_df = combined_df.sample(frac=1.0)  # Shuffle once more
+            # Start with an empty table of the correct schema
+            if batch_files:
+                # Use the schema from the current iteration to maintain consistency
+                with pq.ParquetWriter(temp_output_path, current_schema) as writer:
+                    # Read each batch in shuffled order and write to the output file
+                    for batch_path in tqdm(batch_files, desc="Recombining batches"):
+                        # Read the entire file as a table to ensure schema compatibility
+                        table = pq.read_table(batch_path)
 
-                # If we have more rows than needed, take only what we need
-                if len(combined_df) > rows_for_chunk:
-                    combined_df = combined_df.iloc[:rows_for_chunk]
+                        # Cast the table to the required schema to ensure consistency
+                        table = table.cast(current_schema)
 
-                # Write to output chunk
-                combined_df.to_parquet(output_chunk_path, index=False)
+                        # Write the table
+                        writer.write_table(table)
 
-                rows_processed += len(combined_df)
-                pbar.update(len(combined_df))
-                second_chunk_count += 1
+                        # Release memory
+                        del table
+            else:
+                # Handle the case where there are no batch files (unlikely but possible)
+                print("Warning: No batch files were created. Creating an empty output file.")
 
-        pbar.close()
+                # Create an empty table with the same schema as the input
+                empty_table = pa.Table.from_arrays(
+                    [pa.array([], type=field.type) for field in current_schema],
+                    schema=current_schema
+                )
+                pq.write_table(empty_table, temp_output_path)
 
-        # Step 3: Combine all second-level chunks into the final output file
-        print("Step 3: Combining all second-level shuffled chunks into final output...")
+            # Update the current input for the next iteration
+            current_input = temp_output_path
 
-        # Read and combine all chunks
-        all_dfs = []
-        for chunk_path in tqdm(second_level_chunks, desc="Reading shuffled chunks"):
-            df = pd.read_parquet(chunk_path)
-            all_dfs.append(df)
+            # Clean up this iteration's batch files
+            for batch_path in batch_files:
+                try:
+                    os.remove(batch_path)
+                except Exception as e:
+                    print(f"Warning: Failed to remove temporary file {batch_path}: {e}")
 
-        final_df = pd.concat(all_dfs, ignore_index=True)
+            # Clean up the iteration directory
+            try:
+                os.rmdir(iter_temp_dir)
+            except Exception as e:
+                print(f"Warning: Failed to remove temporary directory {iter_temp_dir}: {e}")
 
-        # Write the final output
-        print(f"Writing final file with {len(final_df)} rows...")
-        final_df.to_parquet(output_path, index=False)
+        # After all iterations, move the final shuffled file to the output path
+        shutil.copy2(current_input, output_path)
 
         print(f"Shuffled parquet file saved to: {output_path}")
 
     finally:
         # Clean up temporary files
         print("Cleaning up temporary files...")
-        shutil.rmtree(temp_dir)
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception as e:
+            print(f"Warning: Failed to clean up temporary directory {temp_dir}: {e}")
         print("Done!")
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Recursively shuffle a Parquet file out-of-core")
-    parser.add_argument("--input_path", help="Path to the input Parquet file")
-    parser.add_argument("--output_path", help="Path for the output shuffled Parquet file")
+    parser = argparse.ArgumentParser(description="Shuffle a Parquet file using a batch-based approach")
+    parser.add_argument("--input_path", required=True, help="Path to the input Parquet file")
+    parser.add_argument("--output_path", required=True, help="Path for the output shuffled Parquet file")
     parser.add_argument("--window-size", type=int, default=50000,
-                        help="Number of rows to process in each window (default: 50000)")
+                        help="Number of rows to process in each batch (default: 50000)")
     parser.add_argument("--temp-dir", default=None,
                         help="Directory to store temporary files (default: system temp directory)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducibility")
+    parser.add_argument("--iterations", type=int, default=1,
+                        help="Number of times to repeat the shuffling process (default: 1)")
 
     args = parser.parse_args()
 
-    recursive_shuffle_parquet(args.input_path, args.output_path,
-                             window_size=args.window_size,
-                             temp_dir=args.temp_dir,
-                             seed=args.seed)
+    recursive_shuffle_parquet(
+        args.input_path,
+        args.output_path,
+        window_size=args.window_size,
+        temp_dir=args.temp_dir,
+        seed=args.seed,
+        iterations=args.iterations
+    )
