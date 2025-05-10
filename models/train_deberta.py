@@ -698,7 +698,24 @@ def main():
                     "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
                 }, keep_in_memory=True)
 
-                shuffle_and_save_dataset(dataset, args.shuffle_dataset_path, shuffle=False)
+                print("Clearing cache!", flush=True)
+                cache_dir = os.path.expanduser("~/.cache/huggingface")
+                if os.path.exists(cache_dir):
+                    print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
+                    shutil.rmtree(cache_dir)
+                else:
+                    print("Hugging Face cache directory not found.", flush=True)
+
+                dataset.save_to_disk(args.shuffle_dataset_path)
+
+                print("Clearing cache a-posteriori !", flush=True)
+                cache_dir = os.path.expanduser("~/.cache/huggingface")
+                if os.path.exists(cache_dir):
+                    print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
+                    shutil.rmtree(cache_dir)
+                else:
+                    print("Hugging Face cache directory not found.", flush=True)
+
             else:
                 print("Loading dataset for shuffling...", flush=True)
                 dataset = load_dataset(args.dataset_format, data_files={
