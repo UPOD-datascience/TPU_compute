@@ -32,13 +32,15 @@ if [ "${PRE_EMPTIBLE}" = true ]; then
       --project="${PROJECT_ID}" \
       --accelerator-type="${ACCELERATOR_TYPE}" \
       --version "${RUNTIME_VERSION}" \
-      --preemptible
+      --preemptible \
+      --data-disk source=projects/${PROJECT_ID}/zones/${ZONE}/disks/${EXT_DISK_NAME},mode=${EXT_DISK_MODE}
 else
     gcloud compute tpus tpu-vm create "${TPU_NAME}" \
       --zone="${ZONE}" \
       --project="${PROJECT_ID}" \
       --accelerator-type="${ACCELERATOR_TYPE}" \
-      --version "${RUNTIME_VERSION}"
+      --version "${RUNTIME_VERSION}" \
+      --data-disk source=projects/${PROJECT_ID}/zones/${ZONE}/disks/${EXT_DISK_NAME},mode=${EXT_DISK_MODE}
 fi
 
 gcloud compute tpus tpu-vm list --zone=${ZONE} --project=${PROJECT_ID}
