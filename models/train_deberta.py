@@ -662,7 +662,7 @@ def main():
     parser.add_argument("--max_steps_per_epoch", type=int, default=None)
     parser.add_argument("--shuffle_buffer_size", type=int, default=10_000)
     parser.add_argument("--shuffle_dataset_path", type=str, default="/home/bob/tmp/shuffle.parquet")
-    parser.add_argument("--shuffle_dataset_gc", type=str, default=None)
+    parser.add_argument("--shuffle_dataset_ext", type=str, default=None)
     parser.add_argument("--shuffle_dataset", action='store_true')
     parser.add_argument("--shuffle_force_update", action='store_true')
     parser.add_argument("--debug", action='store_true')
@@ -691,10 +691,10 @@ def main():
                 print(f"Removing shuffled dataset: {shuffle_dir}", flush=True)
                 shutil.rmtree(shuffle_dir)
 
-            if args.shuffle_dataset_gc is not None:
+            if args.shuffle_dataset_ext is not None:
                 print("Loading pre-shuffled dataset...", flush=True)
                 dataset = load_dataset(args.dataset_format, data_files={
-                    "train": args.shuffle_dataset_gc,
+                    "train": args.shuffle_dataset_ext,
                     "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
                 }, keep_in_memory=True)
 

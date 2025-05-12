@@ -2,9 +2,9 @@
 set -e
 
 # Export variables from .env file
-set -o allexport
-source ../.env
-set +o allexport
+# set -o allexport
+# source ../.env
+# set +o allexport
 
 echo "Mounting data disk to TPU VM..."
 
@@ -34,6 +34,6 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
     --worker=all \
-    --command="df -h | grep ${EXT_DISK_NAME}"
+    --command="df -h | grep /mnt/data"
 
 echo "Data disk mounted successfully in read-only mode."

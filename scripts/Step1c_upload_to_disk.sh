@@ -2,9 +2,9 @@
 set -e
 
 # Export variables from .env file
-set -o allexport
-source ../.env
-set +o allexport
+#set -o allexport
+#source ../.cpt.env
+#set +o allexport
 
 TEMP_VM_NAME="temp-disk-setup-vm"
 DISK_MOUNT_DIR="/mnt/data"
@@ -28,7 +28,7 @@ echo "Creating temporary VM: ${TEMP_VM_NAME}..."
 gcloud compute instances create ${TEMP_VM_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
-    --machine-type=e2-standard-4 \
+    --machine-type=n2-standard-8 \
     --disk="name=${EXT_DISK_NAME},device-name=${EXT_DISK_NAME},mode=rw" \
     --scopes=cloud-platform
 

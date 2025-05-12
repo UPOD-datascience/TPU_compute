@@ -27,7 +27,7 @@ while true; do
     --streaming_data \
     --shuffle_dataset \
     --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
-    --shuffle_dataset_gc=${SHUFFLED_DATASET_GC} \
+    --shuffle_dataset_ext=${SHUFFLED_DATASET_EXT} \
     --checkpoint_path=${MODEL_CHECKPOINT} \
     --max_steps_per_epoch=${NUM_EPOCHS} \
     --weight_decay=${WEIGHT_DECAY} \
