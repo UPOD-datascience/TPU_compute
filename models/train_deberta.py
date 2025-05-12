@@ -41,6 +41,7 @@ from functools import partial
 from itertools import chain
 
 from time import sleep
+from lazy_grouping import LazyGroupingDataset
 
 try:
     os.environ.pop('TPU_PROCESS_ADDRESSES')
@@ -282,6 +283,13 @@ def prep_fn(args):
                                                          "approx_token_counts_original"],
                                          **opt_kwargs)
 
+        # If lazy grouping is enabled, return the raw tokenized dataset
+        if args.lazy_grouping:
+            print("Lazy grouping enabled. Grouping will be performed on-the-fly during training.", flush=True)
+            print(f"This will reduce startup time but may slightly impact training speed.", flush=True)
+            return tokenized_dataset_raw
+
+        # Otherwise, perform grouping now as before
         opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
         print("Performing chunking tokenized data...", flush=True)
         group_fn = partial(group_texts, max_seq_length=args.max_seq_length, pad_token=args.tokenizer.pad_token_id)
@@ -318,6 +326,7 @@ def train_fn(tokenized_dataset, device, args):
                 "weight_decay": args.weight_decay,
                 "max_seq_length": args.max_seq_length,
                 "batch_size": args.per_device_train_batch_size,
+                "lazy_grouping": args.lazy_grouping
             },
             mode="online",
             dir="/home/bes3/temp"
@@ -393,10 +402,23 @@ def train_fn(tokenized_dataset, device, args):
         #shard_id = xm.get_ordinal()
         sharded_train_dataset = tokenized_dataset["train"].shard(num_shards=num_shards, index=shard_id)
 
+        # Apply lazy grouping if enabled
+        if args.lazy_grouping and not args.pre_tokenized:
+            print(f"Applying lazy grouping to sharded dataset for worker {shard_id}...", flush=True)
+            _sharded_train_dataset = LazyGroupingDataset(
+                sharded_train_dataset,
+                max_seq_length=args.max_seq_length,
+                pad_token=args.tokenizer.pad_token_id,
+                batch_size=args.per_device_train_batch_size,
+                streaming=args.streaming_data
+            )
+        else:
+            _sharded_train_dataset = sharded_train_dataset
+
         xm.master_print("Starting the streaming DataLoader...")
 
         train_dataloader = torch.utils.data.DataLoader(
-            sharded_train_dataset,
+            _sharded_train_dataset,
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
             num_workers=0
@@ -668,6 +690,7 @@ def main():
     parser.add_argument("--debug", action='store_true')
     parser.add_argument("--checkpoint_path", type=str)
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
+    parser.add_argument("--lazy_grouping", action='store_true', help="Use lazy grouping to process data on-the-fly during training (incompatible with --pre_tokenized)")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
     args = parser.parse_args()
 
@@ -678,6 +701,9 @@ def main():
 
     if args.streaming_data==True and args.shuffle_buffer_size is None:
         raise ValueError("shuffle_buffer_size is required when streaming_data is set to True.")
+
+    if args.lazy_grouping and args.pre_tokenized:
+        raise ValueError("lazy_grouping cannot be used with pre_tokenized data. Lazy grouping requires raw tokenized data to group on-the-fly.")
 
     # Set the same seed for all processes
     torch.manual_seed(args.seed)

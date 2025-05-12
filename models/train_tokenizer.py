@@ -1,6 +1,6 @@
 # train_tokenizer.py
 from tokenizers import ByteLevelBPETokenizer, SentencePieceBPETokenizer,BertWordPieceTokenizer
-from transformers import DebertaV2TokenizerFast, PreTrainedTokenizerFast
+from transformers import DebertaV2TokenizerFast, PreTrainedTokenizerFast, LlamaTokenizerFast
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors
 from tokenizers.processors import TemplateProcessing
 from tokenizers.normalizers import BertNormalizer
@@ -201,7 +201,7 @@ def main():
     parser.add_argument("--vocab_size", type=int, default=50_368)
     parser.add_argument("--min_frequency", type=int, default=100)
     parser.add_argument("--iterative", action='store_true')
-    parser.add_argument("--tokenizer_type", type=str, choices=['bbpe', 'sentencebpe', 'debertav2', 'bertwordpiece', 'modernbert'], default='bbpe')
+    parser.add_argument("--tokenizer_type", type=str, choices=['bbpe', 'sentencebpe', 'debertav2', 'bertwordpiece', 'modernbert', 'llama'], default='bbpe')
     args = parser.parse_args()
 
     print("Getting file list..")
@@ -241,10 +241,10 @@ def main():
 
         all_texts_iterator = combine_iterators(text_iterators)
         all_texts = map(clean_text, all_texts_iterator)
-    
+
     save_dir = args.output_dir
     os.makedirs(save_dir, exist_ok=True)
-        
+
     if args.tokenizer_type == 'bbpe':
         # Initialize a ByteLevel BPE tokenizer
         tokenizer = ByteLevelBPETokenizer()
@@ -283,7 +283,7 @@ def main():
         # Train the tokenizer
         print("Training tokenizer..")
         tokenizer.train_from_iterator(all_texts, vocab_size=args.vocab_size, min_frequency=args.min_frequency, special_tokens=[
-            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", 
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]",
                 "<|padding|>",
                 "<|endoftext|>",
                 "|||IP_ADDRESS|||",
@@ -291,7 +291,7 @@ def main():
                 "|||PHONE_NUMBER|||"
         ])
         tokenizer.save(os.path.join(save_dir, "tokenizer.json"))
-        
+
         # Wrap in PreTrainedTokenizerFast for ease of use:
         tokenizer_fast = PreTrainedTokenizerFast(
             tokenizer_file=os.path.join(save_dir, "tokenizer.json"),
@@ -309,6 +309,48 @@ def main():
         )
         print("Saving tokenizer..")
         tokenizer_fast.save_pretrained(os.path.join(save_dir))
+    elif args.tokenizer_type == 'llama':
+        # Initialize a SentencePiece BPE tokenizer (appropriate for Llama)
+        tokenizer = SentencePieceBPETokenizer()
+
+        # Llama special tokens
+        special_tokens = [
+            "<unk>",  # Unknown token
+            "<s>",    # Beginning of sentence
+            "</s>",   # End of sentence
+            "<pad>"   # Padding token
+        ]
+
+        # Train the tokenizer
+        print("Training tokenizer..")
+        tokenizer.train_from_iterator(
+            all_texts,
+            vocab_size=args.vocab_size,
+            min_frequency=args.min_frequency,
+            special_tokens=special_tokens
+        )
+
+        # Save the basic tokenizer files
+        print("Saving base tokenizer..")
+        tokenizer.save_model(os.path.join(save_dir))
+
+        # Save the tokenizer.json file for compatibility
+        tokenizer.save(os.path.join(save_dir, "tokenizer.json"))
+
+        # Wrap in LlamaTokenizerFast for HuggingFace compatibility
+        print("Creating LlamaTokenizerFast..")
+        tokenizer_fast = LlamaTokenizerFast(
+            tokenizer_file=os.path.join(save_dir, "tokenizer.json"),
+            model_max_length=2048,  # Standard context length for Llama models
+            bos_token="<s>",
+            eos_token="</s>",
+            unk_token="<unk>",
+            pad_token="<pad>"
+        )
+        # Save the Llama tokenizer with all the necessary files
+        print("Saving LlamaTokenizerFast..")
+        tokenizer_fast.save_pretrained(os.path.join(save_dir))
+
     else:
         raise ValueError(f"Invalid tokenizer type: {args.tokenizer_type}")
 

@@ -41,7 +41,7 @@ gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --comm
 
 # Mount the disk
 echo "Mounting disk to temporary VM..."
-gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="sudo mkdir -p ${DISK_MOUNT_DIR} && sudo mount -o discard,defaults /dev/sdb ${DISK_MOUNT_DIR} && sudo chmod 777 ${DISK_MOUNT_DIR}"
+gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="sudo mkdir -p ${DISK_MOUNT_DIR} && (sudo mount -o discard,defaults /dev/sdb ${DISK_MOUNT_DIR} || (echo 'Disk already mounted, continuing...')) && sudo chmod 777 ${DISK_MOUNT_DIR}"
 
 # Download the dataset from GCS
 echo "Downloading dataset from ${SHUFFLED_DATASET_GC} to disk..."

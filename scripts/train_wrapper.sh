@@ -34,6 +34,7 @@ while true; do
     --max_steps_per_epoch=${NUM_EPOCHS} \
     --weight_decay=${WEIGHT_DECAY} \
     --wandb_key=${WANDB_KEY} \
+    --lazy_grouping \
     --num_train_epochs=5 2>&1 | tee -a ~/logs.txt
 
   EXIT_CODE=$?
