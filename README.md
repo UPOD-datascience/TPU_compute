@@ -60,3 +60,27 @@ Sources:
 # Post-training quantisation
 
 https://github.com/microsoft/VPTQ
+
+
+# Note on training strategies
+
+We want to perform as much of the CRUD+ as possible outside the TPUs. Ideally this means
+* All tokenization
+* All chunking and grouping
+* All shuffling
+
+An **example** strategy;
+1. normalise all texts (jsonl, parquet, csv, tsv) into one format, with one dataschema
+2. load these texts, and tokenize
+3. chunking/grouping the tokenized data
+4. shuffle the texts, multiple times, each shuffled set is used for a different epoch
+
+Possible combine steps 2 and 3, through both steps the dataset will inflate.
+Step 4 deserves some explanation; we need to randomly select the text **sources** for batching, then
+shuffle **within** the batch, then iteratively write to a new dataset. We can do this recursively.
+
+Load these shuffled sets onto an external read-only drive that is then mounted on the TPU.
+
+For training the model use a **streaming** dataloader without shuffling and without tokenization. The training should start within the hour, depending on the TPU network.
+
+Note; we did not do this :D.

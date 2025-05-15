@@ -8,6 +8,10 @@ from torch_xla.runtime import world_size, global_ordinal
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
+import multiprocessing as mp
+#import torch.multiprocessing as torchmp
+#torchmp.set_sharing_strategy('file_system')
+
 from transformers import (
 DebertaV2TokenizerFast,
 DebertaV2Config,
@@ -456,7 +460,7 @@ def train_fn(tokenized_dataset, device, args):
     # Set up optimizer and scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     steps_per_epoch = args.max_steps_per_epoch if args.streaming_data else len(train_dataloader)
-    save_steps = int(steps_per_epoch * args.save_epoch_percentage)
+    save_steps = args.save_epoch_percentage if args.save_epoch_percentage>1. else int(steps_per_epoch * args.save_epoch_percentage)
     total_steps = steps_per_epoch * args.num_train_epochs
     #scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=total_steps)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
@@ -675,7 +679,7 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.001)
     parser.add_argument("--logging_steps", type=int, default=100)
-    parser.add_argument("--save_epoch_percentage", type=float, default=0.5)
+    parser.add_argument("--save_epoch_percentage", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_cores", type=int, default=8)
     parser.add_argument("--keep_in_memory", action='store_true')
@@ -693,6 +697,8 @@ def main():
     parser.add_argument("--lazy_grouping", action='store_true', help="Use lazy grouping to process data on-the-fly during training (incompatible with --pre_tokenized)")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
     args = parser.parse_args()
+
+    mp.set_start_method('fork', force=True)
 
     # give error if both keep_in_memory and streaming_data are set to True
     # as they are mutually exclusive
@@ -797,7 +803,7 @@ def main():
         print("Running single process...")
         prep_and_train_fn(0, args)
     else:
-        xmp.spawn(prep_and_train_fn, args=(args,))
+        xmp.spawn(prep_and_train_fn, args=(args,), nprocs=args.num_cores )
 
 if __name__ == "__main__":
     print("Starting...")

@@ -16,8 +16,8 @@ while true; do
     --tokenizer_name_or_path=/home/${USERNAME}/tokenizer \
     --per_device_train_batch_size=${BATCH_SIZE} \
     --gradient_accumulation_steps=${GRAD_ACCUM_STEPS} \
-    --save_epoch_percentage=0.05 \
-    --logging_steps=100 \
+    --save_epoch_percentage=${SAVE_PERCENTAGE} \
+    --logging_steps=${LOGGING_STEPS} \
     --num_warmup_steps=${NUM_WARMUP} \
     --num_cores=16 \
     --hidden_size=${HIDDEN_SIZE} \
@@ -34,7 +34,6 @@ while true; do
     --max_steps_per_epoch=${NUM_EPOCHS} \
     --weight_decay=${WEIGHT_DECAY} \
     --wandb_key=${WANDB_KEY} \
-    --lazy_grouping \
     --num_train_epochs=5 2>&1 | tee -a ~/logs.txt
 
   EXIT_CODE=$?

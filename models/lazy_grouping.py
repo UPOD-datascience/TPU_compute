@@ -1,29 +1,30 @@
 import torch
 from torch.utils.data import Dataset, IterableDataset
 from typing import Dict, List, Any, Iterator, Union, Optional
+import torch_xla.core.xla_model as xm
 
 class LazyGroupingDataset(IterableDataset):
     """
     A wrapper dataset that applies grouping lazily during iteration.
     This allows for on-the-fly text grouping during training rather than preprocessing the entire dataset upfront.
-    
+
     For streaming datasets, this is particularly beneficial as it:
     1. Reduces startup time dramatically
     2. Processes only the data needed for each batch
     3. Maintains the streaming nature of the dataset
     """
-    
+
     def __init__(
-        self, 
-        dataset: Union[Dataset, IterableDataset], 
-        max_seq_length: int, 
+        self,
+        dataset: Union[Dataset, IterableDataset],
+        max_seq_length: int,
         pad_token: int = 0,
         batch_size: int = 8,
         streaming: bool = True
     ):
         """
         Initialize the lazy grouping dataset wrapper.
-        
+
         Args:
             dataset: The underlying dataset containing tokenized examples
             max_seq_length: Maximum sequence length for grouped examples
@@ -36,50 +37,59 @@ class LazyGroupingDataset(IterableDataset):
         self.pad_token = pad_token
         self.batch_size = batch_size
         self.streaming = streaming
-        
-    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
         """
         Iterate through the dataset, applying grouping on-the-fly.
-        
+
         Returns:
             Iterator yielding batches of grouped examples
         """
         # Create an iterator from the underlying dataset
         dataset_iter = iter(self.dataset)
-        
+
         # Keep yielding batches until we're done
         while True:
             try:
                 # Get a batch of examples
                 batch = []
                 for _ in range(self.batch_size):
-                    batch.append(next(dataset_iter))
-                
+                    try:
+                        item = next(dataset_iter)
+                        batch.append(item)
+                    except StopIteration:
+                        if not batch:  # If batch is empty, we're truly done
+                            raise
+                        break  # Otherwise process the partial batch
+
                 if not batch:
                     break
-                    
+
                 # Convert list of dicts to dict of lists
                 batch_dict = {k: [item[k] for item in batch] for k in batch[0].keys()}
-                
+
                 # Apply grouping to this batch
                 grouped_batch = self._group_texts(batch_dict)
-                
+
                 # Yield each example in the grouped batch
                 for i in range(len(grouped_batch[list(grouped_batch.keys())[0]])):
-                    yield {k: grouped_batch[k][i] for k in grouped_batch.keys()}
-                
+                    # Return the example without converting to tensor
+                    # Let the data collator handle the tensor conversion
+                    example = {k: grouped_batch[k][i] for k in grouped_batch.keys()}
+                    yield example
+
             except StopIteration:
                 # No more data
                 break
-    
+
     def _group_texts(self, examples: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         """
         Group already tokenized texts into chunks of max_seq_length while respecting sample boundaries.
-        
+
         Args:
             examples: Dictionary with keys like 'input_ids', 'attention_mask', etc. where each value
                      is a list of tokenized examples
-                     
+
         Returns:
             Dictionary with same keys but values chunked to max_seq_length with padding
         """
@@ -118,12 +128,12 @@ class LazyGroupingDataset(IterableDataset):
                 result[k].extend(chunks)
 
         return result
-    
+
     def __len__(self) -> Optional[int]:
         """
         Return the length of the dataset if available.
         For streaming datasets, this may not be available.
-        
+
         Returns:
             Length of the dataset if available, else None
         """
