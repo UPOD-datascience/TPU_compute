@@ -31,7 +31,7 @@ while true; do
     --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
     --shuffle_dataset_ext=${SHUFFLED_DATASET_EXT} \
     --checkpoint_path=${MODEL_CHECKPOINT} \
-    --max_steps_per_epoch=${NUM_EPOCHS} \
+    --max_steps_per_epoch=${MAX_STEPS_PER_EPOCH} \
     --weight_decay=${WEIGHT_DECAY} \
     --wandb_key=${WANDB_KEY} \
     --num_train_epochs=5 2>&1 | tee -a ~/logs.txt

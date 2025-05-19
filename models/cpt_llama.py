@@ -106,22 +106,29 @@ class ShardedShuffleDataset(torch.utils.data.IterableDataset):
             items_yielded += 1
             yield buffer.pop(0)
 
+# def tokenize_function(examples, tokenizer, max_seq_length):
+#     # here you can actually add a chunker to split the text into smaller parts, of max_len
+#     output= tokenizer(examples["text"],
+#                     truncation=False,
+#                     max_length=max_seq_length,
+#                     padding="max_length",
+#                     return_overflowing_tokens=True,
+#                     return_length=True
+#     )
+#     input_batch = []
+#     for length, input_ids in zip(output['length'], output['input_ids']):
+#         input_batch.append({
+#             "input_ids": input_ids,
+#             "attention_mask": [1] * length
+#         })
+#     return {"input_ids": input_batch}
+
 def tokenize_function(examples, tokenizer, max_seq_length):
     # here you can actually add a chunker to split the text into smaller parts, of max_len
-    output= tokenizer(examples["text"],
+    return tokenizer(examples["text"],
                     truncation=False,
                     max_length=max_seq_length,
-                    padding="max_length",
-                    return_overflowing_tokens=True,
-                    return_length=True
-    )
-    input_batch = []
-    for length, input_ids in zip(output['length'], output['input_ids']):
-        input_batch.append({
-            "input_ids": input_ids,
-            "attention_mask": [1] * length
-        })
-    return {"input_ids": input_batch}
+                    padding="max_length")
 
 def load_from_gcs(bucket_name, blob_name, local_path, device):
     # Initialize a client
@@ -318,7 +325,7 @@ def train_fn(tokenized_dataset, device, args):
     if global_ordinal() == 0: #.is_master_ordinal():
         wandb.login(key=args.wandb_key)
         wandb.init(
-            project="Llama 3.2 - 1B TPU pretraining from scratch",
+            project="Llama 3.2 - 1B TPU CPT",
             config={
                 "learning_rate": args.learning_rate,
                 "architecture": "Llama 3.2 - 1B",

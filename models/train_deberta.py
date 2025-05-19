@@ -8,7 +8,7 @@ from torch_xla.runtime import world_size, global_ordinal
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
-import multiprocessing as mp
+#import multiprocessing as mp
 #import torch.multiprocessing as torchmp
 #torchmp.set_sharing_strategy('file_system')
 
@@ -698,7 +698,7 @@ def main():
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
     args = parser.parse_args()
 
-    mp.set_start_method('fork', force=True)
+    #mp.set_start_method('fork', force=True)
 
     # give error if both keep_in_memory and streaming_data are set to True
     # as they are mutually exclusive

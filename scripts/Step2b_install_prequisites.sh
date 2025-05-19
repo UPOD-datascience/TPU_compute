@@ -2,15 +2,15 @@
 # set -e
 
 # # Export variables from .env file
-# set -o allexport
-# source ../.env
-# set +o allexport
+#set -o allexport
+#source ../.env
+#set +o allexport
 
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all --command="
-sudo apt-get install libffi-dev
+sudo apt-get update && sudo apt-get install libffi-dev
 pip install torch~=2.5.0 torch_xla[tpu]~=2.5.0 -f https://storage.googleapis.com/libtpu-releases/index.html -f https://storage.googleapis.com/libtpu-wheels/index.html"
 
 # echo "Installing libraries..."

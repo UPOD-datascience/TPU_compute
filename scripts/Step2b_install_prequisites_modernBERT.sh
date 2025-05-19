@@ -10,6 +10,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all --command="
+sudo apt-get update
 sudo apt-get install curl
 sudo apt-get install libffi-dev
 cd tmp
