@@ -211,16 +211,16 @@ def main():
         prefix = "/".join(args.data_dir.split("/")[3:])
         bucket = client.get_bucket(bucket_name)
         blobs = bucket.list_blobs(prefix=prefix)
-        corpus_files = [f"gs://{bucket_name}/{blob.name}" for blob in blobs if blob.name.endswith(('.jsonl', '.txt', '.parquet'))]
+        corpus_files = [f"gs://{bucket_name}/{blob.name}" for blob in blobs if blob.name.endswith(('.jsonl', '.json', '.txt', '.parquet'))]
     else:
-        corpus_files = [os.path.join(args.data_dir, f) for f in os.listdir(args.data_dir) if f.endswith(('.jsonl', '.txt', '.parquet'))]
+        corpus_files = [os.path.join(args.data_dir, f) for f in os.listdir(args.data_dir) if f.endswith(('.jsonl', '.json', '.txt', '.parquet'))]
 
     print("Reading files..")
     # Combine texts from all corpus files
     if not args.iterative:
         all_texts = []
         for file_path in corpus_files:
-            if file_path.endswith('.jsonl'):
+            if file_path.endswith('.jsonl') | file_path.endswith('.json'):
                 all_texts.extend(read_jsonl(file_path))
             elif file_path.endswith('.txt'):
                 all_texts.extend(read_txt(file_path))
@@ -232,7 +232,7 @@ def main():
     else:
         text_iterators = []
         for file_path in corpus_files:
-            if file_path.endswith('.jsonl'):
+            if file_path.endswith('.jsonl') | file_path.endswith('.json'):
                 text_iterators.append(read_jsonl_iterator(file_path))
             elif file_path.endswith('.txt'):
                 text_iterators.append(read_txt_iterator(file_path))
