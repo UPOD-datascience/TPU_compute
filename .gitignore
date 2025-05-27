@@ -6,6 +6,10 @@ __pycache__/
 # keys
 gsa.json
 
+.DS_Store
+
+*.safetensors
+
 # data
 *.parquet
 

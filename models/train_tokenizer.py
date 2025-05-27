@@ -1,6 +1,6 @@
 # train_tokenizer.py
 from tokenizers import ByteLevelBPETokenizer, SentencePieceBPETokenizer,BertWordPieceTokenizer
-from transformers import DebertaV2TokenizerFast, PreTrainedTokenizerFast, LlamaTokenizerFast
+from transformers import DebertaV2TokenizerFast, PreTrainedTokenizerFast, LlamaTokenizerFast, LongformerTokenizerFast, RobertaTokenizerFast
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors
 from tokenizers.processors import TemplateProcessing
 from tokenizers.normalizers import BertNormalizer
@@ -201,7 +201,7 @@ def main():
     parser.add_argument("--vocab_size", type=int, default=50_368)
     parser.add_argument("--min_frequency", type=int, default=100)
     parser.add_argument("--iterative", action='store_true')
-    parser.add_argument("--tokenizer_type", type=str, choices=['bbpe', 'sentencebpe', 'debertav2', 'bertwordpiece', 'modernbert', 'llama'], default='bbpe')
+    parser.add_argument("--tokenizer_type", type=str, choices=['bbpe', 'sentencebpe', 'debertav2', 'bertwordpiece', 'modernbert', 'llama', 'longformer'], default='bbpe')
     args = parser.parse_args()
 
     print("Getting file list..")
@@ -245,7 +245,7 @@ def main():
     save_dir = args.output_dir
     os.makedirs(save_dir, exist_ok=True)
 
-    if args.tokenizer_type == 'bbpe':
+    if args.tokenizer_type in ['bbpe','longformer', 'robert']:
         # Initialize a ByteLevel BPE tokenizer
         tokenizer = ByteLevelBPETokenizer()
         tokenizer._tokenizer.post_processor.verbose = True
@@ -256,6 +256,11 @@ def main():
         ])
         print("Saving tokenizer..")
         tokenizer.save_model(os.path.join(save_dir))
+        if args.tokenizer_type == 'longformer':
+            tokenizer_fast = LongformerTokenizerFast(merges_file=os.path.join(save_dir, "merges.txt"), vocab_file=os.path.join(save_dir, "vocab.json"))
+        else:
+            tokenizer_fast = RobertaTokenizerFast(merges_file=os.path.join(save_dir, "merges.txt"), vocab_file=os.path.join(save_dir, "vocab.json"))
+        tokenizer_fast.save_pretrained(os.path.join(save_dir))
     elif args.tokenizer_type == 'sentencebpe':
         # Initialize a SentencePiece BPE tokenizer
         tokenizer = SentencePieceBPETokenizer()
