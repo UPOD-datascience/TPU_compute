@@ -348,19 +348,11 @@ def train_fn(tokenized_dataset, device, args):
     model_config.cls_token_id = args.tokenizer.cls_token_id
     model_config.sep_token_id = args.tokenizer.sep_token_id
     model_config.vocab_size = args.tokenizer.vocab_size
-<<<<<<< HEAD
-    # model_config.num_hidden_layers = args.num_hidden_layers
-    # model_config.num_attention_heads = args.num_attention_heads
-    # model_config.hidden_size = args.hidden_size
-    # model_config.intermediate_size = args.intermediate_size
-    model_config.max_position_embeddings = args.max_seq_length+2
-=======
     model_config.num_hidden_layers = args.num_hidden_layers
     model_config.num_attention_heads = args.num_attention_heads
     model_config.hidden_size = args.hidden_size
     model_config.intermediate_size = args.intermediate_size
     model_config.max_position_embeddings = args.max_seq_length
->>>>>>> f378f9d (fixing external disk, added longformer)
 
     model = LongformerForMaskedLM(model_config)
 
@@ -700,11 +692,7 @@ def main():
     parser.add_argument("--shuffle_dataset", action='store_true')
     parser.add_argument("--shuffle_force_update", action='store_true')
     parser.add_argument("--debug", action='store_true')
-<<<<<<< HEAD
     parser.add_argument("--checkpoint_path", type=str, default=None)
-=======
-    parser.add_argument("--checkpoint_path", type=str)
->>>>>>> f378f9d (fixing external disk, added longformer)
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
     parser.add_argument("--lazy_grouping", action='store_true', help="Use lazy grouping to process data on-the-fly during training (incompatible with --pre_tokenized)")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")

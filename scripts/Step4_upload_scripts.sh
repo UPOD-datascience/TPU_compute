@@ -9,7 +9,7 @@ if [[ ${LOCAL_MODEL_DIRECTORY} == gs://* ]]; then
   gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
-    --worker=all --command="mkdir -p /home/${USERNAME}/models && gsutil cp ${LOCAL_MODEL_DIRECTORY}/*.py /home/${USERNAME}/models/"
+    --worker=all --command="sudo rm -rf /var/log/* && sudo rm -rf /tmp/* && mkdir -p /home/${USERNAME}/models && gsutil cp ${LOCAL_MODEL_DIRECTORY}/*.py /home/${USERNAME}/models/"
 else
   echo "Copying models from local"
   gcloud compute tpus tpu-vm scp \
