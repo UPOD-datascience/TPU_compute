@@ -16,9 +16,10 @@ from transformers import (
 LongformerTokenizerFast, # Use Longformer tokenizer
 LongformerConfig, # Use Longformer config
 LongformerForMaskedLM, # Use Longformer model
-DataCollatorForLanguageModeling
+DataCollatorForLanguageModeling,
 )
-from transformers import Trainer, TrainingArguments
+from transformers.models.longformer.modeling_longformer import LongformerModel
+#from transformers import Trainer, TrainingArguments
 from transformers import get_linear_schedule_with_warmup
 
 from datasets import load_dataset, DatasetDict, DatasetInfo
@@ -47,6 +48,41 @@ from itertools import chain
 from time import sleep
 from lazy_grouping import LazyGroupingDataset
 
+# +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# MONKEY-PATCH Longformer's internal padding to prevent XLA errors
+# This should be placed EARLY in your script, after imports.
+try:
+    # Keep a reference to the original, just in case (optional)
+    # original_pad_to_window_size = longformer_modeling_module.pad_to_window_size
+
+    def _no_op_pad_to_window_size_method(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        pad_token_id: int,
+    ):
+        """
+        A dummy method that mimics the signature of HF's _pad_to_window_size
+        but does NO padding. We assume our data pipeline has already padded correctly.
+        It must return the same number of values as the original.
+        """
+        # Original returns: padding_len, input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds
+        # We assume padding_len is 0 because we've pre-padded.
+        padding_len = 0
+        return padding_len, input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds
+
+    LongformerModel._pad_to_window_size = _no_op_pad_to_window_size_method
+    print("Successfully monkey-patched LongformerModel._pad_to_window_size", flush=True)
+
+except ImportError:
+        print("Could not import pad_to_window_size for monkey-patching. Check transformers version or path.", flush=True)
+except Exception as e:
+        print(f"Error during monkey-patching: {e}", flush=True)
+# +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
 try:
     os.environ.pop('TPU_PROCESS_ADDRESSES')
     os.environ.pop('CLOUD_TPU_TASK_ID')
@@ -62,6 +98,80 @@ shards = os.environ.get('TPU_WORKER_HOSTNAMES', '0').split(',')
 
 print(f"TPU_WORKER_ID: {worker_id}")
 print(f"TPU_WORKER_HOSTNAMES for {worker_id}: {shards}")
+
+def pad_to_window(batch, window_size, pad_token_id):
+       seq_len = batch["input_ids"].size(1)
+       pad_len = (window_size - seq_len % window_size) % window_size
+       if pad_len:
+           # pad on the right
+           batch["input_ids"] = torch.nn.functional.pad(
+               batch["input_ids"], (0, pad_len), value=pad_token_id
+           )
+           batch["attention_mask"] = torch.nn.functional.pad(
+               batch["attention_mask"], (0, pad_len), value=0
+           )
+           if "labels" in batch:
+               batch["labels"] = torch.nn.functional.pad(
+                   batch["labels"], (0, pad_len), value=-100
+               )
+       return batch
+
+def ensure_static_shapes(batch, device, max_seq_len, batch_size):
+    """Ensure all tensors have static shapes compatible with TPU compilation"""
+    processed_batch = {}
+
+    # Define target shapes - must be multiples of 8 for TPU efficiency
+    target_shapes = {
+        'input_ids': (batch_size, max_seq_len),  # Based on your MAX_SEQ_LEN
+        'attention_mask': (batch_size, max_seq_len),
+        'token_type_ids': (batch_size, max_seq_len) if 'token_type_ids' in batch else None,
+        'labels': (batch_size, max_seq_len) if 'labels' in batch else None
+    }
+
+    for key, tensor in batch.items():
+        if key in target_shapes and target_shapes[key] is not None:
+            current_shape = tensor.shape
+            target_shape = target_shapes[key]
+
+            # Check if reshaping needed
+            if current_shape != target_shape:
+                # Create new tensor with target shape
+                new_tensor = torch.zeros(target_shape,
+                                        dtype=tensor.dtype,
+                                        device=device)
+
+                # Copy data from original tensor
+                slices = tuple(slice(0, min(current_shape[i], target_shape[i]))
+                              for i in range(len(current_shape)))
+                new_tensor[slices] = tensor[slices]
+
+                # For attention_mask, fill with 0s (padding)
+                # For input_ids, fill with pad_token_id
+                # For labels, fill with -100 (ignore index)
+                if key == 'input_ids':
+                    pad_value = 0  # Assuming 0 is your pad token ID
+                elif key == 'labels':
+                    pad_value = -100  # Standard ignore index
+                else:
+                    pad_value = 0
+
+                # Apply padding value to the rest of the tensor
+                padding_slices = []
+                for i in range(len(current_shape)):
+                    if i == 0:  # Batch dimension
+                        padding_slices.append(slice(0, target_shape[i]))
+                    else:  # Sequence dimension
+                        padding_slices.append(slice(current_shape[i], target_shape[i]))
+
+                if any(s.stop > s.start for s in padding_slices):
+                    new_tensor[tuple(padding_slices)] = pad_value
+
+                tensor = new_tensor
+
+        # Convert to bfloat16 if needed
+        processed_batch[key] = tensor.to(device=device, dtype=torch.bfloat16) if tensor.dtype==torch.float32 else tensor.to(device)
+
+    return processed_batch
 
 
 def shuffle_and_save_dataset(dataset, output_path, seed=None, shuffle=True):
@@ -341,6 +451,7 @@ def train_fn(tokenized_dataset, device, args):
 
     # Load pre-trained model
     xm.master_print("Loading the LM ...")
+    WINDOW = 512
     model_config = LongformerConfig.from_pretrained(args.model_name)
     model_config.bos_token_id = args.tokenizer.bos_token_id
     model_config.eos_token_id = args.tokenizer.eos_token_id
@@ -352,7 +463,13 @@ def train_fn(tokenized_dataset, device, args):
     model_config.num_attention_heads = args.num_attention_heads
     model_config.hidden_size = args.hidden_size
     model_config.intermediate_size = args.intermediate_size
-    model_config.max_position_embeddings = args.max_seq_length
+    model_config.attention_window = [WINDOW] * model_config.num_hidden_layers
+
+    base_len = args.max_seq_length       # say 2046
+    padded_len = ((base_len + WINDOW - 1) // WINDOW) * WINDOW
+    model_config.max_position_embeddings = padded_len # args.max_seq_length + 2
+
+    print(f"Continuing with padded len of {padded_len}", flush=True)
 
     model = LongformerForMaskedLM(model_config)
 
@@ -380,6 +497,7 @@ def train_fn(tokenized_dataset, device, args):
         pass
 
     model = model.to(device=device, dtype=torch.bfloat16)
+    #model.gradient_checkpointing_enable()
 
     # Set up data collator
     xm.master_print("Setting up data collator...")
@@ -490,7 +608,27 @@ def train_fn(tokenized_dataset, device, args):
         step = -1
         for step, batch in enumerate(safe_iter(xla_train_loader)):
             try:
+                batch = pad_to_window(batch, WINDOW, args.tokenizer.pad_token_id)
+
+                seq_len_after_pad = batch["input_ids"].size(1)
+                assert seq_len_after_pad == padded_len, f"Bad pad: {seq_len_after_pad}"
+
                 batch = {k: v.to(device=device, dtype=torch.bfloat16) if v.dtype==torch.float32 else v.to(device) for k, v in batch.items()}
+
+                batch = ensure_static_shapes(batch,
+                    device,
+                    max_seq_len=padded_len,
+                    batch_size=args.per_device_train_batch_size)
+
+                # In your training loop, right before `outputs = model(**batch)`
+
+                seq_len = batch["input_ids"].shape[1]
+                win     = model.config.attention_window[0]
+
+                print(f"→ Feeding model input_ids of shape {batch['input_ids'].shape}")
+                assert seq_len % win == 0, f"Sequence length {seq_len} not a multiple of {win}!"
+
+
                 outputs = model(**batch)
                 loss = outputs.loss
                 loss.backward()
@@ -565,6 +703,9 @@ def train_fn(tokenized_dataset, device, args):
 
             except Exception as e:
                 print(f"Error occurred during processing batch {step}: {e}", flush=True)
+                if 'batch' in locals(): del batch
+                if 'outputs' in locals(): del outputs
+                torch.cuda.empty_cache() # or equivalent for TPU
                 miss_steps += 1
                 continue
 
@@ -614,8 +755,11 @@ def train_fn(tokenized_dataset, device, args):
         wandb.finish()
 
 def prep_and_train_fn(index, args):
+    print("Load devices..", flush=True)
     device = xm.xla_device()
+    print("Create tokenizer..")
     tokenized_dataset = prep_fn(args)
+    print("Start training..")
     train_fn(tokenized_dataset, device, args)
 
 def evaluate(model, dataloader, device):
@@ -803,7 +947,7 @@ def main():
         print("Running single process...")
         prep_and_train_fn(0, args)
     else:
-        xmp.spawn(prep_and_train_fn, args=(args,), nprocs=args.num_cores )
+        xmp.spawn(prep_and_train_fn, args=(args,)) #, nprocs=args.num_cores )
 
 if __name__ == "__main__":
     print("Starting...")

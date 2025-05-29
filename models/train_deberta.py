@@ -341,43 +341,50 @@ def train_fn(tokenized_dataset, device, args):
 
     # Load pre-trained model
     xm.master_print("Loading the LM ...")
-    model_config = DebertaV2Config.from_pretrained(args.model_name)
-    model_config.bos_token_id = args.tokenizer.bos_token_id
-    model_config.eos_token_id = args.tokenizer.eos_token_id
-    model_config.pad_token_id = args.tokenizer.pad_token_id
-    model_config.cls_token_id = args.tokenizer.cls_token_id
-    model_config.sep_token_id = args.tokenizer.sep_token_id
-    model_config.vocab_size = args.tokenizer.vocab_size
-    model_config.num_hidden_layers = args.num_hidden_layers
-    model_config.num_attention_heads = args.num_attention_heads
-    model_config.hidden_size = args.hidden_size
-    model_config.intermediate_size = args.intermediate_size
-    model_config.max_position_embeddings = args.max_seq_length
 
-    model = DebertaV2ForMaskedLM(model_config)
 
-    if isinstance(args.checkpoint_path, str) & (args.checkpoint_path != ""):
-        if args.checkpoint_path.startswith('gs://'):
-            # Parse GCS path
-            bucket_name = args.checkpoint_path.split('/')[2]
-            blob_name = '/'.join(args.checkpoint_path.split('/')[3:])
-            local_path = f'/tmp/checkpoint.{args.checkpoint_path.split(".")[-1]}'  # Temporary local path to store the downloaded file
-            checkpoint = load_from_gcs(bucket_name,
-                                       blob_name,
-                                       local_path,
-                                       device)
-        else:
-            if args.checkpoint_path.endswith('.safetensors'):
-                checkpoint = load_safetensors(args.checkpoint_path, device=device)
+    if args.checkpoint_handling in ['start_with_checkpoint', 'start_with_init']:
+        model_config = DebertaV2Config.from_pretrained(args.model_name)
+        model_config.bos_token_id = args.tokenizer.bos_token_id
+        model_config.eos_token_id = args.tokenizer.eos_token_id
+        model_config.pad_token_id = args.tokenizer.pad_token_id
+        model_config.cls_token_id = args.tokenizer.cls_token_id
+        model_config.sep_token_id = args.tokenizer.sep_token_id
+        model_config.vocab_size = args.tokenizer.vocab_size
+        model_config.num_hidden_layers = args.num_hidden_layers
+        model_config.num_attention_heads = args.num_attention_heads
+        model_config.hidden_size = args.hidden_size
+        model_config.intermediate_size = args.intermediate_size
+        model_config.max_position_embeddings = args.max_seq_length
+
+        model = DebertaV2ForMaskedLM(model_config)
+
+        if isinstance(args.checkpoint_path, str) & (args.checkpoint_path != ""):
+            if args.checkpoint_path.startswith('gs://'):
+                # Parse GCS path
+                bucket_name = args.checkpoint_path.split('/')[2]
+                blob_name = '/'.join(args.checkpoint_path.split('/')[3:])
+                local_path = f'/tmp/checkpoint.{args.checkpoint_path.split(".")[-1]}'  # Temporary local path to store the downloaded file
+                checkpoint = load_from_gcs(bucket_name,
+                                        blob_name,
+                                        local_path,
+                                        device)
             else:
-                checkpoint = torch.load(args.checkpoint_path, map_location=device)
+                if args.checkpoint_path.endswith('.safetensors'):
+                    checkpoint = load_safetensors(args.checkpoint_path, device=device)
+                else:
+                    checkpoint = torch.load(args.checkpoint_path, map_location=device)
 
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
         else:
-            model.load_state_dict(checkpoint)
+            pass
+    elif args.checkpoint_handling == 'start_with_basemodel':
+        model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
     else:
-        pass
+        raise ValueError("Checkpoint handling should be one of ['start_with_init','start_with_base', 'start_with_checkpoint']")
 
     model = model.to(device=device, dtype=torch.bfloat16)
 
@@ -693,6 +700,7 @@ def main():
     parser.add_argument("--shuffle_force_update", action='store_true')
     parser.add_argument("--debug", action='store_true')
     parser.add_argument("--checkpoint_path", type=str)
+    parser.add_argument("--checkpoint_handling", type=str, choices=['start_with_checkpoint', 'start_with_basemodel', 'start_with_init'])
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
     parser.add_argument("--lazy_grouping", action='store_true', help="Use lazy grouping to process data on-the-fly during training (incompatible with --pre_tokenized)")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
@@ -803,7 +811,7 @@ def main():
         print("Running single process...")
         prep_and_train_fn(0, args)
     else:
-        xmp.spawn(prep_and_train_fn, args=(args,), nprocs=args.num_cores )
+        xmp.spawn(prep_and_train_fn, args=(args,)) #, nprocs=args.num_cores )
 
 if __name__ == "__main__":
     print("Starting...")

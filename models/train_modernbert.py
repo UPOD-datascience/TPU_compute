@@ -1,6 +1,3 @@
-"""
-This is the main script to continue pre-training a Roberta model.
-"""
 import argparse
 import torch
 from torch_xla.runtime import world_size, global_ordinal

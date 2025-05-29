@@ -5,6 +5,10 @@ set -o allexport
 source ~/.env
 set +o allexport
 
+# Add before running python script
+#export TF_XLA_FLAGS="--tf_xla_enable_lazy_compilation=false --tf_xla_async_compilation=false"
+#export PYTORCH_XLA_FLAGS="--xla_dump_to=/tmp/xla_dump --xla_dump_hlo_as_text --xla_gpu_autotune_level=0"
+
 while true; do
   echo "Training started at $(date)."
   python3 /home/${USERNAME}/models/train_${BASE_MODEL}.py \
@@ -31,6 +35,7 @@ while true; do
     --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
     --shuffle_dataset_ext=${SHUFFLED_DATASET_EXT} \
     --checkpoint_path=${MODEL_CHECKPOINT} \
+    --checkpoint_handling=${CHECKPOINT_HANDLING} \
     --max_steps_per_epoch=${MAX_STEPS_PER_EPOCH} \
     --weight_decay=${WEIGHT_DECAY} \
     --wandb_key=${WANDB_KEY} \

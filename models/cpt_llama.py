@@ -1,6 +1,3 @@
-"""
-This is the main script to continue pre-training a Roberta model.
-"""
 import argparse
 import torch
 from torch_xla.runtime import world_size, global_ordinal
@@ -713,6 +710,7 @@ def main():
                     shutil.rmtree(cache_dir)
                 else:
                     print("Hugging Face cache directory not found.", flush=True)
+
             else:
                 print("Loading dataset for shuffling...", flush=True)
                 dataset = load_dataset(args.dataset_format, data_files={
@@ -749,6 +747,7 @@ def main():
         if os.path.exists(shuffle_dir):
             print(f"Removing shuffled dataset: {shuffle_dir}", flush=True)
             shutil.rmtree(shuffle_dir)
+
 
     args.tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
     args.tokenizer.model_max_length = args.max_seq_length

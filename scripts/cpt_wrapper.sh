@@ -32,6 +32,8 @@ while true; do
     --max_steps_per_epoch=${MAX_STEPS_PER_EPOCH} \
     --weight_decay=${WEIGHT_DECAY} \
     --wandb_key=${WANDB_KEY} \
+    --TPU_NAME=${TPU_NAME} \
+    --TPU_DISK=${EXT_DISK_NAME} \
     --num_train_epochs=5 2>&1 | tee -a ~/logs.txt
 
   EXIT_CODE=$?

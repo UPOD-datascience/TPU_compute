@@ -1,6 +1,6 @@
 #!/bin/bash
 # set -o allexport
-# source ../.longformer.env
+# source ../.cpt.env
 # set +o allexport
 
 echo "Copying models to TPU"
