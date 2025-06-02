@@ -29,7 +29,7 @@ import ftfy
 import pyarrow.parquet as pq
 import sentencepiece as spm
 import tempfile
-
+import platform
 from typing import List, Iterator
 
 # Windows-specific fixes for SentencePiece
