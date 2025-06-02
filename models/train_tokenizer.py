@@ -3,7 +3,6 @@ from tokenizers import (
         ByteLevelBPETokenizer,
         SentencePieceBPETokenizer,
         BertWordPieceTokenizer,
-        SentencePieceTokenizer
         )
 from transformers import (
         DebertaV2TokenizerFast,
