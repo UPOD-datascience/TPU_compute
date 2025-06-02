@@ -32,6 +32,20 @@ import tempfile
 
 from typing import List, Iterator
 
+# Windows-specific fixes for SentencePiece
+if platform.system() == "Windows":
+    # Set environment variables to prevent crashes
+    os.environ["PYTHONHASHSEED"] = "0"
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+
+    # Import with error handling
+    try:
+        import torch
+        torch.set_num_threads(1)
+    except ImportError:
+        pass
+
 def clean_text(text):
     '''
     - remove spurious repetitions of characters, punctuation whitespace and linebreaks
@@ -421,7 +435,7 @@ def main():
             user_defined_symbols=['<mask>'],
             character_coverage=0.9995,
             train_extremely_large_corpus=True,
-            num_threads=os.cpu_count()
+            num_threads=1 #os.cpu_count()
         )
 
         # Clean up temporary file
