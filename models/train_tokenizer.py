@@ -32,77 +32,6 @@ import tempfile
 
 from typing import List, Iterator
 
-def train_bigbird_tokenizer(texts, vocab_size=50000, save_dir="./bigbird_tokenizer", model_max_length=4096):
-    """
-    Train a BigBirdTokenizerFast with SentencePiece encoder.
-
-    Args:
-        texts: Iterator or list of text strings to train on
-        vocab_size: Size of the vocabulary (default: 50000)
-        save_dir: Directory to save the tokenizer (default: "./bigbird_tokenizer")
-        model_max_length: Maximum sequence length (default: 4096)
-
-    Returns:
-        BigBirdTokenizerFast: The trained tokenizer
-    """
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Write all texts to a temporary file for SentencePiece training
-    print("Preparing data for SentencePiece training...")
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8') as temp_file:
-        temp_filename = temp_file.name
-        for text in texts:
-            # Clean the text before training
-            cleaned_text = clean_text(text)
-            temp_file.write(cleaned_text + '\n')
-
-    # Train SentencePiece model directly
-    print("Training SentencePiece model...")
-    spm_model_prefix = os.path.join(save_dir, "sentencepiece")
-
-    # Configure SentencePiece trainer
-    spm.SentencePieceTrainer.train(
-        input=temp_filename,
-        model_prefix=spm_model_prefix,
-        vocab_size=vocab_size,
-        model_type='bpe',
-        pad_id=0,
-        unk_id=1,
-        bos_id=2,
-        eos_id=3,
-        pad_piece='<pad>',
-        unk_piece='<unk>',
-        bos_piece='<s>',
-        eos_piece='</s>',
-        user_defined_symbols=['<mask>'],
-        character_coverage=0.9995,
-        num_threads=os.cpu_count(),
-        input_sentence_size=10000000,  # Process up to 10M sentences
-        shuffle_input_sentence=True
-    )
-
-    # Clean up temporary file
-    os.unlink(temp_filename)
-
-    # Create BigBird tokenizer using the trained SentencePiece model
-    print("Creating BigBirdTokenizerFast...")
-    tokenizer_fast = BigBirdTokenizerFast(
-        vocab_file=f"{spm_model_prefix}.model",
-        model_max_length=model_max_length,
-        bos_token="<s>",
-        eos_token="</s>",
-        unk_token="<unk>",
-        pad_token="<pad>",
-        mask_token="<mask>"
-    )
-
-    # Save the BigBird tokenizer with all necessary files
-    print("Saving BigBirdTokenizerFast...")
-    tokenizer_fast.save_pretrained(save_dir)
-
-    print(f"BigBird tokenizer trained and saved to: {save_dir}")
-    return tokenizer_fast
-
 def clean_text(text):
     '''
     - remove spurious repetitions of characters, punctuation whitespace and linebreaks
@@ -467,7 +396,7 @@ def main():
     elif args.tokenizer_type == 'bigbird':
         # First, write all texts to a temporary file for SentencePiece training
         print("Preparing data for SentencePiece training..")
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as temp_file:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8') as temp_file:
             temp_filename = temp_file.name
             if args.iterative:
                 for text in all_texts:
@@ -500,7 +429,7 @@ def main():
         # Create BigBird tokenizer using the trained SentencePiece model
         print("Creating BigBirdTokenizerFast..")
         tokenizer_fast = BigBirdTokenizerFast(
-            vocab_file=f"{spm_model_prefix}.vocab",
+            vocab_file=f"{spm_model_prefix}.model",
             model_max_length=4096,  # BigBird's extended context length
             bos_token="<s>",
             eos_token="</s>",
