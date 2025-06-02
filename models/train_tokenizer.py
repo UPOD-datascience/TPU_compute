@@ -420,6 +420,7 @@ def main():
             eos_piece='</s>',
             user_defined_symbols=['<mask>'],
             character_coverage=0.9995,
+            train_extremely_large_corpus=True,
             num_threads=os.cpu_count()
         )
 
