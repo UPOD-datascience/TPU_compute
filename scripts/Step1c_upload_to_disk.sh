@@ -78,8 +78,16 @@ echo "Mounting disk to temporary VM..."
 gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="sudo mkdir -p ${EXT_MOUNT_POINT} && (sudo mount -o discard,defaults /dev/${ACTUAL_DEVICE} ${EXT_MOUNT_POINT} || (echo 'Disk already mounted or failed to mount. Listing current mounts:' && mount)) && sudo chmod 777 ${EXT_MOUNT_POINT}"
 
 # Download the dataset from GCS
-echo "Downloading dataset from ${SHUFFLED_DATASET_GC} to disk..."
-gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="gsutil -m cp ${SHUFFLED_DATASET_GC} ${EXT_MOUNT_POINT}/"
+echo "Checking if dataset file already exists on disk..."
+FILENAME=$(basename ${SHUFFLED_DATASET_GC})
+FILE_EXISTS=$(gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="if [ -f ${EXT_MOUNT_POINT}/${FILENAME} ]; then echo 'exists'; else echo 'not_found'; fi")
+
+if [ "$FILE_EXISTS" = "exists" ]; then
+    echo "Dataset file ${FILENAME} already exists on disk. Skipping download."
+else
+    echo "Downloading dataset from ${SHUFFLED_DATASET_GC} to disk..."
+    gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="gsutil -m cp ${SHUFFLED_DATASET_GC} ${EXT_MOUNT_POINT}/"
+fi
 
 # Show disk usage
 echo "Disk usage after downloading:"

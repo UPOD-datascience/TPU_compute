@@ -1,6 +1,18 @@
 # train_tokenizer.py
-from tokenizers import ByteLevelBPETokenizer, SentencePieceBPETokenizer,BertWordPieceTokenizer
-from transformers import DebertaV2TokenizerFast, PreTrainedTokenizerFast, LlamaTokenizerFast, LongformerTokenizerFast, RobertaTokenizerFast
+from tokenizers import (
+        ByteLevelBPETokenizer,
+        SentencePieceBPETokenizer,
+        BertWordPieceTokenizer,
+        SentencePieceTokenizer
+        )
+from transformers import (
+        DebertaV2TokenizerFast,
+        PreTrainedTokenizerFast,
+        LlamaTokenizerFast,
+        LongformerTokenizerFast,
+        RobertaTokenizerFast,
+        BigBirdTokenizerFast
+)
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors
 from tokenizers.processors import TemplateProcessing
 from tokenizers.normalizers import BertNormalizer
@@ -16,8 +28,81 @@ from google.cloud import storage
 import pandas as pd
 import ftfy
 import pyarrow.parquet as pq
+import sentencepiece as spm
+import tempfile
 
 from typing import List, Iterator
+
+def train_bigbird_tokenizer(texts, vocab_size=50000, save_dir="./bigbird_tokenizer", model_max_length=4096):
+    """
+    Train a BigBirdTokenizerFast with SentencePiece encoder.
+
+    Args:
+        texts: Iterator or list of text strings to train on
+        vocab_size: Size of the vocabulary (default: 50000)
+        save_dir: Directory to save the tokenizer (default: "./bigbird_tokenizer")
+        model_max_length: Maximum sequence length (default: 4096)
+
+    Returns:
+        BigBirdTokenizerFast: The trained tokenizer
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Write all texts to a temporary file for SentencePiece training
+    print("Preparing data for SentencePiece training...")
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8') as temp_file:
+        temp_filename = temp_file.name
+        for text in texts:
+            # Clean the text before training
+            cleaned_text = clean_text(text)
+            temp_file.write(cleaned_text + '\n')
+
+    # Train SentencePiece model directly
+    print("Training SentencePiece model...")
+    spm_model_prefix = os.path.join(save_dir, "sentencepiece")
+
+    # Configure SentencePiece trainer
+    spm.SentencePieceTrainer.train(
+        input=temp_filename,
+        model_prefix=spm_model_prefix,
+        vocab_size=vocab_size,
+        model_type='bpe',
+        pad_id=0,
+        unk_id=1,
+        bos_id=2,
+        eos_id=3,
+        pad_piece='<pad>',
+        unk_piece='<unk>',
+        bos_piece='<s>',
+        eos_piece='</s>',
+        user_defined_symbols=['<mask>'],
+        character_coverage=0.9995,
+        num_threads=os.cpu_count(),
+        input_sentence_size=10000000,  # Process up to 10M sentences
+        shuffle_input_sentence=True
+    )
+
+    # Clean up temporary file
+    os.unlink(temp_filename)
+
+    # Create BigBird tokenizer using the trained SentencePiece model
+    print("Creating BigBirdTokenizerFast...")
+    tokenizer_fast = BigBirdTokenizerFast(
+        vocab_file=f"{spm_model_prefix}.model",
+        model_max_length=model_max_length,
+        bos_token="<s>",
+        eos_token="</s>",
+        unk_token="<unk>",
+        pad_token="<pad>",
+        mask_token="<mask>"
+    )
+
+    # Save the BigBird tokenizer with all necessary files
+    print("Saving BigBirdTokenizerFast...")
+    tokenizer_fast.save_pretrained(save_dir)
+
+    print(f"BigBird tokenizer trained and saved to: {save_dir}")
+    return tokenizer_fast
 
 def clean_text(text):
     '''
@@ -201,7 +286,7 @@ def main():
     parser.add_argument("--vocab_size", type=int, default=50_368)
     parser.add_argument("--min_frequency", type=int, default=100)
     parser.add_argument("--iterative", action='store_true')
-    parser.add_argument("--tokenizer_type", type=str, choices=['bbpe', 'sentencebpe', 'debertav2', 'bertwordpiece', 'modernbert', 'llama', 'longformer'], default='bbpe')
+    parser.add_argument("--tokenizer_type", type=str, choices=['bbpe', 'sentencebpe', 'debertav2', 'bertwordpiece', 'modernbert', 'llama', 'longformer', 'bigbird'], default='bbpe')
     args = parser.parse_args()
 
     print("Getting file list..")
@@ -282,6 +367,31 @@ def main():
         # Save the tokenizer files
         print("Saving tokenizer..")
         tokenizer.save_model(os.path.join(save_dir))
+
+        if args.tokenizer_type == 'debertav2':
+            # Load the tokenizer into transformers as a fast tokenizer
+            slow_tokenizer = BertWordPieceTokenizer(os.path.join(save_dir, 'vocab.txt'),
+                                                                unk_token="[UNK]",
+                                                                pad_token="[PAD]",
+                                                                cls_token="[CLS]",
+                                                                sep_token="[SEP]",
+                                                                mask_token="[MASK]")
+            slow_tokenizer.save(os.path.join(save_dir, 'tokenizer.json'))
+
+            tokenizer = DebertaV2TokenizerFast.from_pretrained(
+                save_dir,
+                tokenizer_file=os.path.join(save_dir,"tokenizer.json"),
+                vocab_file=os.path.join(save_dir,"vocab.txt"),
+                unk_token="[UNK]",
+                pad_token="[PAD]",
+                cls_token="[CLS]",
+                sep_token="[SEP]",
+                mask_token="[MASK]"
+            )
+
+            # Now save the tokenizer properly for Hugging Face compatibility
+            print("Saving DeBertaV2tokenizer..")
+            tokenizer.save_pretrained(save_dir)
     elif args.tokenizer_type=='modernbert':
         # Initialize a DeBERTa V2 tokenizer
         tokenizer = BertWordPieceTokenizer(lowercase=False)
@@ -355,34 +465,57 @@ def main():
         # Save the Llama tokenizer with all the necessary files
         print("Saving LlamaTokenizerFast..")
         tokenizer_fast.save_pretrained(os.path.join(save_dir))
+    elif args.tokenizer_type == 'bigbird':
+        # First, write all texts to a temporary file for SentencePiece training
+        print("Preparing data for SentencePiece training..")
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as temp_file:
+            temp_filename = temp_file.name
+            if args.iterative:
+                for text in all_texts:
+                    temp_file.write(text + '\n')
+            else:
+                for text in all_texts:
+                    temp_file.write(text + '\n')
+
+        # Train SentencePiece model directly
+        print("Training SentencePiece model..")
+        spm_model_prefix = os.path.join(save_dir, "sentencepiece")
+
+        # Configure SentencePiece trainer
+        spm.SentencePieceTrainer.train(
+            input=temp_filename,
+            model_prefix=spm_model_prefix,
+            vocab_size=args.vocab_size,
+            pad_piece='<pad>',
+            unk_piece='<unk>',
+            bos_piece='<s>',
+            eos_piece='</s>',
+            user_defined_symbols=['<mask>'],
+            character_coverage=0.9995,
+            num_threads=os.cpu_count()
+        )
+
+        # Clean up temporary file
+        os.unlink(temp_filename)
+
+        # Create BigBird tokenizer using the trained SentencePiece model
+        print("Creating BigBirdTokenizerFast..")
+        tokenizer_fast = BigBirdTokenizerFast(
+            vocab_file=f"{spm_model_prefix}.vocab",
+            model_max_length=4096,  # BigBird's extended context length
+            bos_token="<s>",
+            eos_token="</s>",
+            unk_token="<unk>",
+            pad_token="<pad>",
+            mask_token="<mask>"
+        )
+
+        # Save the BigBird tokenizer with all necessary files
+        print("Saving BigBirdTokenizerFast..")
+        tokenizer_fast.save_pretrained(os.path.join(save_dir))
 
     else:
         raise ValueError(f"Invalid tokenizer type: {args.tokenizer_type}")
-
-    if args.tokenizer_type == 'debertav2':
-        # Load the tokenizer into transformers as a fast tokenizer
-        slow_tokenizer = BertWordPieceTokenizer(os.path.join(save_dir, 'vocab.txt'),
-                                                            unk_token="[UNK]",
-                                                            pad_token="[PAD]",
-                                                            cls_token="[CLS]",
-                                                            sep_token="[SEP]",
-                                                            mask_token="[MASK]")
-        slow_tokenizer.save(os.path.join(save_dir, 'tokenizer.json'))
-
-        tokenizer = DebertaV2TokenizerFast.from_pretrained(
-            save_dir,
-            tokenizer_file=os.path.join(save_dir,"tokenizer.json"),
-            vocab_file=os.path.join(save_dir,"vocab.txt"),
-            unk_token="[UNK]",
-            pad_token="[PAD]",
-            cls_token="[CLS]",
-            sep_token="[SEP]",
-            mask_token="[MASK]"
-        )
-
-        # Now save the tokenizer properly for Hugging Face compatibility
-        print("Saving DeBertaV2tokenizer..")
-        tokenizer.save_pretrained(save_dir)
 
 
 if __name__ == "__main__":

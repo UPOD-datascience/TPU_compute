@@ -2,9 +2,9 @@
 # set -e
 
 # # Export variables from .env file
-#set -o allexport
-#source ../.env
-#set +o allexport
+# set -o allexport
+# source ../.longformer.env
+# set +o allexport
 
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
@@ -28,7 +28,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
   --project=${PROJECT_ID} \
   --worker=all --command="
-pip install transformers tokenizers datasets tqdm wandb safetensors huggingface_hub[cli]
+pip install transformers tokenizers datasets tqdm wandb safetensors nltk huggingface_hub[cli]
 pip install accelerate>=0.26.0
 pip install gcsfs==2024.10.0
 pip install fsspec==2024.10.0"

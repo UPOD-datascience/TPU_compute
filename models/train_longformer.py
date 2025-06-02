@@ -13,12 +13,16 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 #torchmp.set_sharing_strategy('file_system')
 
 from transformers import (
-LongformerTokenizerFast, # Use Longformer tokenizer
 LongformerConfig, # Use Longformer config
-LongformerForMaskedLM, # Use Longformer model
+LongformerTokenizerFast,
 DataCollatorForLanguageModeling,
 )
-from transformers.models.longformer.modeling_longformer import LongformerModel
+from Longformer import (
+    LongformerForMaskedLM,
+    #LongformerTokenizer
+)
+
+#from transformers.models.longformer.modeling_longformer import LongformerModel
 #from transformers import Trainer, TrainingArguments
 from transformers import get_linear_schedule_with_warmup
 
@@ -47,42 +51,6 @@ from itertools import chain
 
 from time import sleep
 from lazy_grouping import LazyGroupingDataset
-
-# +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-# MONKEY-PATCH Longformer's internal padding to prevent XLA errors
-# This should be placed EARLY in your script, after imports.
-try:
-    # Keep a reference to the original, just in case (optional)
-    # original_pad_to_window_size = longformer_modeling_module.pad_to_window_size
-
-    def _no_op_pad_to_window_size_method(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor,
-        position_ids: torch.Tensor,
-        inputs_embeds: torch.Tensor,
-        pad_token_id: int,
-    ):
-        """
-        A dummy method that mimics the signature of HF's _pad_to_window_size
-        but does NO padding. We assume our data pipeline has already padded correctly.
-        It must return the same number of values as the original.
-        """
-        # Original returns: padding_len, input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds
-        # We assume padding_len is 0 because we've pre-padded.
-        padding_len = 0
-        return padding_len, input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds
-
-    LongformerModel._pad_to_window_size = _no_op_pad_to_window_size_method
-    print("Successfully monkey-patched LongformerModel._pad_to_window_size", flush=True)
-
-except ImportError:
-        print("Could not import pad_to_window_size for monkey-patching. Check transformers version or path.", flush=True)
-except Exception as e:
-        print(f"Error during monkey-patching: {e}", flush=True)
-# +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-
 try:
     os.environ.pop('TPU_PROCESS_ADDRESSES')
     os.environ.pop('CLOUD_TPU_TASK_ID')
@@ -453,8 +421,9 @@ def train_fn(tokenized_dataset, device, args):
     xm.master_print("Loading the LM ...")
     WINDOW = 512
     model_config = LongformerConfig.from_pretrained(args.model_name)
-    model_config.bos_token_id = args.tokenizer.bos_token_id
-    model_config.eos_token_id = args.tokenizer.eos_token_id
+    #model_config.bos_token_id = args.tokenizer.bos_token_id
+    #model_config.eos_token_id = args.tokenizer.eos_token_id
+    model_config.mask_token_id = args.tokenizer.mask_token_id
     model_config.pad_token_id = args.tokenizer.pad_token_id
     model_config.cls_token_id = args.tokenizer.cls_token_id
     model_config.sep_token_id = args.tokenizer.sep_token_id
@@ -837,6 +806,7 @@ def main():
     parser.add_argument("--shuffle_force_update", action='store_true')
     parser.add_argument("--debug", action='store_true')
     parser.add_argument("--checkpoint_path", type=str, default=None)
+    parser.add_argument("--checkpoint_handling", type=str, choices=['start_with_checkpoint', 'start_with_basemodel', 'start_with_init'])
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
     parser.add_argument("--lazy_grouping", action='store_true', help="Use lazy grouping to process data on-the-fly during training (incompatible with --pre_tokenized)")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
@@ -930,7 +900,7 @@ def main():
             shutil.rmtree(shuffle_dir)
 
     args.tokenizer = LongformerTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
-    args.tokenizer.model_max_length = args.max_seq_length
+    #args.tokenizer.model_max_length = args.max_seq_length
 
     if args.shuffle_dataset:
             args.dataset_dir = args.shuffle_dataset_path
