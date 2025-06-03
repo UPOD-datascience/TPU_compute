@@ -5,9 +5,9 @@ import argparse
 import torch
 
 from transformers import (
-    RobertaTokenizerFast,
-    RobertaConfig,
-    RobertaForMaskedLM,
+    DebertaV2TokenizerFast,
+    DebertaV2Config,
+    DebertaV2ForMaskedLM,
     DataCollatorForLanguageModeling
 )
 from transformers import Trainer, TrainingArguments
@@ -80,7 +80,7 @@ def prep_fn(args):
         return result
 
     # Load tokenizer
-    tokenizer = RobertaTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
+    tokenizer = DebertaV2TokenizerFast.from_pretrained(args.tokenizer_name_or_path)
 
     # Load and tokenize dataset
     if args.pre_tokenized:
@@ -186,19 +186,19 @@ def train_fn(index, args):
     # Initialize wandb for the master process (we use index==0 as master)
     #if index == 0:
     #    wandb.init(
-    #        project="RoBERTa GPU CPT",
+    #        project="Deberta GPU CPT",
     #        config={
     #            "learning_rate": args.learning_rate,
-    #            "architecture": "RoBERTa",
+    #            "architecture": "Deberta",
     #            "epochs": args.num_train_epochs,
     #            "weight_decay": args.weight_decay,
-    #           "max_seq_length": args.max_seq_length,
+    #            "max_seq_length": args.max_seq_length,
     #            "batch_size": args.per_device_train_batch_size,
     #        }
     #    )
 
     # Load pre-trained model
-    model = RobertaForMaskedLM.from_pretrained(args.model_name)
+    model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
     model.to(device)
 
     # Set up data collator
@@ -307,8 +307,8 @@ def train_fn(index, args):
                 #        f"train_perplexity_epoch_N{args.logging_steps}": perplexity_N,
                 #        "epoch": epoch,
                 #        "step": step,
-                #       "total_step": total_step
-                #   })
+                #        "total_step": total_step
+                #    })
 
             total_step += 1
             sub_step +=1
@@ -387,7 +387,7 @@ def main():
     parser.add_argument("--sharded_data", action='store_true')
     parser.add_argument("--max_steps_per_epoch", type=int, default=None)
     parser.add_argument("--shuffle_buffer_size", type=int, default=10_000)
-    parser.add_argument("--model_name", type=str, default="UMCU/CardioBERTa.nl_clinical")
+    parser.add_argument("--model_name", type=str, default="UMCU/CardioDeberta.nl")
     #parser.add_argument("--wandb_key", type=str, required=True, help="Weights & Biases API key")
     args = parser.parse_args()
 
