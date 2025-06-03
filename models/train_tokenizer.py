@@ -434,7 +434,7 @@ def main():
             eos_piece='</s>',
             user_defined_symbols=['<mask>'],
             character_coverage=0.9995,
-            input_sentence_size=10_000_000,
+            input_sentence_size=1_000_000,
             shuffle_input_sentence=True,
             num_threads=1 #os.cpu_count()
         )
