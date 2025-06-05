@@ -106,7 +106,7 @@ def prep_fn(args):
             return tokenizer(examples["text"],
                              truncation=False,
                              max_length=args.max_seq_length)
-        opt_kwargs = {'num_proc': 8} if args.streaming_data==False else {}
+        opt_kwargs = {'num_proc': args.num_cores} if args.streaming_data==False else {}
 
         tokenized_dataset_raw = dataset.map(tokenize_function,
                                          batched=True,
@@ -117,7 +117,7 @@ def prep_fn(args):
                                                          "approx_token_counts_original"],
                                          **opt_kwargs)
 
-        opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
+        opt_kwargs = {'num_proc': args.num_cores, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
         group_fn = partial(group_texts, pad_token=tokenizer.pad_token_id)
         tokenized_dataset = tokenized_dataset_raw.map(
                 group_fn,
@@ -274,20 +274,30 @@ def train_fn(index, args):
         sub_total_loss = 0.
         sub_step = 0
         model.train()
+        optimizer.zero_grad(set_to_none=True) 
         for step, batch in enumerate(train_loader):
             # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
             outputs = model(**batch)
-            loss = outputs.loss
-            loss.backward()
-
+            
+            with torch.cuda.amp.autocast(enabled=args.fp16):
+                outputs = model(**batch)
+                loss = outputs.loss / args.gradient_accumulation_steps
+            
+            if torch.isnan(loss):
+                optimizer.zero_grad(set_to_none=True) 
+                continue
+            loss.backward()                
+            
             total_loss += loss.item()
             sub_total_loss += loss.item()
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()  # Replaces xm.optimizer_step(optimizer)
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True) 
+                
 
             if (step + 1) % max(args.logging_steps, args.gradient_accumulation_steps) == 0:
                 global_avg_loss = total_loss / step
@@ -378,6 +388,7 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.001)
+    parser.add_argument("--max_grad_norm", type=float, default=10)
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--save_epoch_percentage", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)

@@ -25,7 +25,7 @@ $cmd = 'cd /d ' + $env:FULL_SCRIPT_DIR + ' && poetry run python ../models/cpt_ro
        '--save_epoch_percentage=0.05 ' +
        '--logging_steps=500 ' +
        '--num_warmup_steps=10_000 ' +
-       '--num_cores=8 ' +
+       '--num_cores=1 ' +
        '--max_seq_length=' + $env:MAX_SEQ_LEN + ' ' +
        '--learning_rate=5e-5 ' +
        '--keep_in_memory ' +
