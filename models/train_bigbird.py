@@ -3,7 +3,6 @@ This is the main script to continue pre-training a Roberta model.
 """
 import argparse
 import torch
-#from transformers.models.deberta_v2.tokenization_deberta_v2_fast import DebertaV2Tokenizer
 from torch_xla.runtime import world_size, global_ordinal
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
@@ -12,10 +11,42 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 #import torch.multiprocessing as torchmp
 #torchmp.set_sharing_strategy('file_system')
 
+# Disable tqdm to avoid pickling issues with multiprocessing
+import os
+os.environ["TQDM_DISABLE"] = "1"
+os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+
+# Additional tqdm disabling
+try:
+    import tqdm
+    tqdm.tqdm.disable = True
+    # Monkey patch tqdm to prevent any progress bars
+    def dummy_tqdm(*args, **kwargs):
+        return iter(args[0]) if args else iter([])
+    tqdm.tqdm = dummy_tqdm
+    tqdm.trange = dummy_tqdm
+except ImportError:
+    pass
+
+# Disable datasets and transformers progress bars
+try:
+    import datasets
+    datasets.disable_progress_bar()
+except ImportError:
+    pass
+
+try:
+    import transformers
+    transformers.logging.set_verbosity_error()
+    transformers.utils.logging.disable_progress_bar()
+except ImportError:
+    pass
+
 from transformers import (
-DebertaV2TokenizerFast,
-DebertaV2Config,
-DebertaV2ForMaskedLM,
+BigBirdTokenizerFast,
+BigBirdConfig,
+BigBirdForMaskedLM,
 DataCollatorForLanguageModeling
 )
 from transformers import Trainer, TrainingArguments
@@ -321,10 +352,10 @@ def train_fn(tokenized_dataset, device, args):
     if global_ordinal() == 0: #.is_master_ordinal():
         wandb.login(key=args.wandb_key)
         wandb.init(
-            project="DeBERTaV2 TPU pretraining from scratch",
+            project="BigBird TPU pretraining from scratch",
             config={
                 "learning_rate": args.learning_rate,
-                "architecture": "DeBERTaV2",
+                "architecture": "BigBird",
                 "dataset": args.dataset_dir,
                 "epochs": args.num_train_epochs,
                 "weight_decay": args.weight_decay,
@@ -344,7 +375,7 @@ def train_fn(tokenized_dataset, device, args):
 
 
     if args.checkpoint_handling in ['start_with_checkpoint', 'start_with_init']:
-        model_config = DebertaV2Config.from_pretrained(args.model_name)
+        model_config = BigBirdConfig.from_pretrained(args.model_name)
         model_config.bos_token_id = args.tokenizer.bos_token_id
         model_config.eos_token_id = args.tokenizer.eos_token_id
         model_config.pad_token_id = args.tokenizer.pad_token_id
@@ -357,7 +388,7 @@ def train_fn(tokenized_dataset, device, args):
         model_config.intermediate_size = args.intermediate_size
         model_config.max_position_embeddings = args.max_seq_length
 
-        model = DebertaV2ForMaskedLM(model_config)
+        model = BigBirdForMaskedLM(model_config)
 
         if isinstance(args.checkpoint_path, str) & (args.checkpoint_path != ""):
             if args.checkpoint_path.startswith('gs://'):
@@ -382,7 +413,7 @@ def train_fn(tokenized_dataset, device, args):
         else:
             pass
     elif args.checkpoint_handling == 'start_with_basemodel':
-        model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
+        model = BigBirdForMaskedLM.from_pretrained(args.model_name)
     else:
         raise ValueError("Checkpoint handling should be one of ['start_with_init','start_with_base', 'start_with_checkpoint']")
 
@@ -513,7 +544,7 @@ def train_fn(tokenized_dataset, device, args):
                     total_step += args.gradient_accumulation_steps
 
                 if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
-                    xm.rendezvous("logging")
+                    xm.rendezvous("logging, pre")
 
                     local_avg_loss = total_loss / step
                     local_avg_loss_N = sub_total_loss / sub_step
@@ -537,6 +568,7 @@ def train_fn(tokenized_dataset, device, args):
                             "step": step,
                             "total_step": total_step
                         })
+                    xm.rendezvous("logging, post")
 
                 if args.debug:
                     break
@@ -545,26 +577,27 @@ def train_fn(tokenized_dataset, device, args):
                 sub_step +=1
 
 
-                if (global_ordinal() ==0) & ((step+1) % save_steps == 0):
+                if  ((step+1) % save_steps == 0):
                     xm.rendezvous("before_save")
-                    print("Saving model...", flush=True)
-                    if args.output_dir.startswith("gs://"):
-                        with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
-                            local_output_dir = tmpdirname
-                            print(f"Saving model to {local_output_dir}...", flush=True)
-                            model_cpu = copy.deepcopy(model).to("cpu")
-                            model_cpu.save_pretrained(local_output_dir, save_serialization=True)
-                            print(f"Uploading model to {args.output_dir}...", flush=True)
-                            subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
-                            # rename the directory on GCS to the model name, date, and epoch_step
-                            # Generate a new directory name with model name, date, and epoch_step
-                            new_dir_name = f"{args.model_name}_latest"
-                            new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                            subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir, "*"), new_gcs_path], check=True)
+                    if (global_ordinal() ==0):
+                        print("Saving model...", flush=True)
+                        if args.output_dir.startswith("gs://"):
+                            with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
+                                local_output_dir = tmpdirname
+                                print(f"Saving model to {local_output_dir}...", flush=True)
+                                model_cpu = copy.deepcopy(model).to("cpu")
+                                model_cpu.save_pretrained(local_output_dir, save_serialization=True)
+                                print(f"Uploading model to {args.output_dir}...", flush=True)
+                                subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
+                                # rename the directory on GCS to the model name, date, and epoch_step
+                                # Generate a new directory name with model name, date, and epoch_step
+                                new_dir_name = f"{args.model_name}_latest"
+                                new_gcs_path = os.path.join(args.output_dir, new_dir_name)
+                                subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir, "*"), new_gcs_path], check=True)
 
-                    else:
-                        model_cpu = copy.deepcopy(model).to("cpu")
-                        model_cpu.save_pretrained(args.output_dir, save_serialization=True)
+                        else:
+                            model_cpu = copy.deepcopy(model).to("cpu")
+                            model_cpu.save_pretrained(args.output_dir, save_serialization=True)
                     xm.rendezvous("after_save")
                 else:
                     xm.rendezvous("before_save")
@@ -576,9 +609,16 @@ def train_fn(tokenized_dataset, device, args):
                 continue
 
             if (step+1) % steps_per_epoch == 0:
+                # Synchronize all processes at the end of each training epoch
+                xm.rendezvous("end_of_epoch")
+                print(f"Worker {global_ordinal()} completed epoch {epoch}", flush=True)
                 break
 
+        xm.rendezvous("syncing for next epoch, before validation.")
+
         val_ppl = evaluate(model, xla_validation_loader, device)
+
+        xm.rendezvous("syncing for next epoch, after validation.")
 
         if global_ordinal() == 0:
             wandb.log({
@@ -587,11 +627,10 @@ def train_fn(tokenized_dataset, device, args):
                 "miss_steps": miss_steps
             })
 
-        xm.rendezvous("syncing for next epoch.")
 
+        xm.rendezvous("before_epoch_save")
         # Save model checkpoint
         if global_ordinal() == 0:
-            xm.rendezvous("before_epoch_save")
             print("Saving model...", flush=True)
             if args.output_dir.startswith("gs://"):
                 with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
@@ -611,10 +650,7 @@ def train_fn(tokenized_dataset, device, args):
             else:
                 model_cpu = copy.deepcopy(model).to("cpu")
                 model_cpu.save_pretrained(args.output_dir, save_serialization=True)
-            xm.rendezvous("after_epoch_save")
-        else:
-            xm.rendezvous("before_epoch_save")
-            xm.rendezvous("after_epoch_save")
+        xm.rendezvous("after_epoch_save")
 
     # Finish wandb run
     if global_ordinal() == 0:
@@ -622,6 +658,14 @@ def train_fn(tokenized_dataset, device, args):
 
 def prep_and_train_fn(index, args):
     device = xm.xla_device()
+
+    print(f"Process {index} using device: {device}", flush=True)
+    print(f"Global ordinal: {global_ordinal()}, World size: {world_size()}", flush=True)
+
+    # Initialize tokenizer inside spawned process to avoid pickling issues
+    args.tokenizer = BigBirdTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
+    args.tokenizer.model_max_length = args.max_seq_length
+
     tokenized_dataset = prep_fn(args)
     train_fn(tokenized_dataset, device, args)
 
@@ -706,6 +750,12 @@ def main():
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
     args = parser.parse_args()
 
+    # Ensure TPU is available
+    if not xm.xla_device():
+        raise RuntimeError("TPU not available!")
+
+    print(f"TPU devices available: {xm.xrt_world_size()}")
+    print(f"Current device: {xm.xla_device()}")
     #mp.set_start_method('fork', force=True)
 
     # give error if both keep_in_memory and streaming_data are set to True
@@ -793,8 +843,9 @@ def main():
             print(f"Removing shuffled dataset: {shuffle_dir}", flush=True)
             shutil.rmtree(shuffle_dir)
 
-    args.tokenizer = DebertaV2TokenizerFast.from_pretrained(args.tokenizer_name_or_path)
-    args.tokenizer.model_max_length = args.max_seq_length
+    # Remove tokenizer initialization from main process - moved to prep_and_train_fn
+    # args.tokenizer = BigBirdTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
+    # args.tokenizer.model_max_length = args.max_seq_length
 
     if args.shuffle_dataset:
             args.dataset_dir = args.shuffle_dataset_path
@@ -809,9 +860,36 @@ def main():
 
     if args.num_cores == 1:
         print("Running single process...")
+        # Initialize tokenizer for single process mode
+        args.tokenizer = BigBirdTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
+        args.tokenizer.model_max_length = args.max_seq_length
         prep_and_train_fn(0, args)
     else:
-        xmp.spawn(prep_and_train_fn, args=(args,)) #, nprocs=args.num_cores )
+        try:
+            xmp.spawn(prep_and_train_fn, args=(args,), nprocs=args.num_cores)
+        except AttributeError as e:
+            if "_lock" in str(e):
+                print(f"Caught tqdm pickling error: {e}", flush=True)
+                print("Trying to clean up any remaining tqdm instances...", flush=True)
+
+                # Additional cleanup
+                import gc
+                for obj in gc.get_objects():
+                    try:
+                        if hasattr(obj, '__class__') and 'tqdm' in str(obj.__class__):
+                            if hasattr(obj, 'close'):
+                                obj.close()
+                    except:
+                        pass
+
+                # Force garbage collection
+                gc.collect()
+
+                # Retry spawn
+                print("Retrying xmp.spawn...", flush=True)
+                xmp.spawn(prep_and_train_fn, args=(args,), nprocs=args.num_cores)
+            else:
+                raise e
 
 if __name__ == "__main__":
     print("Starting...")

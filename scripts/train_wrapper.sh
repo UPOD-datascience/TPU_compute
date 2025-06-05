@@ -23,7 +23,7 @@ while true; do
     --save_epoch_percentage=${SAVE_PERCENTAGE} \
     --logging_steps=${LOGGING_STEPS} \
     --num_warmup_steps=${NUM_WARMUP} \
-    --num_cores=16 \
+    --num_cores=8 \
     --hidden_size=${HIDDEN_SIZE} \
     --intermediate_size=${INTERMEDIATE_SIZE} \
     --num_hidden_layers=${HIDDEN_LAYERS} \

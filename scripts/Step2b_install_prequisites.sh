@@ -11,7 +11,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --project=${PROJECT_ID} \
   --worker=all --command="
 sudo apt-get update && sudo apt-get install libffi-dev
-pip install torch~=2.5.0 torch_xla[tpu]~=2.5.0 -f https://storage.googleapis.com/libtpu-releases/index.html -f https://storage.googleapis.com/libtpu-wheels/index.html"
+pip install torch~=2.6.0 torch_xla[tpu]~=2.6.0 -f https://storage.googleapis.com/libtpu-releases/index.html -f https://storage.googleapis.com/libtpu-wheels/index.html"
 
 # echo "Installing libraries..."
 gcloud compute tpus tpu-vm ssh ${TPU_NAME}  \
