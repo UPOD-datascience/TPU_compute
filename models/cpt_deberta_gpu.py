@@ -280,17 +280,17 @@ def train_fn(index, args):
             batch = {k: v.to(device) for k, v in batch.items()}
             outputs = model(**batch)
             
-            with torch.cuda.amp.autocast(enabled=args.fp16):
-                outputs = model(**batch)
-                loss = outputs.loss / args.gradient_accumulation_steps
+            #with torch.cuda.amp.autocast(enabled=args.fp16):
+            outputs = model(**batch)
+            loss = outputs.loss / args.gradient_accumulation_steps
             
             if torch.isnan(loss):
                 optimizer.zero_grad(set_to_none=True) 
                 continue
             loss.backward()                
             
-            total_loss += loss.item()
-            sub_total_loss += loss.item()
+            total_loss += loss.item()*args.gradient_accumulation_steps
+            sub_total_loss += loss.item()*args.gradient_accumulation_steps
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
