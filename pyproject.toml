@@ -21,11 +21,12 @@ pysbd = "^0.3.4"
 datasets = "^3.2.0"
 fsspec = "2023.9.2"
 gcsfs = "2023.9.2"
-torch = { version = "2.6.0", source = "torch" }
+torch = "2.6.0"                  #{ version = "2.6.0", source = "torch" }
 wandb = "^0.19.6"
 tiktoken = "^0.9.0"
 numpy = "^2.2.5"
 sentencepiece = "^0.2.0"
+seaborn = "^0.13.2"
 
 [build-system]
 requires = ["poetry-core"]

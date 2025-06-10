@@ -3,7 +3,7 @@ This is the main script to continue pre-training a Roberta model.
 """
 import argparse
 import torch
-from torch_xla.runtime import world_size, global_ordinal
+
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
@@ -173,8 +173,8 @@ def load_from_gcs(bucket_name, blob_name, local_path, device):
     return checkpoint
 
 def load_sharded_dataset(datasets, dformat):
-    num_shards = max(world_size() , 16)
-    shard_idx = global_ordinal()
+    num_shards = max(xm.xrt_world_size() , 16)
+    shard_idx = xm.get_ordinal()
 
     print(f"Sharding for shard index:{shard_idx} / {num_shards}")
 
@@ -281,7 +281,7 @@ def prep_fn(args):
             try:
                 ds_train_info = DatasetInfo.from_directory(args.dataset_dir+f"/{train_loc}/")
                 num_examples = ds_train_info['num_examples']
-                args.max_steps_per_epoch = num_examples // args.per_device_train_batch_size // max(world_size(), 1)
+                args.max_steps_per_epoch = num_examples // args.per_device_train_batch_size // max(xm.xrt_world_size(), 1)
             except Exception as e:
                 print(f"Could not obtain datasetinfo:{e}")
                 pass
@@ -349,7 +349,7 @@ def safe_iter(iterable):
 
 def train_fn(tokenized_dataset, device, args):
     # Initialize wandb for the master process
-    if global_ordinal() == 0: #.is_master_ordinal():
+    if xm.get_ordinal() == 0: #.is_master_ordinal():
         wandb.login(key=args.wandb_key)
         wandb.init(
             project="BigBird TPU pretraining from scratch",
@@ -382,6 +382,17 @@ def train_fn(tokenized_dataset, device, args):
         model_config.cls_token_id = args.tokenizer.cls_token_id
         model_config.sep_token_id = args.tokenizer.sep_token_id
         model_config.vocab_size = args.tokenizer.vocab_size
+
+        max_token_id = max([model_config.bos_token_id,
+                            model_config.eos_token_id,
+                            model_config.pad_token_id,
+                            model_config.cls_token_id,
+                            model_config.sep_token_id])
+
+        if model_config.vocab_size<=max_token_id:
+            print(f"Increasing vocab size in model to {max_token_id + 1}")
+            model_config.vocab_size = max_token_id + 1
+
         model_config.num_hidden_layers = args.num_hidden_layers
         model_config.num_attention_heads = args.num_attention_heads
         model_config.hidden_size = args.hidden_size
@@ -406,14 +417,16 @@ def train_fn(tokenized_dataset, device, args):
                 else:
                     checkpoint = torch.load(args.checkpoint_path, map_location=device)
 
+
             if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
+                model.load_state_dict(checkpoint['model_state_dict'], strict=True)
             else:
-                model.load_state_dict(checkpoint)
+                model.load_state_dict(checkpoint, strict=True)
         else:
             pass
     elif args.checkpoint_handling == 'start_with_basemodel':
         model = BigBirdForMaskedLM.from_pretrained(args.model_name)
+        # model.resize_token_embeddings(args.tokenizer.vocab_size)
     else:
         raise ValueError("Checkpoint handling should be one of ['start_with_init','start_with_base', 'start_with_checkpoint']")
 
@@ -430,15 +443,15 @@ def train_fn(tokenized_dataset, device, args):
         sampler_rank = 0
         sampler_replicas = 1
     else:
-        sampler_rank = global_ordinal()
-        sampler_replicas = world_size()
+        sampler_rank = xm.get_ordinal()
+        sampler_replicas = xm.xrt_world_size()
 
     # Create sampler
     distributed_sampler = False
     if args.streaming_data:
         xm.master_print("Instantiate sharded dataset...")
-        num_shards = world_size()  # Total number of TPU cores (or processes)
-        shard_id = global_ordinal()  # Unique id for the current process
+        num_shards = xm.xrt_world_size()  # Total number of TPU cores (or processes)
+        shard_id = xm.get_ordinal()  # Unique id for the current process
         print(f"Num shards: {num_shards}, shard id: {shard_id}")
         #num_shards = xm.xrt_world_size()
         #shard_id = xm.get_ordinal()
@@ -503,7 +516,7 @@ def train_fn(tokenized_dataset, device, args):
     #scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=total_steps)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
 
-    if global_ordinal() == 0: # xm.is_master_ordinal():
+    if xm.get_ordinal() == 0: # xm.is_master_ordinal():
         print("Starting training...", flush=True)
         print(f"Total steps: {total_steps}", flush=True)
         print(f"Total epochs: {args.num_train_epochs}", flush=True)
@@ -524,28 +537,44 @@ def train_fn(tokenized_dataset, device, args):
             train_sampler.set_epoch(epoch)
             print("done with setting epoch..", flush=True)
 
+        RENDEZVOUS_FLAGS = {
+            "optimizer_step": 1,
+            "logging_pre": 2,
+            "logging_post": 4,
+            "before_save": 8,
+            "after_save": 16
+        }
+
         print(f"Entering data loader iterator for epoch {epoch}...", flush=True)
         step = -1
         for step, batch in enumerate(safe_iter(xla_train_loader)):
+            completed_rendezvous = 0
+            exception_occurred = False
             try:
                 batch = {k: v.to(device=device, dtype=torch.bfloat16) if v.dtype==torch.float32 else v.to(device) for k, v in batch.items()}
                 outputs = model(**batch)
-                loss = outputs.loss
+                loss = outputs.loss/args.gradient_accumulation_steps
+
+                if torch.isnan(loss):
+                    optimizer.zero_grad(set_to_none=True)
+                    raise ValueError("NaN loss detected")
                 loss.backward()
 
-                total_loss += loss.item()
-                sub_total_loss += loss.item()
+                total_loss += loss.item()*args.gradient_accumulation_steps
+                sub_total_loss += loss.item()*args.gradient_accumulation_steps
 
                 if  (step+1) % args.gradient_accumulation_steps == 0:
                     xm.optimizer_step(optimizer)
                     scheduler.step()
                     optimizer.zero_grad()
+                    xm.rendezvous("optimizer_step")
+                    completed_rendezvous |= RENDEZVOUS_FLAGS["optimizer_step"]
 
                     total_step += args.gradient_accumulation_steps
 
                 if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
                     xm.rendezvous("logging, pre")
-
+                    completed_rendezvous |= RENDEZVOUS_FLAGS["logging_pre"]
                     local_avg_loss = total_loss / step
                     local_avg_loss_N = sub_total_loss / sub_step
                     global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
@@ -557,7 +586,7 @@ def train_fn(tokenized_dataset, device, args):
                     sub_step = 0
                     sub_total_loss = 0.
 
-                    if global_ordinal() ==0:
+                    if xm.get_ordinal() ==0:
                         print(f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}", flush=True)
                         wandb.log({
                             "train_global_average_loss": global_avg_loss,
@@ -569,6 +598,7 @@ def train_fn(tokenized_dataset, device, args):
                             "total_step": total_step
                         })
                     xm.rendezvous("logging, post")
+                    completed_rendezvous |= RENDEZVOUS_FLAGS["logging_post"]
 
                 if args.debug:
                     break
@@ -579,7 +609,8 @@ def train_fn(tokenized_dataset, device, args):
 
                 if  ((step+1) % save_steps == 0):
                     xm.rendezvous("before_save")
-                    if (global_ordinal() ==0):
+                    completed_rendezvous |= RENDEZVOUS_FLAGS["before_save"]
+                    if (xm.get_ordinal() ==0):
                         print("Saving model...", flush=True)
                         if args.output_dir.startswith("gs://"):
                             with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
@@ -599,19 +630,64 @@ def train_fn(tokenized_dataset, device, args):
                             model_cpu = copy.deepcopy(model).to("cpu")
                             model_cpu.save_pretrained(args.output_dir, save_serialization=True)
                     xm.rendezvous("after_save")
+                    completed_rendezvous |= RENDEZVOUS_FLAGS["after_save"]
                 else:
                     xm.rendezvous("before_save")
+                    completed_rendezvous |= RENDEZVOUS_FLAGS["before_save"]
                     xm.rendezvous("after_save")
+                    completed_rendezvous |= RENDEZVOUS_FLAGS["after_save"]
 
             except Exception as e:
+                exception_occurred = True
                 print(f"Error occurred during processing batch {step}: {e}", flush=True)
                 miss_steps += 1
-                continue
+
+            # Synchronize states using separate reductions
+            error_flag = torch.tensor(1.0 if exception_occurred else 0.0, device=device)
+            completed_flag = torch.tensor(float(completed_rendezvous), device=device)
+
+            total_errors = xm.all_reduce(xm.REDUCE_SUM, error_flag)
+            min_completed = xm.all_reduce(xm.REDUCE_MIN, completed_flag)
+
+            error_count = total_errors.item()
+            min_completed_flags = int(min_completed.item())
+            if error_count > 0:
+                print(f"Core {xm.get_ordinal()}: {int(error_count)} cores had errors", flush=True)
+                # Find the minimum set of rendezvous that ALL cores completed
+                my_completed = completed_rendezvous
+                # Determine which rendezvous calls this core still needs to participate in
+                missing_flags = min_completed_flags & (~my_completed)
+                if (missing_flags & RENDEZVOUS_FLAGS["optimizer_step"]) and (step+1) % args.gradient_accumulation_steps == 0:
+                    print(f"Core {xm.get_ordinal()}: Catching up on optimizer_step rendezvous")
+                    xm.rendezvous("optimizer_step")
+
+                if (missing_flags & RENDEZVOUS_FLAGS["logging_pre"]) and (step+1) % args.logging_steps == 0:
+                    print(f"Core {xm.get_ordinal()}: Catching up on logging_pre rendezvous")
+                    xm.rendezvous("logging, pre")
+
+                if (missing_flags & RENDEZVOUS_FLAGS["logging_post"]) and (step+1) % args.logging_steps == 0:
+                    print(f"Core {xm.get_ordinal()}: Catching up on logging_post rendezvous")
+                    xm.rendezvous("logging, post")
+
+                if (missing_flags & RENDEZVOUS_FLAGS["before_save"]):
+                    print(f"Core {xm.get_ordinal()}: Catching up on before_save rendezvous")
+                    xm.rendezvous("before_save")
+
+                if (missing_flags & RENDEZVOUS_FLAGS["after_save"]):
+                    print(f"Core {xm.get_ordinal()}: Catching up on after_save rendezvous")
+                    xm.rendezvous("after_save")
+
+                continue  # All cores skip this step after synchronizing
+
+
+            if step % args.synchronization_steps == 0:  # synchronize very synch steps
+                xm.rendezvous(f"periodic_sync_step_{step}")
+
 
             if (step+1) % steps_per_epoch == 0:
                 # Synchronize all processes at the end of each training epoch
                 xm.rendezvous("end_of_epoch")
-                print(f"Worker {global_ordinal()} completed epoch {epoch}", flush=True)
+                print(f"Worker {xm.get_ordinal()} completed epoch {epoch}", flush=True)
                 break
 
         xm.rendezvous("syncing for next epoch, before validation.")
@@ -620,7 +696,7 @@ def train_fn(tokenized_dataset, device, args):
 
         xm.rendezvous("syncing for next epoch, after validation.")
 
-        if global_ordinal() == 0:
+        if xm.get_ordinal() == 0:
             wandb.log({
                 "val_perplexity": val_ppl,
                 "epoch": epoch,
@@ -630,7 +706,7 @@ def train_fn(tokenized_dataset, device, args):
 
         xm.rendezvous("before_epoch_save")
         # Save model checkpoint
-        if global_ordinal() == 0:
+        if xm.get_ordinal() == 0:
             print("Saving model...", flush=True)
             if args.output_dir.startswith("gs://"):
                 with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
@@ -653,14 +729,21 @@ def train_fn(tokenized_dataset, device, args):
         xm.rendezvous("after_epoch_save")
 
     # Finish wandb run
-    if global_ordinal() == 0:
+    if xm.get_ordinal() == 0:
         wandb.finish()
 
 def prep_and_train_fn(index, args):
-    device = xm.xla_device()
+    if not xm.xla_device():
+        raise RuntimeError("TPU not available!")
 
+
+    print(f"Process rank: {index}")
+
+    device = xm.xla_device()
+    # Ensure TPU is available
+    #
     print(f"Process {index} using device: {device}", flush=True)
-    print(f"Global ordinal: {global_ordinal()}, World size: {world_size()}", flush=True)
+    print(f"Global ordinal: {xm.get_ordinal()}, World size: {xm.xrt_world_size()}", flush=True)
 
     # Initialize tokenizer inside spawned process to avoid pickling issues
     args.tokenizer = BigBirdTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
@@ -732,7 +815,7 @@ def main():
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--save_epoch_percentage", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_cores", type=int, default=8)
+    parser.add_argument("--num_cores", type=int)
     parser.add_argument("--keep_in_memory", action='store_true')
     parser.add_argument("--streaming_data", action='store_true')
     parser.add_argument("--sharded_data", action='store_true')
@@ -748,14 +831,9 @@ def main():
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
     parser.add_argument("--lazy_grouping", action='store_true', help="Use lazy grouping to process data on-the-fly during training (incompatible with --pre_tokenized)")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
+    parser.add_argument("--synchronization_steps", type=int, default=256)
     args = parser.parse_args()
 
-    # Ensure TPU is available
-    if not xm.xla_device():
-        raise RuntimeError("TPU not available!")
-
-    print(f"TPU devices available: {xm.xrt_world_size()}")
-    print(f"Current device: {xm.xla_device()}")
     #mp.set_start_method('fork', force=True)
 
     # give error if both keep_in_memory and streaming_data are set to True
@@ -866,7 +944,7 @@ def main():
         prep_and_train_fn(0, args)
     else:
         try:
-            xmp.spawn(prep_and_train_fn, args=(args,), nprocs=args.num_cores)
+            xmp.spawn(prep_and_train_fn, args=(args,), nprocs=None)
         except AttributeError as e:
             if "_lock" in str(e):
                 print(f"Caught tqdm pickling error: {e}", flush=True)
@@ -887,7 +965,7 @@ def main():
 
                 # Retry spawn
                 print("Retrying xmp.spawn...", flush=True)
-                xmp.spawn(prep_and_train_fn, args=(args,), nprocs=args.num_cores)
+                xmp.spawn(prep_and_train_fn, args=(args,), nprocs=None)
             else:
                 raise e
 

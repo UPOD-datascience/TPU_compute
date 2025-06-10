@@ -4,7 +4,7 @@ This is the main script to continue pre-training a Roberta model.
 import argparse
 import torch
 #from transformers.models.deberta_v2.tokenization_deberta_v2_fast import DebertaV2Tokenizer
-from torch_xla.runtime import world_size, global_ordinal
+
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
@@ -16,7 +16,8 @@ from transformers import (
 DebertaV2TokenizerFast,
 DebertaV2Config,
 DebertaV2ForMaskedLM,
-DataCollatorForLanguageModeling
+DataCollatorForLanguageModeling,
+DataCollatorForWholeWordMask
 )
 from transformers import Trainer, TrainingArguments
 from transformers import get_linear_schedule_with_warmup
@@ -142,8 +143,8 @@ def load_from_gcs(bucket_name, blob_name, local_path, device):
     return checkpoint
 
 def load_sharded_dataset(datasets, dformat):
-    num_shards = max(world_size() , 16)
-    shard_idx = global_ordinal()
+    num_shards = max(xm.xrt_world_size() , 16)
+    shard_idx = xm.get_ordinal()
 
     print(f"Sharding for shard index:{shard_idx} / {num_shards}")
 
@@ -250,7 +251,7 @@ def prep_fn(args):
             try:
                 ds_train_info = DatasetInfo.from_directory(args.dataset_dir+f"/{train_loc}/")
                 num_examples = ds_train_info['num_examples']
-                args.max_steps_per_epoch = num_examples // args.per_device_train_batch_size // max(world_size(), 1)
+                args.max_steps_per_epoch = num_examples // args.per_device_train_batch_size // max(xm.xrt_world_size(), 1)
             except Exception as e:
                 print(f"Could not obtain datasetinfo:{e}")
                 pass
@@ -318,7 +319,7 @@ def safe_iter(iterable):
 
 def train_fn(tokenized_dataset, device, args):
     # Initialize wandb for the master process
-    if global_ordinal() == 0: #.is_master_ordinal():
+    if xm.get_ordinal() == 0: #.is_master_ordinal():
         wandb.login(key=args.wandb_key)
         wandb.init(
             project="DeBERTaV2 TPU pretraining from scratch",
@@ -390,6 +391,7 @@ def train_fn(tokenized_dataset, device, args):
 
     # Set up data collator
     xm.master_print("Setting up data collator...")
+    # DataCollatorForWholeWordMask
     data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
                                                     mlm=True,
                                                     mlm_probability=args.mlm_probability)
@@ -399,15 +401,15 @@ def train_fn(tokenized_dataset, device, args):
         sampler_rank = 0
         sampler_replicas = 1
     else:
-        sampler_rank = global_ordinal()
-        sampler_replicas = world_size()
+        sampler_rank = xm.get_ordinal()
+        sampler_replicas = xm.xrt_world_size()
 
     # Create sampler
     distributed_sampler = False
     if args.streaming_data:
         xm.master_print("Instantiate sharded dataset...")
-        num_shards = world_size()  # Total number of TPU cores (or processes)
-        shard_id = global_ordinal()  # Unique id for the current process
+        num_shards = xm.xrt_world_size() # Total number of TPU cores (or processes)
+        shard_id = min(xm.xrt_world_size()-1, xm.get_ordinal())  # Unique id for the current process
         print(f"Num shards: {num_shards}, shard id: {shard_id}")
         #num_shards = xm.xrt_world_size()
         #shard_id = xm.get_ordinal()
@@ -472,7 +474,7 @@ def train_fn(tokenized_dataset, device, args):
     #scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=total_steps)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
 
-    if global_ordinal() == 0: # xm.is_master_ordinal():
+    if xm.get_ordinal() == 0: # xm.is_master_ordinal():
         print("Starting training...", flush=True)
         print(f"Total steps: {total_steps}", flush=True)
         print(f"Total epochs: {args.num_train_epochs}", flush=True)
@@ -499,13 +501,20 @@ def train_fn(tokenized_dataset, device, args):
             try:
                 batch = {k: v.to(device=device, dtype=torch.bfloat16) if v.dtype==torch.float32 else v.to(device) for k, v in batch.items()}
                 outputs = model(**batch)
-                loss = outputs.loss
+                loss = outputs.loss / args.gradient_accumulation_steps
+
+                if torch.isnan(loss):
+                    optimizer.zero_grad(set_to_none=True)
+                    xm.rendezvous("NaN skipping")
+                    continue
+
                 loss.backward()
 
-                total_loss += loss.item()
-                sub_total_loss += loss.item()
+                total_loss += loss.item()*args.gradient_accumulation_steps
+                sub_total_loss += loss.item()*args.gradient_accumulation_steps
 
                 if  (step+1) % args.gradient_accumulation_steps == 0:
+                    # torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     xm.optimizer_step(optimizer)
                     scheduler.step()
                     optimizer.zero_grad()
@@ -513,7 +522,7 @@ def train_fn(tokenized_dataset, device, args):
                     total_step += args.gradient_accumulation_steps
 
                 if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
-                    xm.rendezvous("logging")
+                    xm.rendezvous("logging, pre")
 
                     local_avg_loss = total_loss / step
                     local_avg_loss_N = sub_total_loss / sub_step
@@ -526,7 +535,7 @@ def train_fn(tokenized_dataset, device, args):
                     sub_step = 0
                     sub_total_loss = 0.
 
-                    if global_ordinal() ==0:
+                    if xm.get_ordinal() ==0:
                         print(f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}", flush=True)
                         wandb.log({
                             "train_global_average_loss": global_avg_loss,
@@ -537,7 +546,7 @@ def train_fn(tokenized_dataset, device, args):
                             "step": step,
                             "total_step": total_step
                         })
-
+                    xm.rendezvous("logging, post")
                 if args.debug:
                     break
 
@@ -545,42 +554,44 @@ def train_fn(tokenized_dataset, device, args):
                 sub_step +=1
 
 
-                if (global_ordinal() ==0) & ((step+1) % save_steps == 0):
+                if  ((step+1) % save_steps == 0):
+                    # All processes must participate in rendezvous simultaneously
                     xm.rendezvous("before_save")
-                    print("Saving model...", flush=True)
-                    if args.output_dir.startswith("gs://"):
-                        with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
-                            local_output_dir = tmpdirname
-                            print(f"Saving model to {local_output_dir}...", flush=True)
-                            model_cpu = copy.deepcopy(model).to("cpu")
-                            model_cpu.save_pretrained(local_output_dir, save_serialization=True)
-                            print(f"Uploading model to {args.output_dir}...", flush=True)
-                            subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
-                            # rename the directory on GCS to the model name, date, and epoch_step
-                            # Generate a new directory name with model name, date, and epoch_step
-                            new_dir_name = f"{args.model_name}_latest"
-                            new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                            subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir, "*"), new_gcs_path], check=True)
+                    
+                    if (xm.get_ordinal() ==0):
+                        print("Saving model...", flush=True)
+                        if args.output_dir.startswith("gs://"):
+                            with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
+                                local_output_dir = tmpdirname
+                                print(f"Saving model to {local_output_dir}...", flush=True)
+                                model_cpu = copy.deepcopy(model).to("cpu")
+                                model_cpu.save_pretrained(local_output_dir, save_serialization=True)
+                                print(f"Uploading model to {args.output_dir}...", flush=True)
+                                subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
+                                # rename the directory on GCS to the model name, date, and epoch_step
+                                # Generate a new directory name with model name, date, and epoch_step
+                                new_dir_name = f"{args.model_name}_latest"
+                                new_gcs_path = os.path.join(args.output_dir, new_dir_name)
+                                subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir, "*"), new_gcs_path], check=True)
 
-                    else:
-                        model_cpu = copy.deepcopy(model).to("cpu")
-                        model_cpu.save_pretrained(args.output_dir, save_serialization=True)
-                    xm.rendezvous("after_save")
-                else:
-                    xm.rendezvous("before_save")
+                        else:
+                            model_cpu = copy.deepcopy(model).to("cpu")
+                            model_cpu.save_pretrained(args.output_dir, save_serialization=True)
+                    
                     xm.rendezvous("after_save")
 
             except Exception as e:
-                print(f"Error occurred during processing batch {step}: {e}", flush=True)
-                miss_steps += 1
-                continue
+                raise Exception(f"Error occurred during processing batch {step}: {e}")
+
+            if step % args.synchronization_steps == 0:  # synchronize very synch steps
+                xm.rendezvous(f"periodic_sync_step_{step}")
 
             if (step+1) % steps_per_epoch == 0:
                 break
 
         val_ppl = evaluate(model, xla_validation_loader, device)
 
-        if global_ordinal() == 0:
+        if xm.get_ordinal() == 0:
             wandb.log({
                 "val_perplexity": val_ppl,
                 "epoch": epoch,
@@ -589,9 +600,10 @@ def train_fn(tokenized_dataset, device, args):
 
         xm.rendezvous("syncing for next epoch.")
 
-        # Save model checkpoint
-        if global_ordinal() == 0:
-            xm.rendezvous("before_epoch_save")
+        # Save model checkpoint - all processes must participate in rendezvous
+        xm.rendezvous("before_epoch_save")
+        
+        if xm.get_ordinal() == 0:
             print("Saving model...", flush=True)
             if args.output_dir.startswith("gs://"):
                 with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
@@ -611,13 +623,11 @@ def train_fn(tokenized_dataset, device, args):
             else:
                 model_cpu = copy.deepcopy(model).to("cpu")
                 model_cpu.save_pretrained(args.output_dir, save_serialization=True)
-            xm.rendezvous("after_epoch_save")
-        else:
-            xm.rendezvous("before_epoch_save")
-            xm.rendezvous("after_epoch_save")
+        
+        xm.rendezvous("after_epoch_save")
 
     # Finish wandb run
-    if global_ordinal() == 0:
+    if xm.get_ordinal() == 0:
         wandb.finish()
 
 def prep_and_train_fn(index, args):
@@ -698,6 +708,7 @@ def main():
     parser.add_argument("--shuffle_dataset_ext", type=str, default=None)
     parser.add_argument("--shuffle_dataset", action='store_true')
     parser.add_argument("--shuffle_force_update", action='store_true')
+    parser.add_argument("--synchronization_steps", type=int, default=64)
     parser.add_argument("--debug", action='store_true')
     parser.add_argument("--checkpoint_path", type=str)
     parser.add_argument("--checkpoint_handling", type=str, choices=['start_with_checkpoint', 'start_with_basemodel', 'start_with_init'])
