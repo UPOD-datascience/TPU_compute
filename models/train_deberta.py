@@ -20,7 +20,7 @@ DataCollatorForLanguageModeling,
 DataCollatorForWholeWordMask
 )
 from transformers import Trainer, TrainingArguments
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup, get_cosine_with_hard_restarts_schedule_with_warmup
 
 from datasets import load_dataset, DatasetDict, DatasetInfo
 from safetensors.torch import load_file as load_safetensors
@@ -471,14 +471,24 @@ def train_fn(tokenized_dataset, device, args):
     steps_per_epoch = args.max_steps_per_epoch if args.streaming_data else len(train_dataloader)
     save_steps = args.save_epoch_percentage if args.save_epoch_percentage>1. else int(steps_per_epoch * args.save_epoch_percentage)
     total_steps = steps_per_epoch * args.num_train_epochs
-    #scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=total_steps)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
+
+    #scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
+    # Use cyclic scheduler with hard restarts (cosine with restarts)
+    # Calculate number of cycles - using 1 cycle per epoch as default, or user-specified value
+    num_cycles = args.num_cycles if args.num_cycles is not None else args.num_train_epochs
+    scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.num_warmup_steps,
+        num_training_steps=total_steps,
+        num_cycles=num_cycles
+    )
 
     if xm.get_ordinal() == 0: # xm.is_master_ordinal():
         print("Starting training...", flush=True)
         print(f"Total steps: {total_steps}", flush=True)
         print(f"Total epochs: {args.num_train_epochs}", flush=True)
         print(f"Total warmup steps: {args.num_warmup_steps}", flush=True)
+        print(f"Number of cycles: {num_cycles}", flush=True)
 
     # Training loop
     total_step = 0
@@ -536,12 +546,14 @@ def train_fn(tokenized_dataset, device, args):
                     sub_total_loss = 0.
 
                     if xm.get_ordinal() ==0:
-                        print(f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}", flush=True)
+                        current_lr = scheduler.get_last_lr()[0]
+                        print(f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}, lr: {current_lr:.2e}", flush=True)
                         wandb.log({
                             "train_global_average_loss": global_avg_loss,
                             "train_global_average_loss_N": global_avg_loss_N,
                             "train_perplexity": perplexity,
                             "train_perplexity_N": perplexity_N,
+                            "learning_rate": current_lr,
                             "epoch": epoch,
                             "step": step,
                             "total_step": total_step
@@ -557,7 +569,7 @@ def train_fn(tokenized_dataset, device, args):
                 if  ((step+1) % save_steps == 0):
                     # All processes must participate in rendezvous simultaneously
                     xm.rendezvous("before_save")
-                    
+
                     if (xm.get_ordinal() ==0):
                         print("Saving model...", flush=True)
                         if args.output_dir.startswith("gs://"):
@@ -577,7 +589,7 @@ def train_fn(tokenized_dataset, device, args):
                         else:
                             model_cpu = copy.deepcopy(model).to("cpu")
                             model_cpu.save_pretrained(args.output_dir, save_serialization=True)
-                    
+
                     xm.rendezvous("after_save")
 
             except Exception as e:
@@ -602,7 +614,7 @@ def train_fn(tokenized_dataset, device, args):
 
         # Save model checkpoint - all processes must participate in rendezvous
         xm.rendezvous("before_epoch_save")
-        
+
         if xm.get_ordinal() == 0:
             print("Saving model...", flush=True)
             if args.output_dir.startswith("gs://"):
@@ -623,7 +635,7 @@ def train_fn(tokenized_dataset, device, args):
             else:
                 model_cpu = copy.deepcopy(model).to("cpu")
                 model_cpu.save_pretrained(args.output_dir, save_serialization=True)
-        
+
         xm.rendezvous("after_epoch_save")
 
     # Finish wandb run
@@ -714,6 +726,7 @@ def main():
     parser.add_argument("--checkpoint_handling", type=str, choices=['start_with_checkpoint', 'start_with_basemodel', 'start_with_init'])
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
     parser.add_argument("--lazy_grouping", action='store_true', help="Use lazy grouping to process data on-the-fly during training (incompatible with --pre_tokenized)")
+    parser.add_argument("--num_cycles", type=int, default=4, help="Number of cycles for cyclic learning rate scheduler. If None, defaults to num_train_epochs")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
     args = parser.parse_args()
 

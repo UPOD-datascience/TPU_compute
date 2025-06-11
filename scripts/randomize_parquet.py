@@ -8,7 +8,7 @@ import shutil
 from tqdm import tqdm
 import random
 
-def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_dir=None, seed=None, iterations=1):
+def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_dir=None, seed=None, iterations=1, write_every_iteration=False):
     """
     Shuffles a Parquet file using a batch-based approach with minimal disk usage.
 
@@ -128,16 +128,18 @@ def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_d
             # Update for next iteration
             if iteration < iterations - 1:
                 current_input = iter_output
+                _output_path = f"{output_path.rstrip('.parquet')}_{iteration}.parquet"
+                if write_every_iteration:
+                    shutil.copy2(iter_output, _output_path)
+                print(f"Shuffled parquet file saved to: {_output_path}")
             else:
                 # Final iteration - copy to output_path
                 shutil.copy2(iter_output, output_path)
-
                 # Clean up the final iteration file
                 try:
                     os.remove(iter_output)
                 except Exception as e:
                     print(f"Warning: Could not remove final iteration file: {e}")
-
         print(f"Shuffled parquet file saved to: {output_path}")
 
     finally:
@@ -163,6 +165,7 @@ if __name__ == "__main__":
                         help="Random seed for reproducibility")
     parser.add_argument("--iterations", type=int, default=1,
                         help="Number of times to repeat the shuffling process (default: 1)")
+    parser.add_argument("--write_every_iteration", action="store_true", default=False)
 
     args = parser.parse_args()
 
@@ -172,5 +175,6 @@ if __name__ == "__main__":
         window_size=args.window_size,
         temp_dir=args.temp_dir,
         seed=args.seed,
-        iterations=args.iterations
+        iterations=args.iterations,
+        write_every_iteration=args.write_every_iteration
     )

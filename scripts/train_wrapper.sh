@@ -39,7 +39,7 @@ while true; do
     --max_steps_per_epoch=${MAX_STEPS_PER_EPOCH} \
     --weight_decay=${WEIGHT_DECAY} \
     --wandb_key=${WANDB_KEY} \
-    --num_train_epochs=5 2>&1 | tee -a ~/logs.txt
+    --num_train_epochs=1 2>&1 | tee -a ~/logs.txt
 
   EXIT_CODE=$?
   echo "Training exited with code ${EXIT_CODE} at $(date). Restarting in 60 seconds..." | tee -a ~/logs.txt
