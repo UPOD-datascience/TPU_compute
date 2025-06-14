@@ -8,12 +8,62 @@ import os
 import sys
 from pathlib import Path
 from typing import List
+import io
 
 try:
     from google.cloud import storage
 except ImportError:
     print("Error: google-cloud-storage is required. Install with: pip install google-cloud-storage")
     sys.exit(1)
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    print("Error: tqdm is required for progress bars. Install with: pip install tqdm")
+    sys.exit(1)
+
+
+class ProgressFileReader:
+    """File-like object that tracks read progress for uploads."""
+    
+    def __init__(self, file_path: Path, progress_bar: tqdm):
+        self.file_path = file_path
+        self.progress_bar = progress_bar
+        self._file = open(file_path, 'rb')
+        self._size = file_path.stat().st_size
+        
+    def read(self, size=-1):
+        data = self._file.read(size)
+        if data:
+            self.progress_bar.update(len(data))
+        return data
+    
+    def readline(self, size=-1):
+        data = self._file.readline(size)
+        if data:
+            self.progress_bar.update(len(data))
+        return data
+    
+    def readlines(self, hint=-1):
+        lines = self._file.readlines(hint)
+        if lines:
+            self.progress_bar.update(sum(len(line) for line in lines))
+        return lines
+    
+    def seek(self, offset, whence=0):
+        return self._file.seek(offset, whence)
+    
+    def tell(self):
+        return self._file.tell()
+    
+    def close(self):
+        self._file.close()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
 
 def find_parquet_files(directory: str) -> List[Path]:
@@ -40,31 +90,53 @@ def find_parquet_files(directory: str) -> List[Path]:
     return parquet_files
 
 
-def upload_file_to_gcs(client: storage.Client, bucket_name: str, local_file_path: Path,
-                      gcs_destination_path: str) -> bool:
+def upload_file_to_gcs(client: storage.Client, bucket_name: str, local_file_path: Path, 
+                      gcs_destination_path: str, overall_progress_bar=None) -> bool:
     """
-    Upload a single file to GCS.
-
+    Upload a single file to GCS with per-file progress tracking.
+    
     Args:
         client: GCS client instance
         bucket_name: Name of the GCS bucket
         local_file_path: Path to the local file
         gcs_destination_path: Destination path in GCS
-
+        overall_progress_bar: Overall progress bar for all files
+        
     Returns:
         True if upload successful, False otherwise
     """
     try:
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(gcs_destination_path)
-
-        print(f"Uploading {local_file_path.name} to gs://{bucket_name}/{gcs_destination_path}")
-        blob.upload_from_filename(str(local_file_path))
-        print(f"✓ Successfully uploaded {local_file_path.name}")
+        
+        # Get file size for progress tracking
+        file_size = local_file_path.stat().st_size
+        
+        # Create per-file progress bar
+        file_progress_desc = f"📁 {local_file_path.name} ({file_size / (1024*1024):.1f} MB)"
+        
+        with tqdm(total=file_size, unit='B', unit_scale=True, unit_divisor=1024,
+                 desc=file_progress_desc, leave=False, position=1) as file_pbar:
+            
+            # Upload with progress tracking
+            with ProgressFileReader(local_file_path, file_pbar) as progress_file:
+                blob.upload_from_file(progress_file, rewind=True)
+        
+        # Update overall progress
+        if overall_progress_bar:
+            overall_progress_bar.update(1)
+            overall_progress_bar.set_postfix_str(f"✓ {local_file_path.name}")
+        else:
+            print(f"✓ Successfully uploaded {local_file_path.name}")
         return True
-
+        
     except Exception as e:
-        print(f"✗ Failed to upload {local_file_path.name}: {str(e)}")
+        error_msg = f"✗ Failed to upload {local_file_path.name}: {str(e)}"
+        if overall_progress_bar:
+            overall_progress_bar.write(error_msg)
+            overall_progress_bar.update(1)
+        else:
+            print(error_msg)
         return False
 
 
@@ -162,23 +234,31 @@ Examples:
                 print(f"  {file_path} -> gs://{args.gcs_bucket_name}/{gcs_path}")
             return
 
-        # Upload files
+        # Upload files with progress bar
         successful_uploads = 0
         failed_uploads = 0
-
-        for file_path in parquet_files:
-            if args.preserve_structure:
-                # Preserve directory structure
-                relative_path = file_path.relative_to(directory_path)
-                gcs_destination = gcs_location + str(relative_path)
-            else:
-                # Just use filename
-                gcs_destination = gcs_location + file_path.name
-
-            if upload_file_to_gcs(client, args.gcs_bucket_name, file_path, gcs_destination):
-                successful_uploads += 1
-            else:
-                failed_uploads += 1
+        
+        # Calculate total size for additional info
+        total_size = sum(f.stat().st_size for f in parquet_files)
+        total_size_mb = total_size / (1024 * 1024)
+        
+        print(f"Total size to upload: {total_size_mb:.1f} MB")
+        
+        with tqdm(total=len(parquet_files), desc="📤 Overall Progress", 
+                 unit="file", position=0) as overall_pbar:
+            for file_path in parquet_files:
+                if args.preserve_structure:
+                    # Preserve directory structure
+                    relative_path = file_path.relative_to(directory_path)
+                    gcs_destination = gcs_location + str(relative_path)
+                else:
+                    # Just use filename
+                    gcs_destination = gcs_location + file_path.name
+                
+                if upload_file_to_gcs(client, args.gcs_bucket_name, file_path, gcs_destination, overall_pbar):
+                    successful_uploads += 1
+                else:
+                    failed_uploads += 1
 
         # Summary
         print(f"\nUpload complete:")
