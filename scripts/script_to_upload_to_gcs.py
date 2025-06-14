@@ -126,7 +126,7 @@ Examples:
 
     try:
         # Initialize GCS client
-        client = storage.Client()
+        client = storage.Client.from_service_account_json('../gsa.json')
 
         # Test bucket access
         try:
