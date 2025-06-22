@@ -64,6 +64,39 @@ shards = os.environ.get('TPU_WORKER_HOSTNAMES', '0').split(',')
 print(f"TPU_WORKER_ID: {worker_id}")
 print(f"TPU_WORKER_HOSTNAMES for {worker_id}: {shards}")
 
+def safe_rendezvous(tag, timeout=600):
+    """Rendezvous with timeout using threading approach (TPU-compatible)"""
+    import threading
+    import time
+
+    result_container = [None]
+    exception_container = [None]
+    finished = threading.Event()
+
+    def rendezvous_worker():
+        try:
+            result_container[0] = xm.rendezvous(tag)
+        except Exception as e:
+            exception_container[0] = e
+        finally:
+            finished.set()
+
+    # Start rendezvous in separate thread
+    worker_thread = threading.Thread(target=rendezvous_worker)
+    worker_thread.daemon = True
+    worker_thread.start()
+
+    # Wait for completion or timeout
+    if finished.wait(timeout=timeout):
+        if exception_container[0]:
+            print(f"Rendezvous '{tag}' failed with error: {exception_container[0]}, continuing...", flush=True)
+            return None
+        return result_container[0]
+    else:
+        print(f"Rendezvous '{tag}' timed out after {timeout} seconds, continuing...", flush=True)
+        return None
+
+
 
 def shuffle_and_save_dataset(dataset, output_path, seed=None, shuffle=True):
     # Shuffle only the training dataset
@@ -506,6 +539,12 @@ def train_fn(tokenized_dataset, device, args):
             print("done with setting epoch..", flush=True)
 
         print(f"Entering data loader iterator for epoch {epoch}...", flush=True)
+
+        # Synchronize all cores before starting data iteration
+        print(f"Synchronizing cores before data iteration for epoch {epoch}...", flush=True)
+        safe_rendezvous(f"epoch_{epoch}_data_start")
+        print(f"Cores synchronized, starting data iteration for epoch {epoch}...", flush=True)
+
         step = -1
         for step, batch in enumerate(safe_iter(xla_train_loader)):
             try:
@@ -515,7 +554,7 @@ def train_fn(tokenized_dataset, device, args):
 
                 if torch.isnan(loss):
                     optimizer.zero_grad(set_to_none=True)
-                    xm.rendezvous("NaN skipping")
+                    safe_rendezvous("NaN skipping")
                     continue
 
                 loss.backward()
@@ -532,7 +571,7 @@ def train_fn(tokenized_dataset, device, args):
                     total_step += args.gradient_accumulation_steps
 
                 if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
-                    xm.rendezvous("logging, pre")
+                    safe_rendezvous("logging, pre")
 
                     local_avg_loss = total_loss / step
                     local_avg_loss_N = sub_total_loss / sub_step
@@ -558,7 +597,7 @@ def train_fn(tokenized_dataset, device, args):
                             "step": step,
                             "total_step": total_step
                         })
-                    xm.rendezvous("logging, post")
+                    safe_rendezvous("logging, post")
                 if args.debug:
                     break
 
@@ -568,7 +607,7 @@ def train_fn(tokenized_dataset, device, args):
 
                 if  ((step+1) % save_steps == 0):
                     # All processes must participate in rendezvous simultaneously
-                    xm.rendezvous("before_save")
+                    safe_rendezvous("before_save")
 
                     if (xm.get_ordinal() ==0):
                         print("Saving model...", flush=True)
@@ -590,13 +629,13 @@ def train_fn(tokenized_dataset, device, args):
                             model_cpu = copy.deepcopy(model).to("cpu")
                             model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
-                    xm.rendezvous("after_save")
+                    safe_rendezvous("after_save")
 
             except Exception as e:
                 raise Exception(f"Error occurred during processing batch {step}: {e}")
 
-            if step % args.synchronization_steps == 0:  # synchronize very synch steps
-                xm.rendezvous(f"periodic_sync_step_{step}")
+            if step > 0 and step % args.synchronization_steps == 0:  # synchronize every synch steps (skip step 0)
+                safe_rendezvous(f"periodic_sync_step_{step}")
 
             if (step+1) % steps_per_epoch == 0:
                 break
@@ -610,10 +649,10 @@ def train_fn(tokenized_dataset, device, args):
                 "miss_steps": miss_steps
             })
 
-        xm.rendezvous("syncing for next epoch.")
+        safe_rendezvous("syncing for next epoch.")
 
         # Save model checkpoint - all processes must participate in rendezvous
-        xm.rendezvous("before_epoch_save")
+        safe_rendezvous("before_epoch_save")
 
         if xm.get_ordinal() == 0:
             print("Saving model...", flush=True)
@@ -636,7 +675,7 @@ def train_fn(tokenized_dataset, device, args):
                 model_cpu = copy.deepcopy(model).to("cpu")
                 model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
-        xm.rendezvous("after_epoch_save")
+        safe_rendezvous("after_epoch_save")
 
     # Finish wandb run
     if xm.get_ordinal() == 0:
@@ -653,7 +692,7 @@ def evaluate(model, dataloader, device):
     total_steps = 0
 
     # Synchronize all TPU cores before starting evaluation
-    xm.rendezvous("evaluation")
+    safe_rendezvous("evaluation")
 
     # Loop over the validation set
     for batch in dataloader:
@@ -720,7 +759,7 @@ def main():
     parser.add_argument("--shuffle_dataset_ext", type=str, default=None)
     parser.add_argument("--shuffle_dataset", action='store_true')
     parser.add_argument("--shuffle_force_update", action='store_true')
-    parser.add_argument("--synchronization_steps", type=int, default=64)
+    parser.add_argument("--synchronization_steps", type=int, default=512)
     parser.add_argument("--debug", action='store_true')
     parser.add_argument("--checkpoint_path", type=str)
     parser.add_argument("--checkpoint_handling", type=str, choices=['start_with_checkpoint', 'start_with_basemodel', 'start_with_init'])

@@ -361,7 +361,8 @@ def train_fn(tokenized_dataset, device, args):
                 "weight_decay": args.weight_decay,
                 "max_seq_length": args.max_seq_length,
                 "batch_size": args.per_device_train_batch_size,
-                "lazy_grouping": args.lazy_grouping
+                "lazy_grouping": args.lazy_grouping,
+                "mlm_probability": args.mlm_probability,
             },
             mode="online",
             dir="/home/bes3/temp"

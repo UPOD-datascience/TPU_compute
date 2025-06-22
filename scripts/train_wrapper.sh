@@ -30,6 +30,7 @@ while true; do
     --num_attention_heads=${NUM_ATTENTION_HEADS} \
     --max_seq_length=${MAX_SEQ_LEN} \
     --learning_rate=${LR} \
+    --mlm_probability=${MLM_PROB} \
     --streaming_data \
     --shuffle_dataset \
     --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \

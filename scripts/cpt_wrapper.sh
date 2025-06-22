@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Source environment variables from .env file
-# set -o allexport
-# source ~/.cpt.env
-# set +o allexport
+set -o allexport
+source ~/.cpt.env
+set +o allexport
 
 huggingface-cli login ${HF_TOKEN}
 
@@ -21,9 +21,10 @@ while true; do
     --save_epoch_percentage=0.05 \
     --logging_steps=100 \
     --num_warmup_steps=${NUM_WARMUP} \
-    --num_cores=8 \
+    --num_cores=1 \
     --max_seq_len=${MAX_SEQ_LEN} \
     --learning_rate=${LR} \
+    --mlm_probability=${MLM_PROB} \
     --streaming_data \
     --shuffle_dataset \
     --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
