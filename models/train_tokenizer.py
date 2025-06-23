@@ -372,10 +372,10 @@ def main():
 
         # Llama special tokens
         special_tokens = [
-            "<unk>",  # Unknown token
+            "<pad>"   # Padding token
             "<s>",    # Beginning of sentence
             "</s>",   # End of sentence
-            "<pad>"   # Padding token
+            "<unk>",  # Unknown token
         ]
 
         # Train the tokenizer
@@ -421,7 +421,7 @@ def main():
 
         # Train SentencePiece model directly
         print("Training SentencePiece model..")
-        spm_model_prefix = os.path.join(save_dir, "sentencepiece")
+        spm_model_prefix = os.path.join(save_dir, "spiece")
 
         # Configure SentencePiece trainer
         spm.SentencePieceTrainer.train(
@@ -432,7 +432,7 @@ def main():
             unk_piece='<unk>',
             bos_piece='<s>',
             eos_piece='</s>',
-            user_defined_symbols=['<mask>'],
+            user_defined_symbols=['[MASK]', '[SEP]', '[CLS]'],
             character_coverage=0.9995,
             input_sentence_size=1_000_000,
             shuffle_input_sentence=True,
@@ -451,7 +451,9 @@ def main():
             eos_token="</s>",
             unk_token="<unk>",
             pad_token="<pad>",
-            mask_token="<mask>"
+            mask_token="[MASK]",
+            sep_token="[SEP]",
+            cls_token="[CLS]"
         )
 
         # Save the BigBird tokenizer with all necessary files
