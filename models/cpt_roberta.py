@@ -370,7 +370,7 @@ def train_fn(tokenized_dataset, device, args):
     # Set up data collator
     xm.master_print("Setting up data collator...")
     data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
-                                                    mlm=True, mlm_probability=0.20)
+                                                    mlm=True, mlm_probability=args.mlm_probability)
 
     # Decide on distributed sampler parameters:
     if args.num_cores == 1:
@@ -683,6 +683,7 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.001)
+    parser.add_argument("--mlm_probability", type=float, default=0.25)
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--save_epoch_percentage", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)

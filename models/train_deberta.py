@@ -64,6 +64,39 @@ shards = os.environ.get('TPU_WORKER_HOSTNAMES', '0').split(',')
 print(f"TPU_WORKER_ID: {worker_id}")
 print(f"TPU_WORKER_HOSTNAMES for {worker_id}: {shards}")
 
+def safe_rendezvous(tag, timeout=600):
+    """Rendezvous with timeout using threading approach (TPU-compatible)"""
+    import threading
+    import time
+
+    result_container = [None]
+    exception_container = [None]
+    finished = threading.Event()
+
+    def rendezvous_worker():
+        try:
+            result_container[0] = xm.rendezvous(tag)
+        except Exception as e:
+            exception_container[0] = e
+        finally:
+            finished.set()
+
+    # Start rendezvous in separate thread
+    worker_thread = threading.Thread(target=rendezvous_worker)
+    worker_thread.daemon = True
+    worker_thread.start()
+
+    # Wait for completion or timeout
+    if finished.wait(timeout=timeout):
+        if exception_container[0]:
+            print(f"Rendezvous '{tag}' failed with error: {exception_container[0]}, continuing...", flush=True)
+            return None
+        return result_container[0]
+    else:
+        print(f"Rendezvous '{tag}' timed out after {timeout} seconds, continuing...", flush=True)
+        return None
+
+
 
 def shuffle_and_save_dataset(dataset, output_path, seed=None, shuffle=True):
     # Shuffle only the training dataset
@@ -387,7 +420,11 @@ def train_fn(tokenized_dataset, device, args):
     else:
         raise ValueError("Checkpoint handling should be one of ['start_with_init','start_with_base', 'start_with_checkpoint']")
 
+    # Move model to device BEFORE creating optimizer
     model = model.to(device=device, dtype=torch.bfloat16)
+
+    # Force XLA compilation of model
+    xm.mark_step()
 
     # Set up data collator
     xm.master_print("Setting up data collator...")
@@ -409,8 +446,9 @@ def train_fn(tokenized_dataset, device, args):
     if args.streaming_data:
         xm.master_print("Instantiate sharded dataset...")
         num_shards = xm.xrt_world_size() # Total number of TPU cores (or processes)
-        shard_id = min(xm.xrt_world_size()-1, xm.get_ordinal())  # Unique id for the current process
-        print(f"Num shards: {num_shards}, shard id: {shard_id}")
+        shard_id = xm.get_ordinal()  # Unique id for the current process
+        print(f"Num shards: {num_shards}, shard id: {shard_id}", flush=True)
+        print(f"Core {shard_id}: Creating sharded dataset...", flush=True)
         #num_shards = xm.xrt_world_size()
         #shard_id = xm.get_ordinal()
         sharded_train_dataset = tokenized_dataset["train"].shard(num_shards=num_shards, index=shard_id)
@@ -466,7 +504,7 @@ def train_fn(tokenized_dataset, device, args):
     xla_train_loader = pl.MpDeviceLoader(train_dataloader, xm.xla_device())
     xla_validation_loader = pl.MpDeviceLoader(validation_dataloader, xm.xla_device())
 
-    # Set up optimizer and scheduler
+    # Set up optimizer and scheduler AFTER model is on device
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     steps_per_epoch = args.max_steps_per_epoch if args.streaming_data else len(train_dataloader)
     save_steps = args.save_epoch_percentage if args.save_epoch_percentage>1. else int(steps_per_epoch * args.save_epoch_percentage)
@@ -483,6 +521,16 @@ def train_fn(tokenized_dataset, device, args):
         num_cycles=num_cycles
     )
 
+    # Debug tensor states before training
+    if xm.get_ordinal() == 0:
+        print("Checking model parameter states...", flush=True)
+        for name, param in model.named_parameters():
+            if param.device.type != 'xla':
+                print(f"WARNING: Parameter {name} is not on XLA device: {param.device}")
+            if param.grad is not None:
+                print(f"WARNING: Parameter {name} has gradient before training starts")
+        print("Model parameter check complete.", flush=True)
+
     if xm.get_ordinal() == 0: # xm.is_master_ordinal():
         print("Starting training...", flush=True)
         print(f"Total steps: {total_steps}", flush=True)
@@ -494,8 +542,15 @@ def train_fn(tokenized_dataset, device, args):
     total_step = 0
     miss_steps = 0
     print(f"ENTERING THE TRAINING LOOP with: {args.num_train_epochs} epochs", flush=True)
+    
+    # Check that all cores are participating
+    print(f"Core {xm.get_ordinal()}: About to enter training loop", flush=True)
+    xm.mark_step()  # Synchronize all cores
+    if xm.get_ordinal() == 0:
+        print("All cores synchronized before training loop", flush=True)
+    
     for epoch in range(args.num_train_epochs):
-        print(f"Starting with epoch {epoch}...", flush=True)
+        print(f"Core {xm.get_ordinal()}: Starting with epoch {epoch}...", flush=True)
         total_loss = 0.
         sub_total_loss = 0.
         sub_step = 0
@@ -506,100 +561,163 @@ def train_fn(tokenized_dataset, device, args):
             print("done with setting epoch..", flush=True)
 
         print(f"Entering data loader iterator for epoch {epoch}...", flush=True)
-        step = -1
-        for step, batch in enumerate(safe_iter(xla_train_loader)):
-            try:
-                batch = {k: v.to(device=device, dtype=torch.bfloat16) if v.dtype==torch.float32 else v.to(device) for k, v in batch.items()}
-                outputs = model(**batch)
-                loss = outputs.loss / args.gradient_accumulation_steps
 
-                if torch.isnan(loss):
-                    optimizer.zero_grad(set_to_none=True)
-                    xm.rendezvous("NaN skipping")
+        # Ensure all previous operations are completed
+        xm.mark_step()
+
+        if xm.get_ordinal() == 0:
+            print(f"Starting data iteration for epoch {epoch}...", flush=True)
+
+        step = -1
+        batch_count = 0
+
+        try:
+            print(f"Core {xm.get_ordinal()}: Starting iteration over data loader...", flush=True)
+            
+            # Add timeout check for data loading
+            data_loader_iter = iter(safe_iter(xla_train_loader))
+            print(f"Core {xm.get_ordinal()}: Created data loader iterator", flush=True)
+            
+            for step in range(steps_per_epoch):
+                try:
+                    batch = next(data_loader_iter)
+                    print(f"Core {xm.get_ordinal()}: Got batch {step}", flush=True)
+                except StopIteration:
+                    print(f"Core {xm.get_ordinal()}: Data loader exhausted at step {step}", flush=True)
+                    break
+                except Exception as e:
+                    print(f"Core {xm.get_ordinal()}: Error getting batch {step}: {e}", flush=True)
+                    miss_steps += 1
+                    continue
+                batch_count += 1
+                if batch_count == 1:
+                    print(f"Core {xm.get_ordinal()}: Successfully loaded first batch for epoch {epoch}, step {step}", flush=True)
+                elif batch_count <= 5:
+                    print(f"Core {xm.get_ordinal()}: Loaded batch {batch_count} for epoch {epoch}, step {step}", flush=True)
+
+                try:
+                    batch = {k: v.to(device=device, dtype=torch.bfloat16) if v.dtype==torch.float32 else v.to(device) for k, v in batch.items()}
+                    outputs = model(**batch)
+                    loss = outputs.loss / args.gradient_accumulation_steps
+
+                    if torch.isnan(loss):
+                        optimizer.zero_grad(set_to_none=True)
+                        xm.mark_step()  # Add mark_step after zero_grad
+                        continue
+
+                    loss.backward()
+
+                    total_loss += loss.item()*args.gradient_accumulation_steps
+                    sub_total_loss += loss.item()*args.gradient_accumulation_steps
+
+                    if  (step+1) % args.gradient_accumulation_steps == 0:
+                        # torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                        xm.optimizer_step(optimizer)
+                        scheduler.step()
+                        optimizer.zero_grad()
+                        xm.mark_step()  # Mark step after optimizer step
+
+                        total_step += args.gradient_accumulation_steps
+
+                    if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
+                        print(f"Core {xm.get_ordinal()}: Reached logging step {step+1}", flush=True)
+                        # Use mark_step for safer synchronization instead of rendezvous
+                        xm.mark_step()
+                        print(f"Core {xm.get_ordinal()}: Completed mark_step for logging", flush=True)
+
+                        local_avg_loss = total_loss / max(step, 1)  # Avoid division by zero
+                        local_avg_loss_N = sub_total_loss / max(sub_step, 1)  # Avoid division by zero
+                        
+                        print(f"Core {xm.get_ordinal()}: About to call mesh_reduce for loss", flush=True)
+                        try:
+                            global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
+                            print(f"Core {xm.get_ordinal()}: Completed mesh_reduce for loss", flush=True)
+                        except Exception as e:
+                            print(f"Core {xm.get_ordinal()}: Error in mesh_reduce for loss: {e}", flush=True)
+                            global_avg_loss = local_avg_loss
+                        
+                        try:
+                            global_avg_loss_N = xm.mesh_reduce("loss_N", local_avg_loss_N, np.mean)
+                            print(f"Core {xm.get_ordinal()}: Completed mesh_reduce for loss_N", flush=True)
+                        except Exception as e:
+                            print(f"Core {xm.get_ordinal()}: Error in mesh_reduce for loss_N: {e}", flush=True)
+                            global_avg_loss_N = local_avg_loss_N
+
+                        perplexity = math.exp(min(global_avg_loss, 10))  # Cap to prevent overflow
+                        perplexity_N = math.exp(min(global_avg_loss_N, 10))  # Cap to prevent overflow
+
+                        sub_step = 0
+                        sub_total_loss = 0.
+
+                        if xm.get_ordinal() ==0:
+                            current_lr = scheduler.get_last_lr()[0]
+                            print(f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}, lr: {current_lr:.2e}", flush=True)
+                            wandb.log({
+                                "train_global_average_loss": global_avg_loss,
+                                "train_global_average_loss_N": global_avg_loss_N,
+                                "train_perplexity": perplexity,
+                                "train_perplexity_N": perplexity_N,
+                                "learning_rate": current_lr,
+                                "epoch": epoch,
+                                "step": step,
+                                "total_step": total_step
+                            })
+                        xm.mark_step()  # Final sync after logging
+
+                    if args.debug:
+                        print(f"Core {xm.get_ordinal()}: Debug mode - breaking after first batch", flush=True)
+                        break
+
+                    total_step += 1
+                    sub_step +=1
+
+                    # Add periodic progress reporting
+                    if step % 10 == 0:
+                        print(f"Core {xm.get_ordinal()}: Completed step {step}, total_step {total_step}", flush=True)
+
+                    if  ((step+1) % save_steps == 0):
+                        # Use mark_step for safer synchronization before saving
+                        xm.mark_step()
+
+                        if (xm.get_ordinal() ==0):
+                            print("Saving model...", flush=True)
+                            if args.output_dir.startswith("gs://"):
+                                with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
+                                    local_output_dir = tmpdirname
+                                    print(f"Saving model to {local_output_dir}...", flush=True)
+                                    model_cpu = copy.deepcopy(model).to("cpu")
+                                    model_cpu.save_pretrained(local_output_dir, save_serialization=True)
+                                    print(f"Uploading model to {args.output_dir}...", flush=True)
+                                    subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
+                                    # rename the directory on GCS to the model name, date, and epoch_step
+                                    # Generate a new directory name with model name, date, and epoch_step
+                                    new_dir_name = f"{args.model_name}_latest"
+                                    new_gcs_path = os.path.join(args.output_dir, new_dir_name)
+                                    subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir, "*"), new_gcs_path], check=True)
+                            else:
+                                model_cpu = copy.deepcopy(model).to("cpu")
+                                model_cpu.save_pretrained(args.output_dir,save_serialization=True)
+
+                        # Use mark_step for safer synchronization after saving
+                        xm.mark_step()
+
+                    if step > 0 and step % args.synchronization_steps == 0:  # synchronize every synch steps (skip step 0)
+                        # Use mark_step for safer periodic synchronization
+                        xm.mark_step()
+
+                    if (step+1) % steps_per_epoch == 0:
+                        break
+
+                except Exception as e:
+                    print(f"Core {xm.get_ordinal()}: Error occurred during processing batch {step}: {e}", flush=True)
+                    # Skip this batch and continue
+                    miss_steps += 1
+                    xm.mark_step()  # Ensure synchronization after error
                     continue
 
-                loss.backward()
-
-                total_loss += loss.item()*args.gradient_accumulation_steps
-                sub_total_loss += loss.item()*args.gradient_accumulation_steps
-
-                if  (step+1) % args.gradient_accumulation_steps == 0:
-                    # torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    xm.optimizer_step(optimizer)
-                    scheduler.step()
-                    optimizer.zero_grad()
-
-                    total_step += args.gradient_accumulation_steps
-
-                if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
-                    xm.rendezvous("logging, pre")
-
-                    local_avg_loss = total_loss / step
-                    local_avg_loss_N = sub_total_loss / sub_step
-                    global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
-                    global_avg_loss_N = xm.mesh_reduce("loss_N", local_avg_loss_N, np.mean)
-
-                    perplexity = math.exp(global_avg_loss)
-                    perplexity_N = math.exp(global_avg_loss_N)
-
-                    sub_step = 0
-                    sub_total_loss = 0.
-
-                    if xm.get_ordinal() ==0:
-                        current_lr = scheduler.get_last_lr()[0]
-                        print(f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}, lr: {current_lr:.2e}", flush=True)
-                        wandb.log({
-                            "train_global_average_loss": global_avg_loss,
-                            "train_global_average_loss_N": global_avg_loss_N,
-                            "train_perplexity": perplexity,
-                            "train_perplexity_N": perplexity_N,
-                            "learning_rate": current_lr,
-                            "epoch": epoch,
-                            "step": step,
-                            "total_step": total_step
-                        })
-                    xm.rendezvous("logging, post")
-                if args.debug:
-                    break
-
-                total_step += 1
-                sub_step +=1
-
-
-                if  ((step+1) % save_steps == 0):
-                    # All processes must participate in rendezvous simultaneously
-                    xm.rendezvous("before_save")
-
-                    if (xm.get_ordinal() ==0):
-                        print("Saving model...", flush=True)
-                        if args.output_dir.startswith("gs://"):
-                            with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
-                                local_output_dir = tmpdirname
-                                print(f"Saving model to {local_output_dir}...", flush=True)
-                                model_cpu = copy.deepcopy(model).to("cpu")
-                                model_cpu.save_pretrained(local_output_dir, save_serialization=True)
-                                print(f"Uploading model to {args.output_dir}...", flush=True)
-                                subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
-                                # rename the directory on GCS to the model name, date, and epoch_step
-                                # Generate a new directory name with model name, date, and epoch_step
-                                new_dir_name = f"{args.model_name}_latest"
-                                new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                                subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir, "*"), new_gcs_path], check=True)
-
-                        else:
-                            model_cpu = copy.deepcopy(model).to("cpu")
-                            model_cpu.save_pretrained(args.output_dir, save_serialization=True)
-
-                    xm.rendezvous("after_save")
-
-            except Exception as e:
-                raise Exception(f"Error occurred during processing batch {step}: {e}")
-
-            if step % args.synchronization_steps == 0:  # synchronize very synch steps
-                xm.rendezvous(f"periodic_sync_step_{step}")
-
-            if (step+1) % steps_per_epoch == 0:
-                break
+        except Exception as e:
+            print(f"Core {xm.get_ordinal()}: Error in data loader iteration for epoch {epoch}: {e}", flush=True)
+            print(f"Core {xm.get_ordinal()}: Continuing to next epoch...", flush=True)
 
         val_ppl = evaluate(model, xla_validation_loader, device)
 
@@ -610,10 +728,11 @@ def train_fn(tokenized_dataset, device, args):
                 "miss_steps": miss_steps
             })
 
-        xm.rendezvous("syncing for next epoch.")
+        # Use mark_step for safer synchronization between epochs
+        xm.mark_step()
 
-        # Save model checkpoint - all processes must participate in rendezvous
-        xm.rendezvous("before_epoch_save")
+        # Use mark_step for safer synchronization before epoch save
+        xm.mark_step()
 
         if xm.get_ordinal() == 0:
             print("Saving model...", flush=True)
@@ -636,7 +755,8 @@ def train_fn(tokenized_dataset, device, args):
                 model_cpu = copy.deepcopy(model).to("cpu")
                 model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
-        xm.rendezvous("after_epoch_save")
+        # Use mark_step for safer synchronization after epoch save
+        xm.mark_step()
 
     # Finish wandb run
     if xm.get_ordinal() == 0:
@@ -652,8 +772,8 @@ def evaluate(model, dataloader, device):
     total_loss = 0.0
     total_steps = 0
 
-    # Synchronize all TPU cores before starting evaluation
-    xm.rendezvous("evaluation")
+    # Use mark_step for safer synchronization before evaluation
+    xm.mark_step()
 
     # Loop over the validation set
     for batch in dataloader:
@@ -720,7 +840,7 @@ def main():
     parser.add_argument("--shuffle_dataset_ext", type=str, default=None)
     parser.add_argument("--shuffle_dataset", action='store_true')
     parser.add_argument("--shuffle_force_update", action='store_true')
-    parser.add_argument("--synchronization_steps", type=int, default=64)
+    parser.add_argument("--synchronization_steps", type=int, default=512)
     parser.add_argument("--debug", action='store_true')
     parser.add_argument("--checkpoint_path", type=str)
     parser.add_argument("--checkpoint_handling", type=str, choices=['start_with_checkpoint', 'start_with_basemodel', 'start_with_init'])

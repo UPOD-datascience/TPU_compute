@@ -1,9 +1,9 @@
 #!/bin/bash
 # set -o allexport
-# source ../.longformer.env
+# source ../.env
 # set +o allexport
 
-ENV=".longformer.env"
+ENV=".env"
 
 echo "Setting environment variables... (TPU_NAME=${TPU_NAME}, ZONE=${ZONE}, PROJECT_ID=${PROJECT_ID})"
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -19,7 +19,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --worker=all \
     --command="rm -rf /home/${USERNAME}/.cache/*; rm ~/logs.txt"
 
-    echo "Uploading .longformer.env as .env and training wrapper script... (TPU_NAME=${TPU_NAME}, ZONE=${ZONE}, PROJECT_ID=${PROJECT_ID}, USERNAME=${USERNAME})"
+    echo "Uploading ${ENV} as .env and training wrapper script... (TPU_NAME=${TPU_NAME}, ZONE=${ZONE}, PROJECT_ID=${PROJECT_ID}, USERNAME=${USERNAME})"
     # Copy .longformer.env to .env on the remote
     gcloud compute tpus tpu-vm scp ../${ENV} ${TPU_NAME}:/home/${USERNAME}/.env \
         --zone=${ZONE} \

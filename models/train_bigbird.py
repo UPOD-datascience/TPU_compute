@@ -47,6 +47,7 @@ from transformers import (
 BigBirdTokenizerFast,
 BigBirdConfig,
 BigBirdForMaskedLM,
+BigBirdForCausalLM,
 DataCollatorForLanguageModeling
 )
 from transformers import Trainer, TrainingArguments
@@ -361,7 +362,8 @@ def train_fn(tokenized_dataset, device, args):
                 "weight_decay": args.weight_decay,
                 "max_seq_length": args.max_seq_length,
                 "batch_size": args.per_device_train_batch_size,
-                "lazy_grouping": args.lazy_grouping
+                "lazy_grouping": args.lazy_grouping,
+                "mlm_probability": args.mlm_probability,
             },
             mode="online",
             dir="/home/bes3/temp"
@@ -381,6 +383,7 @@ def train_fn(tokenized_dataset, device, args):
         model_config.pad_token_id = args.tokenizer.pad_token_id
         model_config.cls_token_id = args.tokenizer.cls_token_id
         model_config.sep_token_id = args.tokenizer.sep_token_id
+        model_config.mask_token_id = args.tokenizer.mask_token_id
         model_config.vocab_size = args.tokenizer.vocab_size
 
         max_token_id = max([model_config.bos_token_id,
