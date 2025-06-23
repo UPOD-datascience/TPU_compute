@@ -106,7 +106,7 @@ def prep_fn(args):
             return tokenizer(examples["text"],
                              truncation=False,
                              max_length=args.max_seq_length)
-        opt_kwargs = {'num_proc': 8} if args.streaming_data==False else {}
+        opt_kwargs = {'num_proc': 1} if args.streaming_data==False else {}
 
         tokenized_dataset_raw = dataset.map(tokenize_function,
                                          batched=True,
@@ -204,7 +204,7 @@ def train_fn(index, args):
     # Set up data collator
     data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
                                                      mlm=True,
-                                                     mlm_probability=0.15)
+                                                     mlm_probability=args.mlm_probability)
 
     # For GPU training, assume a single process (non-distributed)
     sampler_rank = 0
@@ -378,6 +378,7 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.001)
+    parser.add_argument("--mlm_probability", type=float, default=0.25)
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--save_epoch_percentage", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
