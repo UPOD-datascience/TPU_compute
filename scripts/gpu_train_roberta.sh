@@ -7,7 +7,7 @@ echo "Starting training..."
 nohup python3 ../models/cpt_roberta_gpu.py  \
   --dataset_dir=${DATASET_FOLDER} \
   --tmp_dir=${TMP_DIR} \
-  --output_dir=${} \
+  --output_dir=${OUTPUT_DIR} \
   --model_name=${MODEL_NAME} \
   --tokenizer_name_or_path=${TOKENIZER_PATH}\
   --per_device_train_batch_size=16 \

@@ -304,7 +304,7 @@ def train_fn(index, args):
                 global_avg_loss_N = sub_total_loss / sub_step
                 perplexity = math.exp(global_avg_loss)
                 perplexity_N = math.exp(global_avg_loss_N)
-                print(f"Epoch {epoch+1}, step {step}, loss: {global_avg_loss}, train perplexity: {perplexity}")
+                print(f"Epoch {epoch+1}, step {step}, samples {args.per_device_train_batch_size*step}, loss: {global_avg_loss}, train perplexity: {perplexity}")
 
                 sub_step = 0
                 sub_total_loss = 0.
