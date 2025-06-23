@@ -152,7 +152,7 @@ def get_optimizer(model, args):
     )
     return optimizer
 
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, device, bf16=False):
     model.eval()
     total_loss = 0.0
     total_steps = 0
@@ -163,11 +163,12 @@ def evaluate(model, dataloader, device):
         labels = batch["labels"].to(device)
 
         with torch.no_grad():
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
+            with torch.cuda.amp.autocast(enabled=bf16, dtype=torch.bfloat16 if bf16 else torch.float32):
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
         loss = outputs.loss
         total_loss += loss.item()
         total_steps += 1
@@ -200,6 +201,15 @@ def train_fn(index, args):
     # Load pre-trained model
     model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
     model.to(device)
+    
+    if args.bf16:
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            print(f"Using BF16 mixed precision training")
+        else:
+            print(f"Warning: BF16 not supported on this device, falling back to FP32")
+            args.bf16 = False
+    else:
+        print(f"Using FP32 precision training")
 
     # Set up data collator
     data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
@@ -259,6 +269,9 @@ def train_fn(index, args):
     scheduler = get_linear_schedule_with_warmup(optimizer,
                                                  num_warmup_steps=args.num_warmup_steps,
                                                  num_training_steps=total_steps)
+    
+    # Set up gradient scaler for mixed precision training
+    scaler = torch.cuda.amp.GradScaler(enabled=args.bf16)
 
     if index == 0:
         print("Starting training...", flush=True)
@@ -266,6 +279,7 @@ def train_fn(index, args):
         print(f"Total epochs: {args.num_train_epochs}", flush=True)
         print(f"Total warmup steps: {args.num_warmup_steps}", flush=True)
         print(f"Saving model every: {save_steps}", flush=True)
+        print(f"Mixed precision (BF16): {args.bf16}", flush=True)
 
     # Training loop
     total_step = 0
@@ -278,25 +292,27 @@ def train_fn(index, args):
         for step, batch in enumerate(train_loader):
             # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch)
             
-            #with torch.cuda.amp.autocast(enabled=args.fp16):
-            outputs = model(**batch)
-            loss = outputs.loss / args.gradient_accumulation_steps
+            with torch.cuda.amp.autocast(enabled=args.bf16, dtype=torch.bfloat16 if args.bf16 else torch.float32):
+                outputs = model(**batch)
+                loss = outputs.loss / args.gradient_accumulation_steps
             
             if torch.isnan(loss):
                 optimizer.zero_grad(set_to_none=True) 
                 continue
-            loss.backward()                
+            
+            scaler.scale(loss).backward()
             
             total_loss += loss.item()*args.gradient_accumulation_steps
             sub_total_loss += loss.item()*args.gradient_accumulation_steps
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer.step()  # Replaces xm.optimizer_step(optimizer)
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
-                optimizer.zero_grad(set_to_none=True) 
+                optimizer.zero_grad(set_to_none=True)
                 
 
             if (step + 1) % max(args.logging_steps, args.gradient_accumulation_steps) == 0:
@@ -341,7 +357,7 @@ def train_fn(index, args):
                     model_cpu = copy.deepcopy(model).to("cpu")
                     model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
-        val_ppl,val_loss = evaluate(model, validation_loader, device)
+        val_ppl,val_loss = evaluate(model, validation_loader, device, args.bf16)
         print(f"Epoch {epoch+1} Validation Perplexity: {val_ppl:.3f}")
 
         #if index == 0:
@@ -399,6 +415,7 @@ def main():
     parser.add_argument("--max_steps_per_epoch", type=int, default=None)
     parser.add_argument("--shuffle_buffer_size", type=int, default=10_000)
     parser.add_argument("--model_name", type=str, default="UMCU/CardioDeberta.nl")
+    parser.add_argument("--bf16", action='store_true', default=False, help="Use BF16 precision")
     #parser.add_argument("--wandb_key", type=str, required=True, help="Weights & Biases API key")
     args = parser.parse_args()
 
