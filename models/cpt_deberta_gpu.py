@@ -346,6 +346,7 @@ def train_fn(index, args):
                         local_output_dir = tmpdirname
                         print(f"Saving model to {local_output_dir}...")
                         model_cpu = copy.deepcopy(model).to("cpu")
+                        model_cpu = model_cpu.to(torch.bfloat16)
                         model_cpu.save_pretrained(local_output_dir, save_serialization=True)
                         print(f"Uploading model to {args.output_dir}...")
                         subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
@@ -375,6 +376,7 @@ def train_fn(index, args):
                     local_output_dir = tmpdirname
                     print(f"Saving model to {local_output_dir}...")
                     model_cpu = copy.deepcopy(model).to("cpu")
+                    model_cpu = model_cpu.to(torch.bfloat16)
                     model_cpu.save_pretrained(local_output_dir, save_serialization=True)
                     print(f"Uploading model to {args.output_dir}...")
                     subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
