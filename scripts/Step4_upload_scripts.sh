@@ -1,7 +1,7 @@
 #!/bin/bash
-# set -o allexport
-# source ../.longformer.env
-# set +o allexport
+set -o allexport
+source ../.llama.env
+set +o allexport
 
 echo "Copying models to TPU"
 if [[ ${LOCAL_MODEL_DIRECTORY} == gs://* ]]; then
@@ -9,8 +9,24 @@ if [[ ${LOCAL_MODEL_DIRECTORY} == gs://* ]]; then
   gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
-    --worker=all --command="sudo rm -rf /var/log/* && sudo rm -rf /tmp/* && mkdir -p /home/${USERNAME}/models && gsutil cp ${LOCAL_MODEL_DIRECTORY}/*.py /home/${USERNAME}/models/"
+    --worker=all --command="sudo rm ~/logs.txt && sudo rm -rf /var/log/* && sudo rm -rf /tmp/* && mkdir -p /home/${USERNAME}/models && gsutil cp ${LOCAL_MODEL_DIRECTORY}/*.py /home/${USERNAME}/models/"
 else
+    echo "Cleaning up.."
+    gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+      --zone=${ZONE} \
+      --project=${PROJECT_ID} \
+      --worker=all --command="sudo rm ~/logs.txt"
+
+    gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+        --zone=${ZONE} \
+        --project=${PROJECT_ID} \
+        --worker=all --command="sudo rm -rf /var/log/*"
+
+    gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+        --zone=${ZONE} \
+        --project=${PROJECT_ID} \
+        --worker=all --command="sudo rm -rf /tmp/*"
+
     echo "Copying models from local"
     gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
         --zone=${ZONE} \

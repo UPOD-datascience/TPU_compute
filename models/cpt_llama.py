@@ -1,17 +1,31 @@
 import argparse
 import torch
-from torch_xla.runtime import world_size, global_ordinal
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
-import torch_xla.distributed.xla_multiprocessing as xmp
+import traceback
+import sys
+
+#import deepspeed
+try:
+    from torch_xla.runtime import world_size, global_ordinal
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    print("XLA import successful")
+
+    # Make `torch.xla` point at the installed torch_xla package
+    #import torch_xla
+    #torch.xla = torch_xla
+    #sys.modules["torch.xla"] = torch_xla
+except ImportError as e:
+    print(f"XLA import failed: {e}")
+    exit(1)
+
 from transformers import (
 LlamaTokenizerFast,
 LlamaConfig,
 LlamaForCausalLM,
 DataCollatorForLanguageModeling
 )
-from transformers import Trainer, TrainingArguments
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
 from datasets import load_dataset, DatasetDict, DatasetInfo
 from safetensors.torch import load_file as load_safetensors
@@ -19,7 +33,6 @@ from safetensors.torch import load_file as load_safetensors
 import wandb
 import os
 import io
-import sys
 import tempfile
 import subprocess
 import copy
@@ -38,13 +51,13 @@ from itertools import chain
 
 from time import sleep
 
-try:
-    os.environ.pop('TPU_PROCESS_ADDRESSES')
-    os.environ.pop('CLOUD_TPU_TASK_ID')
-except:
-    print("No TPU_PROCESS_ADDRESSES or CLOUD_TPU_TASK_ID to remove")
+# try:
+#     os.environ.pop('TPU_PROCESS_ADDRESSES')
+#     os.environ.pop('CLOUD_TPU_TASK_ID')
+# except:
+#     print("No TPU_PROCESS_ADDRESSES or CLOUD_TPU_TASK_ID to remove")
 
-print("TPU_NUM_DEVICES:", os.environ.get("TPU_NUM_DEVICES"), flush=True)
+print("TPU_NUM_DEVICES identified at system level:", os.environ.get("TPU_NUM_DEVICES"), flush=True)
 print("TPU_CHIPS_PER_HOST_BOUNDS:", os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS"), flush=True)
 
 worker_id = int(os.environ.get('TPU_WORKER_ID', '0'))
@@ -149,9 +162,14 @@ def load_from_gcs(bucket_name, blob_name, local_path, device):
 
     return checkpoint
 
-def load_sharded_dataset(datasets, dformat):
-    num_shards = max(world_size() , 16)
-    shard_idx = global_ordinal()
+def load_sharded_dataset(datasets, dformat, args):
+    # For single process mode, use process-based indices instead of TPU core indices
+    if args.num_cores == 1:
+        num_shards = 1
+        shard_idx = 0
+    else:
+        num_shards = max(world_size() , 16)
+        shard_idx = global_ordinal()
 
     print(f"Sharding for shard index:{shard_idx} / {num_shards}")
 
@@ -223,6 +241,17 @@ def group_texts(examples, max_seq_length, pad_token=0):
     return result
 
 def prep_fn(args):
+    # For streaming data, each process needs to load and tokenize independently
+    # but we stagger the start times to avoid resource contention
+
+    # Stagger the start times to avoid all processes hitting the storage simultaneously
+    current_ordinal = global_ordinal()
+    stagger_delay = current_ordinal * 2  # 2 seconds per core
+
+    if stagger_delay > 0:
+        print(f"Process {current_ordinal}: Waiting {stagger_delay}s to stagger dataset loading...")
+        sleep(stagger_delay)
+
     # Load and tokenize dataset
     if args.pre_tokenized:
         datasets = {
@@ -230,7 +259,7 @@ def prep_fn(args):
             "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.{args.dataset_format}"
         }
         if args.streaming_data:
-            print("Loading pre-tokenized dataset, streaming with shuffle..", flush=True)
+            print(f"Process {current_ordinal}: Loading pre-tokenized streaming dataset...", flush=True)
             tokenized_dataset = load_dataset(
                     args.dataset_format,
                     data_files=datasets,
@@ -238,7 +267,7 @@ def prep_fn(args):
                     keep_in_memory=False,
                 ).shuffle(buffer_size=args.shuffle_buffer_size)
         else:
-            print("Loading pre-tokenized dataset, no streaming", flush=True)
+            print(f"Process {current_ordinal}: Loading pre-tokenized dataset...", flush=True)
             tokenized_dataset = load_dataset(
                 args.dataset_format,
                 data_files=datasets,
@@ -246,35 +275,36 @@ def prep_fn(args):
                 keep_in_memory=True,
             )
     else:
-        print(f"Tokenizing dataset... with streaming: {args.streaming_data} and keep_in_memory: {args.keep_in_memory}", flush=True)
+        print(f"Process {current_ordinal}: Loading raw dataset for tokenization...", flush=True)
         print(f"Dataset location: {args.dataset_dir}", flush=True)
 
         train_loc = "train" if not args.debug else "validation"
-
         datasets = {"train": args.dataset_dir+f"/{train_loc}/*.{args.dataset_format}",
                     "validation": args.dataset_dir+f"/validation/*.{args.dataset_format}"}
 
         if args.streaming_data:
             try:
-                ds_train_info = DatasetInfo.from_directory(args.dataset_dir+f"/{train_loc}/")
-                num_examples = ds_train_info['num_examples']
-                args.max_steps_per_epoch = num_examples // args.per_device_train_batch_size // max(world_size(), 1)
+                if current_ordinal == 0:  # Only master process calculates this
+                    ds_train_info = DatasetInfo.from_directory(args.dataset_dir+f"/{train_loc}/")
+                    num_examples = ds_train_info['num_examples']
+                    args.max_steps_per_epoch = num_examples // args.per_device_train_batch_size // max(world_size(), 1)
+                    print(f"Maximum steps per epoch: {args.max_steps_per_epoch}", flush=True)
             except Exception as e:
                 print(f"Could not obtain datasetinfo:{e}")
                 pass
 
-            print("Init streaming dataset...", flush=True)
+            print(f"Process {current_ordinal}: Init streaming dataset...", flush=True)
             dataset = load_dataset(
                     args.dataset_format,
                     data_files=datasets,
                     streaming=True,
                     keep_in_memory=False
-                )#.shuffle(buffer_size=args.shuffle_buffer_size)
+                )
         else:
-            print("Init non-streaming dataset...", flush=True)
+            print(f"Process {current_ordinal}: Init non-streaming dataset...", flush=True)
             if args.sharded_data:
                 print("Sharding data...", flush=True)
-                dataset = load_sharded_dataset(datasets, args.dataset_format)
+                dataset = load_sharded_dataset(datasets, args.dataset_format, args)
             else:
                 dataset = load_dataset(
                         args.dataset_format,
@@ -283,28 +313,48 @@ def prep_fn(args):
                         keep_in_memory=True
                     )
 
-        opt_kwargs = {'num_proc': args.num_cores} if args.streaming_data==False else {}
-        print("Tokenizing dataset...", flush=True)
+        # For streaming data, don't use multiprocessing (num_proc=1 or omit)
+        # Each TPU core is already a separate process
+        print(f"Process {current_ordinal}: Tokenizing dataset...", flush=True)
         tokenize_fn = partial(tokenize_function, tokenizer=args.tokenizer, max_seq_length=args.max_seq_length)
-        tokenized_dataset_raw = dataset.map(tokenize_fn,
-                                         batched=True,
-                                         remove_columns=["text",
-                                                         "id",
-                                                         "source",
-                                                         "approx_token_counts_translated",
-                                                         "approx_token_counts_original"],
-                                         **opt_kwargs)
 
-        opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
-        print("Performing chunking tokenized data...", flush=True)
+        # Remove num_proc for streaming to avoid conflicts
+        if args.streaming_data:
+            tokenized_dataset_raw = dataset.map(
+                tokenize_fn,
+                batched=True,
+                remove_columns=["text", "id", "source", "approx_token_counts_translated", "approx_token_counts_original"]
+            )
+        else:
+            tokenized_dataset_raw = dataset.map(
+                tokenize_fn,
+                batched=True,
+                remove_columns=["text", "id", "source", "approx_token_counts_translated", "approx_token_counts_original"],
+                num_proc=1  # Use single process to avoid conflicts
+            )
+
+        print(f"Process {current_ordinal}: Performing chunking tokenized data...", flush=True)
         group_fn = partial(group_texts, max_seq_length=args.max_seq_length, pad_token=args.tokenizer.pad_token_id)
-        tokenized_dataset = tokenized_dataset_raw.map(
+
+        if args.streaming_data:
+            tokenized_dataset = tokenized_dataset_raw.map(group_fn, batched=True)
+        else:
+            tokenized_dataset = tokenized_dataset_raw.map(
                 group_fn,
                 batched=True,
-                **opt_kwargs
+                num_proc=1,
+                desc=f"Grouping texts in chunks of {args.max_seq_length}"
             )
+
         del tokenized_dataset_raw
+
+    print(f"Process {current_ordinal}: Dataset preparation complete", flush=True)
+
+    # Optional: Add a barrier to ensure all processes finish around the same time
+    xm.rendezvous("dataset_prep_complete")
+
     return tokenized_dataset
+
 
 def safe_iter(iterable):
     iterator = iter(iterable)
@@ -315,15 +365,25 @@ def safe_iter(iterable):
             break
         except Exception as e:
             print(f"Error encountered in iteration: {e}")
+            print(f"Error type: {type(e).__name__}")
+            import traceback
+            traceback.print_exc()
+            # Don't continue on XLA tensor errors - these need to be fixed
+            if "XLA" in str(e) or "tensor" in str(e).lower():
+                print("XLA/tensor error detected - stopping iteration")
+                raise
             continue
 
 def train_fn(tokenized_dataset, device, args):
     # Initialize wandb for the master process
+    print(f"Process {global_ordinal()}: Starting train_fn...", flush=True)
     if global_ordinal() == 0: #.is_master_ordinal():
         wandb.login(key=args.wandb_key)
         wandb.init(
             project="Llama 3.2 - 1B TPU CPT",
             config={
+                "TPU ID": args.TPU_NAME,
+                "TPU DISK": args.TPU_DISK,
                 "learning_rate": args.learning_rate,
                 "architecture": "Llama 3.2 - 1B",
                 "dataset": args.dataset_dir,
@@ -335,15 +395,25 @@ def train_fn(tokenized_dataset, device, args):
             mode="online",
             dir="/home/bes3/temp"
         )
+        wandb.run.log_code(root="/home/bes3/models", name="cpt_llama")
 
     # Load model configuration
     #config = RobertaConfig.from_pretrained(args.model_name)
 
     # Load pre-trained model
-    xm.master_print("Loading the LM ...")
+    print(f"Process {global_ordinal()}: Loading the LM...", flush=True)
     if isinstance(args.checkpoint_path, str) & (args.checkpoint_path != ""):
+        print(f"Process {global_ordinal()}: Loading model from checkpoint: {args.checkpoint_path}", flush=True)
+
         #model_config = LlamaConfig.from_pretrained(args.model_name)
-        model = LlamaForCausalLM.from_pretrained(args.model_name)
+        config = LlamaConfig.from_pretrained(args.model_name,
+            token=args.huggingface_token)
+
+        # Create model with config (avoids meta parameters)
+        with torch.device("cpu"):
+            model = LlamaForCausalLM(config)
+        print(f"Process {global_ordinal()}: Empty model created on CPU", flush=True)
+
         if args.checkpoint_path.startswith('gs://'):
             # Parse GCS path
             bucket_name = args.checkpoint_path.split('/')[2]
@@ -353,53 +423,119 @@ def train_fn(tokenized_dataset, device, args):
                                        blob_name,
                                        local_path,
                                        device)
+            sleep(1)
+            print(f"Process {global_ordinal()}: Checkpoint downloaded...", flush=True)
+            xm.rendezvous("checkpoint_downloaded")
         else:
             if args.checkpoint_path.endswith('.safetensors'):
                 checkpoint = load_safetensors(args.checkpoint_path, device=device)
             else:
                 checkpoint = torch.load(args.checkpoint_path, map_location=device)
+            sleep(1)
+            print(f"Process {global_ordinal()}: Checkpoint downloaded...", flush=True)
+            xm.rendezvous("checkpoint_downloaded")
+
 
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
         else:
             model.load_state_dict(checkpoint)
+
+        sleep(1)
+        print(f"Process {global_ordinal()}: Checkpoint loaded in memory..", flush=True)
     else:
-        model = LlamaForCausalLM.from_pretrained(args.model_name)
-        pass
+        with torch.device("cpu"):
+            model = LlamaForCausalLM.from_pretrained(args.model_name,
+                token=args.huggingface_token,
+                device_map=None,
+                _fast_init=False,
+                low_cpu_mem_usage=False
+            )
 
-    model = model.to(device=device, dtype=torch.bfloat16)
+    xm.rendezvous("checkpoint_loaded_in_memory")
 
+    # Debug single core mode
+    print(f"Process {global_ordinal()}: world_size={world_size()}, global_ordinal={global_ordinal()}, num_cores={args.num_cores}", flush=True)
+
+    # For single core mode, simplify the model loading
+    if args.num_cores == 1:
+        print(f"Process {global_ordinal()}: Single core mode - loading model to TPU device {device}...", flush=True)
+        try:
+            model = model.to(device=device, dtype=torch.bfloat16)
+            xm.mark_step()  # Ensure model transfer completes
+            print(f"Process {global_ordinal()}: Model loaded to device successfully", flush=True)
+            print(f"Process {global_ordinal()}: Model device after loading: {next(model.parameters()).device}", flush=True)
+        except Exception as e:
+            print(f"Process {global_ordinal()}: Error loading model to device: {e}", flush=True)
+            raise
+    else:
+        # Original multi-core logic
+        for i in range(world_size()):
+            if global_ordinal() == i:
+                print(f"Process {global_ordinal()}: My turn to load model to TPU device {device}...", flush=True)
+                try:
+                    model = model.to(device=device, dtype=torch.bfloat16)
+                    # model.gradient_checkpointing_enable()
+                    print(f"Process {global_ordinal()}: Checkpoint loaded on device successfully", flush=True)
+                except Exception as e:
+                    print(f"Process {global_ordinal()}: Error loading model to device: {e}", flush=True)
+                    raise
+
+            # Wait for current process to finish before next one starts
+            xm.rendezvous(f"model_to_device_{i}")
+
+    print(f"Process {global_ordinal()}: All models loaded to devices", flush=True)
+
+    # print("After checkpointing, model on device:", next(model.parameters()).device, flush=True)
+    # if hasattr(model, 'tie_weights'):
+    #     model.tie_weights()
     # Set up data collator
-    xm.master_print("Setting up data collator...")
+    print(f"Process: {global_ordinal()}. Setting up data collator.")
     data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
                                                     mlm=False)
+    xm.rendezvous("datacollator")
 
     # Decide on distributed sampler parameters:
     if args.num_cores == 1:
         sampler_rank = 0
         sampler_replicas = 1
+        print(f"Process {global_ordinal()}: Using single core mode", flush=True)
     else:
         sampler_rank = global_ordinal()
         sampler_replicas = world_size()
 
+    print(f"Process {global_ordinal()}: About to create DataLoader...", flush=True)
+
     # Create sampler
     distributed_sampler = False
     if args.streaming_data:
-        xm.master_print("Instantiate sharded dataset...")
-        num_shards = world_size()  # Total number of TPU cores (or processes)
-        shard_id = global_ordinal()  # Unique id for the current process
-        print(f"Num shards: {num_shards}, shard id: {shard_id}")
-        #num_shards = xm.xrt_world_size()
-        #shard_id = xm.get_ordinal()
-        sharded_train_dataset = tokenized_dataset["train"].shard(num_shards=num_shards, index=shard_id)
+        print(f"Process {global_ordinal()}: Creating sharded dataset...", flush=True)
 
-        xm.master_print("Starting the streaming DataLoader...")
+        # For single process mode, use process-based indices instead of TPU core indices
+        if args.num_cores == 1:
+            num_shards = 1
+            shard_id = 0
+        else:
+            num_shards = world_size()  # Total number of TPU cores (or processes)
+            shard_id = global_ordinal()  # Unique id for the current process
+        print(f"Process {global_ordinal()}: Num shards: {num_shards}, shard id: {shard_id}", flush=True)
+
+        try:
+            sharded_train_dataset = tokenized_dataset["train"].shard(num_shards=num_shards, index=shard_id)
+            print(f"Process {global_ordinal()}: Sharded dataset created successfully", flush=True)
+        except Exception as e:
+            print(f"Process {global_ordinal()}: Error creating sharded dataset: {e}", flush=True)
+            raise
+
+        print(f"Process {global_ordinal()}: Creating streaming DataLoader...", flush=True)
 
         train_dataloader = torch.utils.data.DataLoader(
             sharded_train_dataset,
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
-            num_workers=0
+            num_workers=0,
+            pin_memory=False,
+            drop_last=True
         )
     else:
         xm.master_print("Starting the DistributedSampler...")
@@ -428,17 +564,60 @@ def train_fn(tokenized_dataset, device, args):
         del tokenized_dataset
         gc.collect()
 
-    xla_train_loader = pl.MpDeviceLoader(train_dataloader, xm.xla_device())
-    xla_validation_loader = pl.MpDeviceLoader(validation_dataloader, xm.xla_device())
+    # For single core, try alternative data loading approach
+    if args.num_cores == 1:
+        print(f"Process {global_ordinal()}: Using single core data loading", flush=True)
+        # For single core, we might not need MpDeviceLoader
+        xla_train_loader = train_dataloader
+        xla_validation_loader = validation_dataloader
+    else:
+        xla_train_loader = pl.MpDeviceLoader(train_dataloader, xm.xla_device())
+        xla_validation_loader = pl.MpDeviceLoader(validation_dataloader, xm.xla_device())
+
+    print(f"XLA device is: {xm.xla_device()}", flush=True)
+    print(f"Device for training: {device}", flush=True)
+
+    xm.rendezvous("data_loader")
 
     # Set up optimizer and scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    #optimizer = torch.optim.Adafactor(model.parameters(), lr=args.learning_rate, #weight_decay=args.weight_decay, scale_parameter=False, relative_step=False)
+
     steps_per_epoch = args.max_steps_per_epoch if args.streaming_data else len(train_dataloader)
-    save_steps = int(steps_per_epoch * args.save_epoch_percentage)
+    save_steps = int(steps_per_epoch * args.save_epoch_percentage) if args.save_epoch_percentage<1 else args.save_epoch_percentage
     total_steps = steps_per_epoch * args.num_train_epochs
     #scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=total_steps)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
 
+    if args.lr_schedule == 'linear':
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
+    else:
+        scheduler = get_cosine_schedule_with_warmup(optimizer,
+            num_warmup_steps=args.num_warmup_steps,
+            num_training_steps=total_steps,
+            num_cycles=args.num_cycles)
+
+    # ds_config = {
+    #     "zero_optimization": {
+    #         "stage": 3,
+    #         "offload_param": {
+    #             "device": "cpu"
+    #         }
+    #     },
+    #     "bf16": {
+    #         "enabled": True
+    #     }
+    # }
+
+    # # Replace model, optimizer, scheduler with a DeepSpeed engine
+    # model, optimizer, _, scheduler = deepspeed.initialize(
+    #     model=model,
+    #     optimizer=optimizer,
+    #     lr_scheduler=scheduler,
+    #     config=ds_config
+    # )
+
+    xm.rendezvous("start_training")
     if global_ordinal() == 0: # xm.is_master_ordinal():
         print("Starting training...", flush=True)
         print(f"Total steps: {total_steps}", flush=True)
@@ -450,7 +629,9 @@ def train_fn(tokenized_dataset, device, args):
     miss_steps = 0
     print(f"ENTERING THE TRAINING LOOP with: {args.num_train_epochs} epochs", flush=True)
     for epoch in range(args.num_train_epochs):
-        print(f"Starting with epoch {epoch}...", flush=True)
+        xm.rendezvous(f"start_epoch_{epoch}")
+        print(f"Starting with epoch {epoch}...for process {global_ordinal()}", flush=True)
+
         total_loss = 0.
         sub_total_loss = 0.
         sub_step = 0
@@ -464,26 +645,118 @@ def train_fn(tokenized_dataset, device, args):
         step = -1
         for step, batch in enumerate(safe_iter(xla_train_loader)):
             try:
-                batch = {k: v.to(device=device, dtype=torch.bfloat16) if v.dtype==torch.float32 else v.to(device) for k, v in batch.items()}
-                outputs = model(**batch)
-                loss = outputs.loss
+                # Debug tensor information for first few batches
+                if step < 3:
+                    print(f"Process {global_ordinal()}: Processing batch {step}...", flush=True)
+
+                if step == 0:
+                    print(f"Process {global_ordinal()}: First batch tensor info:", flush=True)
+                    for k, v in batch.items():
+                        if isinstance(v, torch.Tensor):
+                            is_xla = 'xla' in str(v.device).lower()
+                            print(f"  {k}: shape={v.shape}, dtype={v.dtype}, device={v.device}, is_xla={is_xla}", flush=True)
+
+                    # Check model device
+                    model_device = next(model.parameters()).device
+                    print(f"  Model parameters device: {model_device}", flush=True)
+                    print(f"  Target device: {device}", flush=True)
+
+                    # Verify XLA is working
+                    try:
+                        test_tensor = torch.tensor([1.0]).to(device)
+                        print(f"  Test tensor device: {test_tensor.device}, is_xla: {'xla' in str(test_tensor.device).lower()}", flush=True)
+                    except Exception as tensor_e:
+                        print(f"  Error creating test tensor: {tensor_e}", flush=True)
+
+                    # Verify model embeddings are on XLA device
+                    try:
+                        embedding_device = model.model.embed_tokens.weight.device
+                        print(f"  Model embeddings device: {embedding_device}, is_xla: {'xla' in str(embedding_device).lower()}", flush=True)
+
+                        # For single core, ensure model is properly on XLA device
+                        if args.num_cores == 1 and 'xla' not in str(embedding_device).lower():
+                            print(f"  WARNING: Model not on XLA device in single core mode, forcing move...", flush=True)
+                            model = model.to(device)
+                            xm.mark_step()  # Ensure transfer completes
+                            new_embedding_device = model.model.embed_tokens.weight.device
+                            print(f"  Model moved - new embeddings device: {new_embedding_device}", flush=True)
+                    except AttributeError as ae:
+                        print(f"  Could not access model embeddings: {ae}", flush=True)
+
+                # Handle tensor placement - simplified approach for single core
+                if args.num_cores == 1:
+                    # For single core, be more explicit about tensor movement
+                    new_batch = {}
+                    for k, v in batch.items():
+                        if isinstance(v, torch.Tensor):
+                            # Ensure tensor is on XLA device
+                            if not ('xla' in str(v.device).lower()):
+                                if v.dtype == torch.float32:
+                                    new_batch[k] = v.to(device, dtype=torch.bfloat16)
+                                else:
+                                    new_batch[k] = v.to(device)
+                            else:
+                                # Already on XLA device, just convert dtype if needed
+                                if v.dtype == torch.float32:
+                                    new_batch[k] = v.to(dtype=torch.bfloat16)
+                                else:
+                                    new_batch[k] = v
+                        else:
+                            new_batch[k] = v
+                    batch = new_batch
+
+                    # For first few batches, log tensor devices after processing
+                    if step < 3:
+                        print(f"  Batch {step} - Final tensor devices:", flush=True)
+                        for k, v in batch.items():
+                            if isinstance(v, torch.Tensor):
+                                print(f"    {k}: {v.device} (shape: {v.shape})", flush=True)
+
+                        # Ensure XLA operations are synchronized before model forward pass
+                        xm.mark_step()
+                else:
+                    # Original logic for multi-core
+                    batch = {k: v.to(device=device, dtype=torch.bfloat16) if v.dtype==torch.float32 else v.to(device) for k, v in batch.items()}
+                loss = model(**batch).loss / args.gradient_accumulation_steps
+                nan = torch.isnan(loss)
+                if nan:
+                    optimizer.zero_grad(set_to_none=True)
+                    print(f"[Rank {global_ordinal()}] NaN loss; skipping backward but keeping sync", flush=True)
+                    loss = torch.nan_to_num(loss, nan=0.0)
+
                 loss.backward()
 
-                total_loss += loss.item()
-                sub_total_loss += loss.item()
+                total_loss += loss.item()*args.gradient_accumulation_steps
+                sub_total_loss += loss.item()*args.gradient_accumulation_steps
 
                 if  (step+1) % args.gradient_accumulation_steps == 0:
-                    xm.optimizer_step(optimizer)
+                    #model.step()              # does optimizer_step + zero_grad via DeepSpeed
+                    #print(f"[Rank {global_ordinal()}] Performing optimization", flush=True)
+                    # Add before clipping
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    if grad_norm > args.max_grad_norm:
+                        print(f"[Rank {global_ordinal()}] Gradient norm {grad_norm:.2f} was clipped to {args.max_grad_norm} at step {step}")
+                    # reactivate grad norm later
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    xm.optimizer_step(optimizer, barrier=True)
                     scheduler.step()
+                    xm.mark_step()
                     optimizer.zero_grad()
+                    #xm.clear_all_gradients()
 
                     total_step += args.gradient_accumulation_steps
 
-                if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
-                    xm.rendezvous("logging")
+                #xm.mark_step()
+                    #xm.clear_all_gradients()       # drops stale XLA gradient buffers
 
-                    local_avg_loss = total_loss / step
-                    local_avg_loss_N = sub_total_loss / sub_step
+                #if (step+1) %  (args.gradient_accumulation_steps - 1)== 0:
+                    #mem = xm.get_memory_info(xm.xla_device())
+                    #print(f"[Rank {global_ordinal()}] Free HBM: {','.join([str(round(m/1e6,3)) for m in mem.values()])} GB")
+
+                if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
+                    local_avg_loss = total_loss / (step + 1)
+                    local_avg_loss_N = sub_total_loss / max(sub_step, 1)
+
                     global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
                     global_avg_loss_N = xm.mesh_reduce("loss_N", local_avg_loss_N, np.mean)
 
@@ -493,6 +766,7 @@ def train_fn(tokenized_dataset, device, args):
                     sub_step = 0
                     sub_total_loss = 0.
 
+                    xm.rendezvous("before_wandb_log")
                     if global_ordinal() ==0:
                         print(f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}", flush=True)
                         wandb.log({
@@ -503,42 +777,47 @@ def train_fn(tokenized_dataset, device, args):
                             "epoch": epoch,
                             "step": step,
                             "total_step": total_step
-                        })
-
+                        }, commit = False)
+                    xm.rendezvous("after_wandb_log")
                 if args.debug:
                     break
 
-                total_step += 1
+                #total_step += 1
                 sub_step +=1
 
+                if ((step+1) % save_steps == 0):
+                    xm.rendezvous("before_model_saving")
+                    if (global_ordinal() ==0):
+                        print("Saving model...", flush=True)
 
-                if (global_ordinal() ==0) & ((step+1) % save_steps == 0):
-                    xm.rendezvous("before_save")
-                    print("Saving model...", flush=True)
-                    if args.output_dir.startswith("gs://"):
-                        with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
-                            local_output_dir = tmpdirname
-                            print(f"Saving model to {local_output_dir}...", flush=True)
+                        wandb.log({"epoch_done": epoch}, commit=True)
+                        wandb.finish()
+
+                        if args.output_dir.startswith("gs://"):
+                            with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
+                                local_output_dir = tmpdirname
+                                print(f"Saving model to {local_output_dir}...", flush=True)
+                                model_cpu = copy.deepcopy(model).to("cpu")
+                                model_cpu.save_pretrained(local_output_dir, save_serialization=True)
+                                print(f"Uploading model to {args.output_dir}...", flush=True)
+                                subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
+                                # rename the directory on GCS to the model name, date, and epoch_step
+                                # Generate a new directory name with model name, date, and epoch_step
+                                new_dir_name = f"{args.model_name}_latest"
+                                new_gcs_path = os.path.join(args.output_dir, new_dir_name)
+                                subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
+
+                        else:
                             model_cpu = copy.deepcopy(model).to("cpu")
-                            model_cpu.save_pretrained(local_output_dir, save_serialization=True)
-                            print(f"Uploading model to {args.output_dir}...", flush=True)
-                            subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
-                            # rename the directory on GCS to the model name, date, and epoch_step
-                            # Generate a new directory name with model name, date, and epoch_step
-                            new_dir_name = f"{args.model_name}_latest"
-                            new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                            subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
-
-                    else:
-                        model_cpu = copy.deepcopy(model).to("cpu")
-                        model_cpu.save_pretrained(args.output_dir, save_serialization=True)
-                    xm.rendezvous("after_save")
+                            model_cpu.save_pretrained(args.output_dir, save_serialization=True)
+                    xm.rendezvous("after_model_saving")
                 else:
-                    xm.rendezvous("before_save")
-                    xm.rendezvous("after_save")
+                    pass
 
             except Exception as e:
                 print(f"Error occurred during processing batch {step}: {e}", flush=True)
+                print("Full traceback:")
+                traceback.print_exc()
                 miss_steps += 1
                 continue
 
@@ -552,13 +831,10 @@ def train_fn(tokenized_dataset, device, args):
                 "val_perplexity": val_ppl,
                 "epoch": epoch,
                 "miss_steps": miss_steps
-            })
-
-        xm.rendezvous("syncing for next epoch.")
+            }, commit=True)
 
         # Save model checkpoint
         if global_ordinal() == 0:
-            xm.rendezvous("before_epoch_save")
             print("Saving model...", flush=True)
             if args.output_dir.startswith("gs://"):
                 with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
@@ -578,10 +854,8 @@ def train_fn(tokenized_dataset, device, args):
             else:
                 model_cpu = copy.deepcopy(model).to("cpu")
                 model_cpu.save_pretrained(args.output_dir, save_serialization=True)
-            xm.rendezvous("after_epoch_save")
         else:
-            xm.rendezvous("before_epoch_save")
-            xm.rendezvous("after_epoch_save")
+            pass
 
     # Finish wandb run
     if global_ordinal() == 0:
@@ -589,16 +863,23 @@ def train_fn(tokenized_dataset, device, args):
 
 def prep_and_train_fn(index, args):
     device = xm.xla_device()
+
+    # Verify all cores are participating
+    world_size_val = world_size()
+    ordinal = global_ordinal()
+
+    print(f"Process {index}: ordinal={ordinal}, world_size={world_size_val}, device={device}", flush=True)
+
+    xm.rendezvous("prep_start")
     tokenized_dataset = prep_fn(args)
+
+    xm.rendezvous("train_start")
     train_fn(tokenized_dataset, device, args)
 
 def evaluate(model, dataloader, device):
     model.eval()
     total_loss = 0.0
     total_steps = 0
-
-    # Synchronize all TPU cores before starting evaluation
-    xm.rendezvous("evaluation")
 
     # Loop over the validation set
     for batch in dataloader:
@@ -624,6 +905,7 @@ def evaluate(model, dataloader, device):
     # Now reduce across all TPU cores to get a "global" average
     # mesh_reduce can apply a function (here `np.mean`) over the local values
     global_avg_loss = xm.mesh_reduce("eval_loss", local_avg_loss, np.mean)
+    xm.mark_step()  # Ensure mesh_reduce operation is executed
 
     # Perplexity = exp(average cross-entropy loss)
     ppl = math.exp(global_avg_loss)
@@ -647,15 +929,21 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.001)
-    parser.add_argument("--logging_steps", type=int, default=100)
-    parser.add_argument("--save_epoch_percentage", type=float, default=0.5)
+    parser.add_argument("--lr_schedule", type=str, choices=["linear", "cosine"], default="linear", help="linear=warmup→decay; oscillatory=cosine‐restarts")
+    parser.add_argument("--num_cycles", type=float, default=10, help="number of cycles for oscillatory schedule (defaults to 10)")
+    parser.add_argument("--eta_min", type=float, default=1e-6,
+                        help="minimum LR for oscillatory schedule")
+    parser.add_argument("--max_grad_norm", type=float, default=14.4)
+    parser.add_argument("--mlm_probability", type=float, default=0.15)
+    parser.add_argument("--logging_steps", type=int, default=1_000)
+    parser.add_argument("--save_epoch_percentage", type=float, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_cores", type=int, default=8)
     parser.add_argument("--keep_in_memory", action='store_true')
     parser.add_argument("--streaming_data", action='store_true')
     parser.add_argument("--sharded_data", action='store_true')
-    parser.add_argument("--max_steps_per_epoch", type=int, default=None)
-    parser.add_argument("--shuffle_buffer_size", type=int, default=10_000)
+    parser.add_argument("--max_steps_per_epoch", type=int, default=50_000_000)
+    parser.add_argument("--shuffle_buffer_size", type=int, default=1_000)
     parser.add_argument("--shuffle_dataset_path", type=str, default="/home/bob/tmp/shuffle.parquet")
     parser.add_argument("--shuffle_dataset_ext", type=str, default=None)
     parser.add_argument("--shuffle_dataset", action='store_true')
@@ -664,6 +952,9 @@ def main():
     parser.add_argument("--checkpoint_path", type=str)
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
+    parser.add_argument("--huggingface_token", type=str, required=True)
+    parser.add_argument("--TPU_NAME", type=str, default="unknown, please set with --TPU_ID")
+    parser.add_argument("--TPU_DISK", type=str, default="unknown, please set with --TPU_DISK")
     args = parser.parse_args()
 
     # give error if both keep_in_memory and streaming_data are set to True
@@ -749,7 +1040,7 @@ def main():
             shutil.rmtree(shuffle_dir)
 
 
-    args.tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
+    args.tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name_or_path, token=args.huggingface_token)
     args.tokenizer.model_max_length = args.max_seq_length
     args.tokenizer.add_special_tokens({'pad_token': '<pad>'})
 
@@ -758,18 +1049,25 @@ def main():
             args.dataset_format = 'arrow'
             print("Continuing with Arrow format", flush=True)
 
-    sleep(20)
+    sleep(5)
 
     # Spawn processes
     print(f"Initializing TPU...with {args.num_cores} cores")
     print("Spawning processes...")
 
     if args.num_cores == 1:
-        print("Running single process...")
+        print("Running single process...", flush=True)
         prep_and_train_fn(0, args)
     else:
-        xmp.spawn(prep_and_train_fn, args=(args,))
-
+        # set TPU_NUM_DEVICES to args.num_cores
+        os.environ['TPU_NUM_DEVICES'] = str(args.num_cores)
+        # Ensure XLA uses all available cores
+        os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=' + str(args.num_cores)
+        try:
+            xmp.spawn(prep_and_train_fn, args=(args,), start_method='spawn')
+        except Exception as e:
+            print(f"Error spawning processes: {e}", flush=True)
+            raise e
 if __name__ == "__main__":
     print("Starting...")
     main()

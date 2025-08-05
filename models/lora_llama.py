@@ -1,58 +1,39 @@
-"""
-This is the main script to continue pre-training a Roberta model.
-"""
 import argparse
 import torch
-from typing import List, Dict, Any
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
-import torch_xla.distributed.xla_multiprocessing as xmp
-#import multiprocessing as mp
-#import torch.multiprocessing as torchmp
-#torchmp.set_sharing_strategy('file_system')
+import traceback
+import sys
 
-# Disable tqdm to avoid pickling issues with multiprocessing
-import os
-os.environ["TQDM_DISABLE"] = "1"
-os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
-os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
-
-# Additional tqdm disabling
+#import deepspeed
 try:
-    import tqdm
-    tqdm.tqdm.disable = True
-    # Monkey patch tqdm to prevent any progress bars
-    def dummy_tqdm(*args, **kwargs):
-        return iter(args[0]) if args else iter([])
-    tqdm.tqdm = dummy_tqdm
-    tqdm.trange = dummy_tqdm
-except ImportError:
-    pass
+    from torch_xla.runtime import world_size, global_ordinal
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    print("XLA import successful")
 
-# Disable datasets and transformers progress bars
-try:
-    import datasets
-    datasets.disable_progress_bar()
-except ImportError:
-    pass
-
-try:
-    import transformers
-    transformers.logging.set_verbosity_error()
-    transformers.utils.logging.disable_progress_bar()
-except ImportError:
-    pass
+    # Make `torch.xla` point at the installed torch_xla package
+    #import torch_xla
+    #torch.xla = torch_xla
+    #sys.modules["torch.xla"] = torch_xla
+except ImportError as e:
+    print(f"XLA import failed: {e}")
+    exit(1)
 
 from transformers import (
-BigBirdTokenizerFast,
-BigBirdConfig,
-BigBirdForMaskedLM,
-BigBirdForCausalLM,
-BigBirdForPreTraining,
+LlamaTokenizerFast,
+LlamaConfig,
+LlamaForCausalLM,
 DataCollatorForLanguageModeling
 )
-from transformers import Trainer, TrainingArguments
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    get_peft_model_state_dict,
+    prepare_model_for_kbit_training,
+    TaskType
+)
 
 from datasets import load_dataset, DatasetDict, DatasetInfo
 from safetensors.torch import load_file as load_safetensors
@@ -60,7 +41,6 @@ from safetensors.torch import load_file as load_safetensors
 import wandb
 import os
 import io
-import sys
 import tempfile
 import subprocess
 import copy
@@ -78,15 +58,14 @@ from functools import partial
 from itertools import chain
 
 from time import sleep
-from lazy_grouping import LazyGroupingDataset
 
-try:
-    os.environ.pop('TPU_PROCESS_ADDRESSES')
-    os.environ.pop('CLOUD_TPU_TASK_ID')
-except:
-    print("No TPU_PROCESS_ADDRESSES or CLOUD_TPU_TASK_ID to remove")
+# try:
+#     os.environ.pop('TPU_PROCESS_ADDRESSES')
+#     os.environ.pop('CLOUD_TPU_TASK_ID')
+# except:
+#     print("No TPU_PROCESS_ADDRESSES or CLOUD_TPU_TASK_ID to remove")
 
-print("TPU_NUM_DEVICES:", os.environ.get("TPU_NUM_DEVICES"), flush=True)
+print("TPU_NUM_DEVICES identified at system level:", os.environ.get("TPU_NUM_DEVICES"), flush=True)
 print("TPU_CHIPS_PER_HOST_BOUNDS:", os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS"), flush=True)
 
 worker_id = int(os.environ.get('TPU_WORKER_ID', '0'))
@@ -112,57 +91,6 @@ def shuffle_and_save_dataset(dataset, output_path, seed=None, shuffle=True):
     print("Saving shuffled data to disk", flush=True)
     shuffled_dataset.save_to_disk(output_path)
     print(f"Shuffled dataset saved to {output_path}", flush=True)
-
-class DataCollatorForBigBirdPreTraining:
-    def __init__(self, tokenizer, mlm_probability=0.15):
-        self.tokenizer = tokenizer
-        self.mlm_probability = mlm_probability
-        self.mlm_collator = DataCollatorForLanguageModeling(
-            tokenizer=tokenizer, mlm=True, mlm_probability=mlm_probability
-        )
-
-    def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, Any]:
-        # Prepare sentence pairs for NSP
-        input_ids = []
-        token_type_ids = []
-        attention_mask = []
-        next_sentence_label = []
-
-        # Shuffle for negative sampling
-        sentences = [ex["text"] for ex in examples]
-        for i, ex in enumerate(examples):
-            if random.random() < 0.5:
-                # Positive pair (next sentence is actual next)
-                first, second = ex["text_a"], ex["text_b"]
-                label = 0
-            else:
-                # Negative pair (next sentence is random)
-                first = ex["text_a"]
-                second = random.choice(sentences)
-                label = 1
-
-            encoded = self.tokenizer(
-                first, second,
-                truncation=True,
-                max_length=self.tokenizer.model_max_length,
-                padding="max_length",
-                return_tensors="pt"
-            )
-            input_ids.append(encoded["input_ids"][0])
-            token_type_ids.append(encoded["token_type_ids"][0])
-            attention_mask.append(encoded["attention_mask"][0])
-            next_sentence_label.append(label)
-
-        # MLM masking
-        batch = {
-            "input_ids": input_ids,
-            "token_type_ids": token_type_ids,
-            "attention_mask": attention_mask,
-        }
-        mlm_batch = self.mlm_collator([{"input_ids": ids} for ids in input_ids])
-        batch["labels"] = mlm_batch["labels"]
-        batch["next_sentence_label"] = torch.tensor(next_sentence_label)
-        return batch
 
 
 class ShardedShuffleDataset(torch.utils.data.IterableDataset):
@@ -196,6 +124,23 @@ class ShardedShuffleDataset(torch.utils.data.IterableDataset):
             items_yielded += 1
             yield buffer.pop(0)
 
+# def tokenize_function(examples, tokenizer, max_seq_length):
+#     # here you can actually add a chunker to split the text into smaller parts, of max_len
+#     output= tokenizer(examples["text"],
+#                     truncation=False,
+#                     max_length=max_seq_length,
+#                     padding="max_length",
+#                     return_overflowing_tokens=True,
+#                     return_length=True
+#     )
+#     input_batch = []
+#     for length, input_ids in zip(output['length'], output['input_ids']):
+#         input_batch.append({
+#             "input_ids": input_ids,
+#             "attention_mask": [1] * length
+#         })
+#     return {"input_ids": input_batch}
+
 def tokenize_function(examples, tokenizer, max_seq_length):
     # here you can actually add a chunker to split the text into smaller parts, of max_len
     return tokenizer(examples["text"],
@@ -225,9 +170,14 @@ def load_from_gcs(bucket_name, blob_name, local_path, device):
 
     return checkpoint
 
-def load_sharded_dataset(datasets, dformat):
-    num_shards = max(xm.xrt_world_size() , 16)
-    shard_idx = xm.get_ordinal()
+def load_sharded_dataset(datasets, dformat, args):
+    # For single process mode, use process-based indices instead of TPU core indices
+    if args.num_cores == 1:
+        num_shards = 1
+        shard_idx = 0
+    else:
+        num_shards = max(world_size() , 16)
+        shard_idx = global_ordinal()
 
     print(f"Sharding for shard index:{shard_idx} / {num_shards}")
 
@@ -249,7 +199,7 @@ def load_sharded_dataset(datasets, dformat):
     return DatasetDict(sharded_dataset)
 
 
-def group_texts(examples, max_seq_length, min_seq_length=32, pad_token=0):
+def group_texts(examples, max_seq_length, pad_token=0):
     """
     Group already tokenized texts into chunks of max_seq_length while respecting sample boundaries.
 
@@ -274,10 +224,6 @@ def group_texts(examples, max_seq_length, min_seq_length=32, pad_token=0):
 
         # Calculate how many chunks we need for this example
         example_length = len(current_example[sample_key])
-        # if less than args.min_tokens, skip
-        if example_length < min_seq_length:
-            continue
-
         num_chunks = (example_length + max_seq_length - 1) // max_seq_length  # Ceiling division
 
         # Split each feature into chunks
@@ -303,6 +249,17 @@ def group_texts(examples, max_seq_length, min_seq_length=32, pad_token=0):
     return result
 
 def prep_fn(args):
+    # For streaming data, each process needs to load and tokenize independently
+    # but we stagger the start times to avoid resource contention
+
+    # Stagger the start times to avoid all processes hitting the storage simultaneously
+    current_ordinal = global_ordinal()
+    stagger_delay = current_ordinal * 2  # 2 seconds per core
+
+    if stagger_delay > 0:
+        print(f"Process {current_ordinal}: Waiting {stagger_delay}s to stagger dataset loading...")
+        sleep(stagger_delay)
+
     # Load and tokenize dataset
     if args.pre_tokenized:
         datasets = {
@@ -310,7 +267,7 @@ def prep_fn(args):
             "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.{args.dataset_format}"
         }
         if args.streaming_data:
-            print("Loading pre-tokenized dataset, streaming with shuffle..", flush=True)
+            print(f"Process {current_ordinal}: Loading pre-tokenized streaming dataset...", flush=True)
             tokenized_dataset = load_dataset(
                     args.dataset_format,
                     data_files=datasets,
@@ -318,7 +275,7 @@ def prep_fn(args):
                     keep_in_memory=False,
                 ).shuffle(buffer_size=args.shuffle_buffer_size)
         else:
-            print("Loading pre-tokenized dataset, no streaming", flush=True)
+            print(f"Process {current_ordinal}: Loading pre-tokenized dataset...", flush=True)
             tokenized_dataset = load_dataset(
                 args.dataset_format,
                 data_files=datasets,
@@ -326,35 +283,36 @@ def prep_fn(args):
                 keep_in_memory=True,
             )
     else:
-        print(f"Tokenizing dataset... with streaming: {args.streaming_data} and keep_in_memory: {args.keep_in_memory}", flush=True)
+        print(f"Process {current_ordinal}: Loading raw dataset for tokenization...", flush=True)
         print(f"Dataset location: {args.dataset_dir}", flush=True)
 
         train_loc = "train" if not args.debug else "validation"
-
         datasets = {"train": args.dataset_dir+f"/{train_loc}/*.{args.dataset_format}",
                     "validation": args.dataset_dir+f"/validation/*.{args.dataset_format}"}
 
         if args.streaming_data:
             try:
-                ds_train_info = DatasetInfo.from_directory(args.dataset_dir+f"/{train_loc}/")
-                num_examples = ds_train_info['num_examples']
-                args.max_steps_per_epoch = num_examples // args.per_device_train_batch_size // max(xm.xrt_world_size(), 1)
+                if current_ordinal == 0:  # Only master process calculates this
+                    ds_train_info = DatasetInfo.from_directory(args.dataset_dir+f"/{train_loc}/")
+                    num_examples = ds_train_info['num_examples']
+                    args.max_steps_per_epoch = num_examples // args.per_device_train_batch_size // max(world_size(), 1)
+                    print(f"Maximum steps per epoch: {args.max_steps_per_epoch}", flush=True)
             except Exception as e:
                 print(f"Could not obtain datasetinfo:{e}")
                 pass
 
-            print("Init streaming dataset...", flush=True)
+            print(f"Process {current_ordinal}: Init streaming dataset...", flush=True)
             dataset = load_dataset(
                     args.dataset_format,
                     data_files=datasets,
                     streaming=True,
                     keep_in_memory=False
-                )#.shuffle(buffer_size=args.shuffle_buffer_size)
+                )
         else:
-            print("Init non-streaming dataset...", flush=True)
+            print(f"Process {current_ordinal}: Init non-streaming dataset...", flush=True)
             if args.sharded_data:
                 print("Sharding data...", flush=True)
-                dataset = load_sharded_dataset(datasets, args.dataset_format)
+                dataset = load_sharded_dataset(datasets, args.dataset_format, args)
             else:
                 dataset = load_dataset(
                         args.dataset_format,
@@ -363,35 +321,48 @@ def prep_fn(args):
                         keep_in_memory=True
                     )
 
-        opt_kwargs = {'num_proc': args.num_cores} if args.streaming_data==False else {}
-        print("Tokenizing dataset...", flush=True)
+        # For streaming data, don't use multiprocessing (num_proc=1 or omit)
+        # Each TPU core is already a separate process
+        print(f"Process {current_ordinal}: Tokenizing dataset...", flush=True)
         tokenize_fn = partial(tokenize_function, tokenizer=args.tokenizer, max_seq_length=args.max_seq_length)
-        tokenized_dataset_raw = dataset.map(tokenize_fn,
-                                         batched=True,
-                                         remove_columns=["text",
-                                                         "id",
-                                                         "source",
-                                                         "approx_token_counts_translated",
-                                                         "approx_token_counts_original"],
-                                         **opt_kwargs)
 
-        # If lazy grouping is enabled, return the raw tokenized dataset
-        if args.lazy_grouping:
-            print("Lazy grouping enabled. Grouping will be performed on-the-fly during training.", flush=True)
-            print(f"This will reduce startup time but may slightly impact training speed.", flush=True)
-            return tokenized_dataset_raw
+        # Remove num_proc for streaming to avoid conflicts
+        if args.streaming_data:
+            tokenized_dataset_raw = dataset.map(
+                tokenize_fn,
+                batched=True,
+                remove_columns=["text", "id", "source", "approx_token_counts_translated", "approx_token_counts_original"]
+            )
+        else:
+            tokenized_dataset_raw = dataset.map(
+                tokenize_fn,
+                batched=True,
+                remove_columns=["text", "id", "source", "approx_token_counts_translated", "approx_token_counts_original"],
+                num_proc=1  # Use single process to avoid conflicts
+            )
 
-        # Otherwise, perform grouping now as before
-        opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
-        print("Performing chunking tokenized data...", flush=True)
-        group_fn = partial(group_texts, max_seq_length=args.max_seq_length, min_seq_length=args.min_seq_length, pad_token=args.tokenizer.pad_token_id)
-        tokenized_dataset = tokenized_dataset_raw.map(
+        print(f"Process {current_ordinal}: Performing chunking tokenized data...", flush=True)
+        group_fn = partial(group_texts, max_seq_length=args.max_seq_length, pad_token=args.tokenizer.pad_token_id)
+
+        if args.streaming_data:
+            tokenized_dataset = tokenized_dataset_raw.map(group_fn, batched=True)
+        else:
+            tokenized_dataset = tokenized_dataset_raw.map(
                 group_fn,
                 batched=True,
-                **opt_kwargs
+                num_proc=1,
+                desc=f"Grouping texts in chunks of {args.max_seq_length}"
             )
+
         del tokenized_dataset_raw
+
+    print(f"Process {current_ordinal}: Dataset preparation complete", flush=True)
+
+    # Optional: Add a barrier to ensure all processes finish around the same time
+    xm.rendezvous("dataset_prep_complete")
+
     return tokenized_dataset
+
 
 def safe_iter(iterable):
     iterator = iter(iterable)
@@ -406,174 +377,189 @@ def safe_iter(iterable):
 
 def train_fn(tokenized_dataset, device, args):
     # Initialize wandb for the master process
-    if xm.get_ordinal() == 0: #.is_master_ordinal():
+    print(f"Process {global_ordinal()}: Starting train_fn...", flush=True)
+    if global_ordinal() == 0: #.is_master_ordinal():
         wandb.login(key=args.wandb_key)
+        wandb_config = {
+            "TPU ID": args.TPU_NAME,
+            "TPU DISK": args.TPU_DISK,
+            "learning_rate": args.learning_rate,
+            "architecture": "Llama 3.2 - 1B - LoRa",
+            "dataset": args.dataset_dir,
+            "epochs": args.num_train_epochs,
+            "weight_decay": args.weight_decay,
+            "max_seq_length": args.max_seq_length,
+            "batch_size": args.per_device_train_batch_size,
+        }
+
+        # Add LoRA-specific config if enabled
+        if args.use_lora:
+            wandb_config.update({
+                "use_lora": True,
+                "lora_r": args.lora_r,
+                "lora_alpha": args.lora_alpha,
+                "lora_dropout": args.lora_dropout,
+                "lora_target_modules": args.lora_target_modules,
+                "lora_bias": args.lora_bias,
+            })
+        else:
+            wandb_config["use_lora"] = False
+
         wandb.init(
-            project="BigBird TPU pretraining from scratch",
-            config={
-                "learning_rate": args.learning_rate,
-                "architecture": "BigBird",
-                "dataset": args.dataset_dir,
-                "epochs": args.num_train_epochs,
-                "weight_decay": args.weight_decay,
-                "max_seq_length": args.max_seq_length,
-                "batch_size": args.per_device_train_batch_size,
-                "lazy_grouping": args.lazy_grouping,
-                "mlm_probability": args.mlm_probability,
-            },
+            project="Llama 3.2 - 1B TPU CPT",
+            config=wandb_config,
             mode="online",
             dir="/home/bes3/temp"
         )
+        wandb.run.log_code(root="/home/bes3/models", name="cpt_llama")
 
     # Load model configuration
     #config = RobertaConfig.from_pretrained(args.model_name)
 
     # Load pre-trained model
-    xm.master_print("Loading the LM ...")
+    print(f"Process {global_ordinal()}: Loading the LM...", flush=True)
+    if isinstance(args.checkpoint_path, str) & (args.checkpoint_path != ""):
+        print(f"Process {global_ordinal()}: Loading model from checkpoint: {args.checkpoint_path}", flush=True)
 
+        #model_config = LlamaConfig.from_pretrained(args.model_name)
+        config = LlamaConfig.from_pretrained(args.model_name,
+            token=args.huggingface_token)
 
-    if args.checkpoint_handling in ['start_with_checkpoint', 'start_with_init']:
-        model_config = BigBirdConfig.from_pretrained(args.model_name)
-        model_config.bos_token_id = args.tokenizer.bos_token_id
-        model_config.eos_token_id = args.tokenizer.eos_token_id
-        model_config.pad_token_id = args.tokenizer.pad_token_id
-        model_config.cls_token_id = args.tokenizer.cls_token_id
-        model_config.sep_token_id = args.tokenizer.sep_token_id
-        model_config.mask_token_id = args.tokenizer.mask_token_id
-        model_config.vocab_size = args.tokenizer.vocab_size
+        # Create model with config (avoids meta parameters)
+        with torch.device("cpu"):
+            model = LlamaForCausalLM(config)
+        print(f"Process {global_ordinal()}: Empty model created on CPU", flush=True)
 
-        # Debug: Print all special token IDs
-        print(f"Tokenizer vocab_size: {args.tokenizer.vocab_size}")
-        print(f"Special token IDs:")
-        print(f"  bos_token_id: {model_config.bos_token_id}")
-        print(f"  eos_token_id: {model_config.eos_token_id}")
-        print(f"  pad_token_id: {model_config.pad_token_id}")
-        print(f"  cls_token_id: {model_config.cls_token_id}")
-        print(f"  sep_token_id: {model_config.sep_token_id}")
-        print(f"  mask_token_id: {model_config.mask_token_id}")
-
-        # Calculate max token ID and ensure vocab_size is large enough
-        special_token_ids = [
-            model_config.bos_token_id,
-            model_config.eos_token_id,
-            model_config.pad_token_id,
-            model_config.cls_token_id,
-            model_config.sep_token_id,
-            model_config.mask_token_id
-        ]
-        # Filter out None values
-        special_token_ids = [tid for tid in special_token_ids if tid is not None]
-
-        if special_token_ids:
-            max_token_id = max(special_token_ids)
-            print(f"Max special token ID: {max_token_id}")
-
-            if model_config.vocab_size <= max_token_id:
-                new_vocab_size = max_token_id + 1
-                print(f"Increasing vocab size from {model_config.vocab_size} to {new_vocab_size}")
-                model_config.vocab_size = new_vocab_size
-
-        model_config.num_hidden_layers = args.num_hidden_layers
-        model_config.num_attention_heads = args.num_attention_heads
-        model_config.hidden_size = args.hidden_size
-        model_config.intermediate_size = args.intermediate_size
-        model_config.max_position_embeddings = args.max_seq_length
-
-        if args.causal_training==True:
-            model = BigBirdForCausalLM(model_config)
+        if args.checkpoint_path.startswith('gs://'):
+            # Parse GCS path
+            bucket_name = args.checkpoint_path.split('/')[2]
+            blob_name = '/'.join(args.checkpoint_path.split('/')[3:])
+            local_path = f'/tmp/checkpoint.{args.checkpoint_path.split(".")[-1]}'  # Temporary local path to store the downloaded file
+            checkpoint = load_from_gcs(bucket_name,
+                                       blob_name,
+                                       local_path,
+                                       device)
+            sleep(1)
+            print(f"Process {global_ordinal()}: Checkpoint downloaded...", flush=True)
+            xm.rendezvous("checkpoint_downloaded")
         else:
-            model = BigBirdForPreTraining(model_config)
-
-        # print tokenizer len model vocab
-        print(f"Tokenizer length: {len(args.tokenizer)}")
-        print(f"Model vocab size: {model.config.vocab_size}")
-
-        if isinstance(args.checkpoint_path, str) & (args.checkpoint_path != ""):
-            if args.checkpoint_path.startswith('gs://'):
-                # Parse GCS path
-                bucket_name = args.checkpoint_path.split('/')[2]
-                blob_name = '/'.join(args.checkpoint_path.split('/')[3:])
-                local_path = f'/tmp/checkpoint.{args.checkpoint_path.split(".")[-1]}'  # Temporary local path to store the downloaded file
-                checkpoint = load_from_gcs(bucket_name,
-                                        blob_name,
-                                        local_path,
-                                        device)
+            if args.checkpoint_path.endswith('.safetensors'):
+                checkpoint = load_safetensors(args.checkpoint_path, device=device)
             else:
-                if args.checkpoint_path.endswith('.safetensors'):
-                    checkpoint = load_safetensors(args.checkpoint_path, device=device)
-                else:
-                    checkpoint = torch.load(args.checkpoint_path, map_location=device)
+                checkpoint = torch.load(args.checkpoint_path, map_location=device)
+            sleep(1)
+            print(f"Process {global_ordinal()}: Checkpoint downloaded...", flush=True)
+            xm.rendezvous("checkpoint_downloaded")
 
 
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'], strict=True)
-            else:
-                model.load_state_dict(checkpoint, strict=True)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
         else:
-            pass
-    elif args.checkpoint_handling == 'start_with_basemodel':
-        if args.causal_training:
-            model = BigBirdForCausalLM.from_pretrained(args.model_name)
-        else:
-            model = BigBirdForPreTraining.from_pretrained(args.model_name)
-        # model.resize_token_embeddings(args.tokenizer.vocab_size)
-    else:
-        raise ValueError("Checkpoint handling should be one of ['start_with_init','start_with_base', 'start_with_checkpoint']")
+            model.load_state_dict(checkpoint)
 
-    model = model.to(device=device, dtype=torch.bfloat16)
-
-    # Set up data collator
-    xm.master_print("Setting up data collator...")
-    if args.causal_training:
-        data_collator = DataCollatorForLanguageModeling(
-                    tokenizer=args.tokenizer,
-                    mlm=False
-                )
+        sleep(1)
+        print(f"Process {global_ordinal()}: Checkpoint loaded in memory..", flush=True)
     else:
-        data_collator = DataCollatorForBigBirdPreTraining(
-            tokenizer=args.tokenizer,
-            mlm_probability=args.mlm_probability
+        with torch.device("cpu"):
+            model = LlamaForCausalLM.from_pretrained(args.model_name,
+                token=args.huggingface_token,
+                device_map=None,
+                _fast_init=False,
+                low_cpu_mem_usage=False
+            )
+
+    # Apply LoRA if requested
+    if args.use_lora:
+        print(f"Process {global_ordinal()}: Applying LoRA configuration...", flush=True)
+
+        # Configure LoRA
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=args.lora_target_modules,
+            lora_dropout=args.lora_dropout,
+            bias=args.lora_bias,
+            task_type=TaskType.CAUSAL_LM,
         )
+
+        # Apply LoRA to the model
+        model = get_peft_model(model, lora_config)
+
+        # Print trainable parameters info
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Process {global_ordinal()}: Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.2f}%)", flush=True)
+        print(f"Process {global_ordinal()}: Total parameters: {total_params:,}", flush=True)
+
+        if global_ordinal() == 0:
+            model.print_trainable_parameters()
+
+    xm.rendezvous("checkpoint_loaded_in_memory")
+    for i in range(world_size()):
+        if global_ordinal() == i:
+            print(f"Process {global_ordinal()}: My turn to load model to TPU device {device}...", flush=True)
+            try:
+                model = model.to(device=device, dtype=torch.bfloat16)
+                # model.gradient_checkpointing_enable()
+                print(f"Process {global_ordinal()}: Checkpoint loaded on device successfully", flush=True)
+            except Exception as e:
+                print(f"Process {global_ordinal()}: Error loading model to device: {e}", flush=True)
+                raise
+
+        # Wait for current process to finish before next one starts
+        xm.rendezvous(f"model_to_device_{i}")
+
+    print(f"Process {global_ordinal()}: All models loaded to devices", flush=True)
+
+    # print("After checkpointing, model on device:", next(model.parameters()).device, flush=True)
+    # if hasattr(model, 'tie_weights'):
+    #     model.tie_weights()
+    # Set up data collator
+    print(f"Process: {global_ordinal()}. Setting up data collator.")
+    data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
+                                                    mlm=False)
+    xm.rendezvous("datacollator")
 
     # Decide on distributed sampler parameters:
     if args.num_cores == 1:
         sampler_rank = 0
         sampler_replicas = 1
     else:
-        sampler_rank = xm.get_ordinal()
-        sampler_replicas = xm.xrt_world_size()
+        sampler_rank = global_ordinal()
+        sampler_replicas = world_size()
+
+    print(f"Process {global_ordinal()}: About to create DataLoader...", flush=True)
 
     # Create sampler
     distributed_sampler = False
     if args.streaming_data:
-        xm.master_print("Instantiate sharded dataset...")
-        num_shards = xm.xrt_world_size()  # Total number of TPU cores (or processes)
-        shard_id = xm.get_ordinal()  # Unique id for the current process
-        print(f"Num shards: {num_shards}, shard id: {shard_id}")
-        #num_shards = xm.xrt_world_size()
-        #shard_id = xm.get_ordinal()
-        sharded_train_dataset = tokenized_dataset["train"].shard(num_shards=num_shards, index=shard_id)
+        print(f"Process {global_ordinal()}: Creating sharded dataset...", flush=True)
 
-        # Apply lazy grouping if enabled
-        if args.lazy_grouping and not args.pre_tokenized:
-            print(f"Applying lazy grouping to sharded dataset for worker {shard_id}...", flush=True)
-            _sharded_train_dataset = LazyGroupingDataset(
-                sharded_train_dataset,
-                max_seq_length=args.max_seq_length,
-                pad_token=args.tokenizer.pad_token_id,
-                batch_size=args.per_device_train_batch_size,
-                streaming=args.streaming_data
-            )
+        # For single process mode, use process-based indices instead of TPU core indices
+        if args.num_cores == 1:
+            num_shards = 1
+            shard_id = 0
         else:
-            _sharded_train_dataset = sharded_train_dataset
+            num_shards = world_size()  # Total number of TPU cores (or processes)
+            shard_id = global_ordinal()  # Unique id for the current process
+        print(f"Process {global_ordinal()}: Num shards: {num_shards}, shard id: {shard_id}", flush=True)
 
-        xm.master_print("Starting the streaming DataLoader...")
+        try:
+            sharded_train_dataset = tokenized_dataset["train"].shard(num_shards=num_shards, index=shard_id)
+            print(f"Process {global_ordinal()}: Sharded dataset created successfully", flush=True)
+        except Exception as e:
+            print(f"Process {global_ordinal()}: Error creating sharded dataset: {e}", flush=True)
+            raise
+
+        print(f"Process {global_ordinal()}: Creating streaming DataLoader...", flush=True)
 
         train_dataloader = torch.utils.data.DataLoader(
-            _sharded_train_dataset,
+            sharded_train_dataset,
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
-            num_workers=0
+            num_workers=0,
+            pin_memory=False,
+            drop_last=True
         )
     else:
         xm.master_print("Starting the DistributedSampler...")
@@ -603,17 +589,56 @@ def train_fn(tokenized_dataset, device, args):
         gc.collect()
 
     xla_train_loader = pl.MpDeviceLoader(train_dataloader, xm.xla_device())
+    print(f"XLA device is: {xm.xla_device()}")
     xla_validation_loader = pl.MpDeviceLoader(validation_dataloader, xm.xla_device())
 
+    xm.rendezvous("data_loader")
+
     # Set up optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    if args.use_lora:
+        # Only optimize LoRA parameters
+        optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                                    lr=args.learning_rate, weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    #optimizer = torch.optim.Adafactor(model.parameters(), lr=args.learning_rate, #weight_decay=args.weight_decay, scale_parameter=False, relative_step=False)
+
     steps_per_epoch = args.max_steps_per_epoch if args.streaming_data else len(train_dataloader)
-    save_steps = args.save_epoch_percentage if args.save_epoch_percentage>1. else int(steps_per_epoch * args.save_epoch_percentage)
+    save_steps = int(steps_per_epoch * args.save_epoch_percentage)
     total_steps = steps_per_epoch * args.num_train_epochs
     #scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=total_steps)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
 
-    if xm.get_ordinal() == 0: # xm.is_master_ordinal():
+    if args.lr_schedule == 'linear':
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
+    else:
+        scheduler = get_cosine_schedule_with_warmup(optimizer,
+            num_warmup_steps=args.num_warmup_steps,
+            num_training_steps=total_steps,
+            num_cycles=args.num_cycles)
+
+    # ds_config = {
+    #     "zero_optimization": {
+    #         "stage": 3,
+    #         "offload_param": {
+    #             "device": "cpu"
+    #         }
+    #     },
+    #     "bf16": {
+    #         "enabled": True
+    #     }
+    # }
+
+    # # Replace model, optimizer, scheduler with a DeepSpeed engine
+    # model, optimizer, _, scheduler = deepspeed.initialize(
+    #     model=model,
+    #     optimizer=optimizer,
+    #     lr_scheduler=scheduler,
+    #     config=ds_config
+    # )
+
+    xm.rendezvous("start_training")
+    if global_ordinal() == 0: # xm.is_master_ordinal():
         print("Starting training...", flush=True)
         print(f"Total steps: {total_steps}", flush=True)
         print(f"Total epochs: {args.num_train_epochs}", flush=True)
@@ -624,7 +649,9 @@ def train_fn(tokenized_dataset, device, args):
     miss_steps = 0
     print(f"ENTERING THE TRAINING LOOP with: {args.num_train_epochs} epochs", flush=True)
     for epoch in range(args.num_train_epochs):
-        print(f"Starting with epoch {epoch}...", flush=True)
+        xm.rendezvous(f"start_epoch_{epoch}")
+        print(f"Starting with epoch {epoch}...for process {global_ordinal()}", flush=True)
+
         total_loss = 0.
         sub_total_loss = 0.
         sub_step = 0
@@ -634,49 +661,51 @@ def train_fn(tokenized_dataset, device, args):
             train_sampler.set_epoch(epoch)
             print("done with setting epoch..", flush=True)
 
-        RENDEZVOUS_FLAGS = {
-            "optimizer_step": 1,
-            "logging_pre": 2,
-            "logging_post": 4,
-            "before_save": 8,
-            "after_save": 16
-        }
-
         print(f"Entering data loader iterator for epoch {epoch}...", flush=True)
         step = -1
         for step, batch in enumerate(safe_iter(xla_train_loader)):
-            completed_rendezvous = 0
-            exception_occurred = False
             try:
                 batch = {k: v.to(device=device, dtype=torch.bfloat16) if v.dtype==torch.float32 else v.to(device) for k, v in batch.items()}
-                if args.causal_training:
-                    outputs = model(**batch)
-                else:
-                    outputs = model(**batch, next_sentence_label=batch.get('next_sentence_label'))
-                loss = outputs.loss/args.gradient_accumulation_steps
-
-                if torch.isnan(loss):
+                loss = model(**batch).loss / args.gradient_accumulation_steps
+                nan = torch.isnan(loss)
+                if nan:
                     optimizer.zero_grad(set_to_none=True)
-                    raise ValueError("NaN loss detected")
+                    print(f"[Rank {global_ordinal()}] NaN loss; skipping backward but keeping sync", flush=True)
+                    loss = torch.nan_to_num(loss, nan=0.0)
+
                 loss.backward()
 
                 total_loss += loss.item()*args.gradient_accumulation_steps
                 sub_total_loss += loss.item()*args.gradient_accumulation_steps
 
                 if  (step+1) % args.gradient_accumulation_steps == 0:
-                    xm.optimizer_step(optimizer)
+                    #model.step()              # does optimizer_step + zero_grad via DeepSpeed
+                    #print(f"[Rank {global_ordinal()}] Performing optimization", flush=True)
+                    # Add before clipping
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    if grad_norm > args.max_grad_norm:
+                        print(f"[Rank {global_ordinal()}] Gradient norm {grad_norm:.2f} was clipped to {args.max_grad_norm}")
+                    # reactivate grad norm later
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    xm.optimizer_step(optimizer, barrier=True)
                     scheduler.step()
+                    xm.mark_step()
                     optimizer.zero_grad()
-                    xm.rendezvous("optimizer_step")
-                    completed_rendezvous |= RENDEZVOUS_FLAGS["optimizer_step"]
+                    #xm.clear_all_gradients()
 
                     total_step += args.gradient_accumulation_steps
 
+                #xm.mark_step()
+                    #xm.clear_all_gradients()       # drops stale XLA gradient buffers
+
+                #if (step+1) %  (args.gradient_accumulation_steps - 1)== 0:
+                    #mem = xm.get_memory_info(xm.xla_device())
+                    #print(f"[Rank {global_ordinal()}] Free HBM: {','.join([str(round(m/1e6,3)) for m in mem.values()])} GB")
+
                 if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
-                    xm.rendezvous("logging, pre")
-                    completed_rendezvous |= RENDEZVOUS_FLAGS["logging_pre"]
-                    local_avg_loss = total_loss / step
-                    local_avg_loss_N = sub_total_loss / sub_step
+                    local_avg_loss = total_loss / (step + 1)
+                    local_avg_loss_N = sub_total_loss / max(sub_step, 1)
+
                     global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
                     global_avg_loss_N = xm.mesh_reduce("loss_N", local_avg_loss_N, np.mean)
 
@@ -686,7 +715,8 @@ def train_fn(tokenized_dataset, device, args):
                     sub_step = 0
                     sub_total_loss = 0.
 
-                    if xm.get_ordinal() ==0:
+                    xm.rendezvous("before_wandb_log")
+                    if global_ordinal() ==0:
                         print(f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}", flush=True)
                         wandb.log({
                             "train_global_average_loss": global_avg_loss,
@@ -696,22 +726,22 @@ def train_fn(tokenized_dataset, device, args):
                             "epoch": epoch,
                             "step": step,
                             "total_step": total_step
-                        })
-                    xm.rendezvous("logging, post")
-                    completed_rendezvous |= RENDEZVOUS_FLAGS["logging_post"]
-
+                        }, commit = False)
+                    xm.rendezvous("after_wandb_log")
                 if args.debug:
                     break
 
-                total_step += 1
+                #total_step += 1
                 sub_step +=1
 
-
-                if  ((step+1) % save_steps == 0):
-                    xm.rendezvous("before_save")
-                    completed_rendezvous |= RENDEZVOUS_FLAGS["before_save"]
-                    if (xm.get_ordinal() ==0):
+                if ((step+1) % save_steps == 0):
+                    xm.rendezvous("before_model_saving")
+                    if (global_ordinal() ==0):
                         print("Saving model...", flush=True)
+
+                        wandb.log({"epoch_done": epoch}, commit=True)
+                        wandb.finish()
+
                         if args.output_dir.startswith("gs://"):
                             with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
                                 local_output_dir = tmpdirname
@@ -724,96 +754,50 @@ def train_fn(tokenized_dataset, device, args):
                                 # Generate a new directory name with model name, date, and epoch_step
                                 new_dir_name = f"{args.model_name}_latest"
                                 new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                                subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir, "*"), new_gcs_path], check=True)
+                                subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
 
                         else:
                             model_cpu = copy.deepcopy(model).to("cpu")
                             model_cpu.save_pretrained(args.output_dir, save_serialization=True)
-                    xm.rendezvous("after_save")
-                    completed_rendezvous |= RENDEZVOUS_FLAGS["after_save"]
+                    xm.rendezvous("after_model_saving")
                 else:
-                    xm.rendezvous("before_save")
-                    completed_rendezvous |= RENDEZVOUS_FLAGS["before_save"]
-                    xm.rendezvous("after_save")
-                    completed_rendezvous |= RENDEZVOUS_FLAGS["after_save"]
+                    pass
 
             except Exception as e:
-                exception_occurred = True
                 print(f"Error occurred during processing batch {step}: {e}", flush=True)
+                print("Full traceback:")
+                traceback.print_exc()
                 miss_steps += 1
-
-            # Synchronize states using separate reductions
-            error_flag = torch.tensor(1.0 if exception_occurred else 0.0, device=device)
-            completed_flag = torch.tensor(float(completed_rendezvous), device=device)
-
-            total_errors = xm.all_reduce(xm.REDUCE_SUM, error_flag)
-            min_completed = xm.all_reduce(xm.REDUCE_MIN, completed_flag)
-
-            error_count = total_errors.item()
-            min_completed_flags = int(min_completed.item())
-            if error_count > 0:
-                print(f"Core {xm.get_ordinal()}: {int(error_count)} cores had errors", flush=True)
-                # Find the minimum set of rendezvous that ALL cores completed
-                my_completed = completed_rendezvous
-                # Determine which rendezvous calls this core still needs to participate in
-                missing_flags = min_completed_flags & (~my_completed)
-                if (missing_flags & RENDEZVOUS_FLAGS["optimizer_step"]) and (step+1) % args.gradient_accumulation_steps == 0:
-                    print(f"Core {xm.get_ordinal()}: Catching up on optimizer_step rendezvous")
-                    xm.rendezvous("optimizer_step")
-
-                if (missing_flags & RENDEZVOUS_FLAGS["logging_pre"]) and (step+1) % args.logging_steps == 0:
-                    print(f"Core {xm.get_ordinal()}: Catching up on logging_pre rendezvous")
-                    xm.rendezvous("logging, pre")
-
-                if (missing_flags & RENDEZVOUS_FLAGS["logging_post"]) and (step+1) % args.logging_steps == 0:
-                    print(f"Core {xm.get_ordinal()}: Catching up on logging_post rendezvous")
-                    xm.rendezvous("logging, post")
-
-                if (missing_flags & RENDEZVOUS_FLAGS["before_save"]):
-                    print(f"Core {xm.get_ordinal()}: Catching up on before_save rendezvous")
-                    xm.rendezvous("before_save")
-
-                if (missing_flags & RENDEZVOUS_FLAGS["after_save"]):
-                    print(f"Core {xm.get_ordinal()}: Catching up on after_save rendezvous")
-                    xm.rendezvous("after_save")
-
-                continue  # All cores skip this step after synchronizing
-
-
-            if step % args.synchronization_steps == 0:  # synchronize very synch steps
-                xm.rendezvous(f"periodic_sync_step_{step}")
-
+                continue
 
             if (step+1) % steps_per_epoch == 0:
-                # Synchronize all processes at the end of each training epoch
-                xm.rendezvous("end_of_epoch")
-                print(f"Worker {xm.get_ordinal()} completed epoch {epoch}", flush=True)
                 break
-
-        xm.rendezvous("syncing for next epoch, before validation.")
 
         val_ppl = evaluate(model, xla_validation_loader, device)
 
-        xm.rendezvous("syncing for next epoch, after validation.")
-
-        if xm.get_ordinal() == 0:
+        if global_ordinal() == 0:
             wandb.log({
                 "val_perplexity": val_ppl,
                 "epoch": epoch,
                 "miss_steps": miss_steps
-            })
+            }, commit=True)
 
-
-        xm.rendezvous("before_epoch_save")
         # Save model checkpoint
-        if xm.get_ordinal() == 0:
+        if global_ordinal() == 0:
             print("Saving model...", flush=True)
             if args.output_dir.startswith("gs://"):
                 with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
                     local_output_dir = tmpdirname
                     print(f"Saving model to {local_output_dir}...", flush=True)
                     model_cpu = copy.deepcopy(model).to("cpu")
-                    model_cpu.save_pretrained(local_output_dir, save_serialization=True)
+                    if args.use_lora:
+                        # Save only LoRA adapters
+                        model_cpu.save_pretrained(local_output_dir, save_serialization=True)
+                        # Also save the LoRA state dict separately for convenience
+                        lora_state_dict = get_peft_model_state_dict(model_cpu)
+                        torch.save(lora_state_dict, os.path.join(local_output_dir, "lora_weights.pt"))
+                    else:
+                        model_cpu.save_pretrained(local_output_dir, save_serialization=True)
                     print(f"Uploading model to {args.output_dir}...", flush=True)
                     subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
                     # rename the directory on GCS to the model name, date, and epoch_step
@@ -825,40 +809,40 @@ def train_fn(tokenized_dataset, device, args):
                     subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
             else:
                 model_cpu = copy.deepcopy(model).to("cpu")
-                model_cpu.save_pretrained(args.output_dir, save_serialization=True)
-        xm.rendezvous("after_epoch_save")
+                if args.use_lora:
+                    # Save only LoRA adapters
+                    model_cpu.save_pretrained(args.output_dir, save_serialization=True)
+                    # Also save the LoRA state dict separately for convenience
+                    lora_state_dict = get_peft_model_state_dict(model_cpu)
+                    torch.save(lora_state_dict, os.path.join(args.output_dir, "lora_weights.pt"))
+                else:
+                    model_cpu.save_pretrained(args.output_dir, save_serialization=True)
+        else:
+            pass
 
     # Finish wandb run
-    if xm.get_ordinal() == 0:
+    if global_ordinal() == 0:
         wandb.finish()
 
 def prep_and_train_fn(index, args):
-    if not xm.xla_device():
-        raise RuntimeError("TPU not available!")
-
-
-    print(f"Process rank: {index}")
-
     device = xm.xla_device()
-    # Ensure TPU is available
-    #
-    print(f"Process {index} using device: {device}", flush=True)
-    print(f"Global ordinal: {xm.get_ordinal()}, World size: {xm.xrt_world_size()}", flush=True)
 
-    # Initialize tokenizer inside spawned process to avoid pickling issues
-    args.tokenizer = BigBirdTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
-    args.tokenizer.model_max_length = args.max_seq_length
+    # Verify all cores are participating
+    world_size_val = world_size()
+    ordinal = global_ordinal()
 
+    print(f"Process {index}: ordinal={ordinal}, world_size={world_size_val}, device={device}", flush=True)
+
+    xm.rendezvous("prep_start")
     tokenized_dataset = prep_fn(args)
+
+    xm.rendezvous("train_start")
     train_fn(tokenized_dataset, device, args)
 
 def evaluate(model, dataloader, device):
     model.eval()
     total_loss = 0.0
     total_steps = 0
-
-    # Synchronize all TPU cores before starting evaluation
-    xm.rendezvous("evaluation")
 
     # Loop over the validation set
     for batch in dataloader:
@@ -884,6 +868,7 @@ def evaluate(model, dataloader, device):
     # Now reduce across all TPU cores to get a "global" average
     # mesh_reduce can apply a function (here `np.mean`) over the local values
     global_avg_loss = xm.mesh_reduce("eval_loss", local_avg_loss, np.mean)
+    xm.mark_step()  # Ensure mesh_reduce operation is executed
 
     # Perplexity = exp(average cross-entropy loss)
     ppl = math.exp(global_avg_loss)
@@ -898,45 +883,53 @@ def main():
     parser.add_argument("--dataset_format", default="json", choices=["json", "parquet", "arrow"])
     parser.add_argument("--tmp_dir", type=str, required=True)
     parser.add_argument("--tokenizer_name_or_path", type=str, required=True)
+    parser.add_argument("--max_seq_length", type=int, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--pre_tokenized", action='store_true', default=False)
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
-    parser.add_argument("--mlm_probability", type=float, default=0.25)
-    parser.add_argument("--causal_training", action='store_true', default=False)
-    parser.add_argument("--max_seq_length", type=int, default=512)
-    parser.add_argument("--min_seq_length", type=int, default=32)
-    parser.add_argument("--hidden_size", type=int, default=768)
-    parser.add_argument("--intermediate_size", type=int, default=3072)
-    parser.add_argument("--num_attention_heads", type=int, default=12)
-    parser.add_argument("--num_hidden_layers", type=int, default=12)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--num_warmup_steps", type=int, default=1000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.001)
-    parser.add_argument("--logging_steps", type=int, default=100)
-    parser.add_argument("--save_epoch_percentage", type=float, default=0.05)
+    parser.add_argument("--lr_schedule", type=str, choices=["linear", "cosine"], default="linear", help="linear=warmup→decay; oscillatory=cosine‐restarts")
+    parser.add_argument("--num_cycles", type=float, default=10, help="number of cycles for oscillatory schedule (defaults to 10)")
+    parser.add_argument("--eta_min", type=float, default=1e-6,
+                        help="minimum LR for oscillatory schedule")
+    parser.add_argument("--max_grad_norm", type=float, default=14.0)
+    parser.add_argument("--mlm_probability", type=float, default=0.15)
+    parser.add_argument("--logging_steps", type=int, default=1_000)
+    parser.add_argument("--save_epoch_percentage", type=float, default=1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_cores", type=int)
+    parser.add_argument("--num_cores", type=int, default=8)
     parser.add_argument("--keep_in_memory", action='store_true')
     parser.add_argument("--streaming_data", action='store_true')
     parser.add_argument("--sharded_data", action='store_true')
-    parser.add_argument("--max_steps_per_epoch", type=int, default=None)
-    parser.add_argument("--shuffle_buffer_size", type=int, default=10_000)
+    parser.add_argument("--max_steps_per_epoch", type=int, default=50_000_000)
+    parser.add_argument("--shuffle_buffer_size", type=int, default=1_000)
     parser.add_argument("--shuffle_dataset_path", type=str, default="/home/bob/tmp/shuffle.parquet")
     parser.add_argument("--shuffle_dataset_ext", type=str, default=None)
     parser.add_argument("--shuffle_dataset", action='store_true')
     parser.add_argument("--shuffle_force_update", action='store_true')
     parser.add_argument("--debug", action='store_true')
     parser.add_argument("--checkpoint_path", type=str)
-    parser.add_argument("--checkpoint_handling", type=str, choices=['start_with_checkpoint', 'start_with_basemodel', 'start_with_init'])
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
-    parser.add_argument("--lazy_grouping", action='store_true', help="Use lazy grouping to process data on-the-fly during training (incompatible with --pre_tokenized)")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
-    parser.add_argument("--synchronization_steps", type=int, default=256)
-    args = parser.parse_args()
+    parser.add_argument("--huggingface_token", type=str, required=True)
+    parser.add_argument("--TPU_NAME", type=str, default="unknown, please set with --TPU_ID")
+    parser.add_argument("--TPU_DISK", type=str, default="unknown, please set with --TPU_DISK")
 
-    #mp.set_start_method('fork', force=True)
+    # LoRA-specific arguments
+    parser.add_argument("--use_lora", action='store_true', default=False, help="Enable LoRA fine-tuning")
+    parser.add_argument("--lora_r", type=int, default=32, help="LoRA attention dimension")
+    parser.add_argument("--lora_alpha", type=int, default=64, help="LoRA scaling parameter")
+    parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout probability")
+    parser.add_argument("--lora_target_modules", type=str, nargs='+',
+                        default=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                        help="Target modules for LoRA adaptation")
+    parser.add_argument("--lora_bias", type=str, default="none", choices=["none", "all", "lora_only"],
+                        help="Bias type for LoRA")
+    args = parser.parse_args()
 
     # give error if both keep_in_memory and streaming_data are set to True
     # as they are mutually exclusive
@@ -945,9 +938,6 @@ def main():
 
     if args.streaming_data==True and args.shuffle_buffer_size is None:
         raise ValueError("shuffle_buffer_size is required when streaming_data is set to True.")
-
-    if args.lazy_grouping and args.pre_tokenized:
-        raise ValueError("lazy_grouping cannot be used with pre_tokenized data. Lazy grouping requires raw tokenized data to group on-the-fly.")
 
     # Set the same seed for all processes
     torch.manual_seed(args.seed)
@@ -1023,54 +1013,35 @@ def main():
             print(f"Removing shuffled dataset: {shuffle_dir}", flush=True)
             shutil.rmtree(shuffle_dir)
 
-    # Remove tokenizer initialization from main process - moved to prep_and_train_fn
-    # args.tokenizer = BigBirdTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
-    # args.tokenizer.model_max_length = args.max_seq_length
+
+    args.tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name_or_path, token=args.huggingface_token)
+    args.tokenizer.model_max_length = args.max_seq_length
+    args.tokenizer.add_special_tokens({'pad_token': '<pad>'})
 
     if args.shuffle_dataset:
             args.dataset_dir = args.shuffle_dataset_path
             args.dataset_format = 'arrow'
             print("Continuing with Arrow format", flush=True)
 
-    sleep(20)
+    sleep(5)
 
     # Spawn processes
     print(f"Initializing TPU...with {args.num_cores} cores")
     print("Spawning processes...")
 
     if args.num_cores == 1:
-        print("Running single process...")
-        # Initialize tokenizer for single process mode
-        args.tokenizer = BigBirdTokenizerFast.from_pretrained(args.tokenizer_name_or_path)
-        args.tokenizer.model_max_length = args.max_seq_length
+        print("Running single process...", flush=True)
         prep_and_train_fn(0, args)
     else:
+        # set TPU_NUM_DEVICES to args.num_cores
+        os.environ['TPU_NUM_DEVICES'] = str(args.num_cores)
+        # Ensure XLA uses all available cores
+        os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=' + str(args.num_cores)
         try:
-            xmp.spawn(prep_and_train_fn, args=(args,), nprocs=None)
-        except AttributeError as e:
-            if "_lock" in str(e):
-                print(f"Caught tqdm pickling error: {e}", flush=True)
-                print("Trying to clean up any remaining tqdm instances...", flush=True)
-
-                # Additional cleanup
-                import gc
-                for obj in gc.get_objects():
-                    try:
-                        if hasattr(obj, '__class__') and 'tqdm' in str(obj.__class__):
-                            if hasattr(obj, 'close'):
-                                obj.close()
-                    except:
-                        pass
-
-                # Force garbage collection
-                gc.collect()
-
-                # Retry spawn
-                print("Retrying xmp.spawn...", flush=True)
-                xmp.spawn(prep_and_train_fn, args=(args,), nprocs=None)
-            else:
-                raise e
-
+            xmp.spawn(prep_and_train_fn, args=(args,), start_method='spawn')
+        except Exception as e:
+            print(f"Error spawning processes: {e}", flush=True)
+            raise e
 if __name__ == "__main__":
     print("Starting...")
     main()

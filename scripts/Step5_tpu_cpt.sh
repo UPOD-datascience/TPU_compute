@@ -1,7 +1,9 @@
 #!/bin/bash#
-# set -o allexport
-# source ../.cpt.env
-# set +o allexport
+set -o allexport
+source ../.llama.env
+set +o allexport
+
+ENV=".llama.env"
 
 echo "Setting environment variables..."
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -17,8 +19,15 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --worker=all \
     --command="rm -rf /home/${USERNAME}/.cache/*; rm ~/logs.txt"
 
+echo "Uploading ${ENV} as .env and training wrapper script... (TPU_NAME=${TPU_NAME}, ZONE=${ZONE}, PROJECT_ID=${PROJECT_ID}, USERNAME=${USERNAME})"
+# Copy .longformer.env to .env on the remote
+gcloud compute tpus tpu-vm scp ../${ENV} ${TPU_NAME}:/home/${USERNAME}/.env \
+    --zone=${ZONE} \
+    --project=${PROJECT_ID} \
+    --worker=all
+
 echo "Uploading .env and training wrapper script..."
-gcloud compute tpus tpu-vm scp ../.cpt.env cpt_wrapper.sh ${TPU_NAME}:/home/${USERNAME}/ \
+gcloud compute tpus tpu-vm scp cpt_wrapper.sh ${TPU_NAME}:/home/${USERNAME}/ \
     --zone=${ZONE} --project=${PROJECT_ID} --worker=all
 
 echo "Stopping all running processes..."

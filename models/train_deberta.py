@@ -510,16 +510,16 @@ def train_fn(tokenized_dataset, device, args):
     save_steps = args.save_epoch_percentage if args.save_epoch_percentage>1. else int(steps_per_epoch * args.save_epoch_percentage)
     total_steps = steps_per_epoch * args.num_train_epochs
 
-    #scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
     # Use cyclic scheduler with hard restarts (cosine with restarts)
     # Calculate number of cycles - using 1 cycle per epoch as default, or user-specified value
-    num_cycles = args.num_cycles if args.num_cycles is not None else args.num_train_epochs
-    scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=args.num_warmup_steps,
-        num_training_steps=total_steps,
-        num_cycles=num_cycles
-    )
+    #num_cycles = args.num_cycles if args.num_cycles is not None else args.num_train_epochs
+    # scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
+    #     optimizer,
+    #     num_warmup_steps=args.num_warmup_steps,
+    #     num_training_steps=total_steps,
+    #     num_cycles=num_cycles
+    # )
 
     # Debug tensor states before training
     if xm.get_ordinal() == 0:
@@ -536,19 +536,19 @@ def train_fn(tokenized_dataset, device, args):
         print(f"Total steps: {total_steps}", flush=True)
         print(f"Total epochs: {args.num_train_epochs}", flush=True)
         print(f"Total warmup steps: {args.num_warmup_steps}", flush=True)
-        print(f"Number of cycles: {num_cycles}", flush=True)
+        #print(f"Number of cycles: {num_cycles}", flush=True)
 
     # Training loop
     total_step = 0
     miss_steps = 0
     print(f"ENTERING THE TRAINING LOOP with: {args.num_train_epochs} epochs", flush=True)
-    
+
     # Check that all cores are participating
     print(f"Core {xm.get_ordinal()}: About to enter training loop", flush=True)
     xm.mark_step()  # Synchronize all cores
     if xm.get_ordinal() == 0:
         print("All cores synchronized before training loop", flush=True)
-    
+
     for epoch in range(args.num_train_epochs):
         print(f"Core {xm.get_ordinal()}: Starting with epoch {epoch}...", flush=True)
         total_loss = 0.
@@ -573,11 +573,11 @@ def train_fn(tokenized_dataset, device, args):
 
         try:
             print(f"Core {xm.get_ordinal()}: Starting iteration over data loader...", flush=True)
-            
+
             # Add timeout check for data loading
             data_loader_iter = iter(safe_iter(xla_train_loader))
             print(f"Core {xm.get_ordinal()}: Created data loader iterator", flush=True)
-            
+
             for step in range(steps_per_epoch):
                 try:
                     batch = next(data_loader_iter)
@@ -602,7 +602,6 @@ def train_fn(tokenized_dataset, device, args):
 
                     if torch.isnan(loss):
                         optimizer.zero_grad(set_to_none=True)
-                        xm.mark_step()  # Add mark_step after zero_grad
                         continue
 
                     loss.backward()
@@ -627,7 +626,7 @@ def train_fn(tokenized_dataset, device, args):
 
                         local_avg_loss = total_loss / max(step, 1)  # Avoid division by zero
                         local_avg_loss_N = sub_total_loss / max(sub_step, 1)  # Avoid division by zero
-                        
+
                         print(f"Core {xm.get_ordinal()}: About to call mesh_reduce for loss", flush=True)
                         try:
                             global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
@@ -635,7 +634,7 @@ def train_fn(tokenized_dataset, device, args):
                         except Exception as e:
                             print(f"Core {xm.get_ordinal()}: Error in mesh_reduce for loss: {e}", flush=True)
                             global_avg_loss = local_avg_loss
-                        
+
                         try:
                             global_avg_loss_N = xm.mesh_reduce("loss_N", local_avg_loss_N, np.mean)
                             print(f"Core {xm.get_ordinal()}: Completed mesh_reduce for loss_N", flush=True)

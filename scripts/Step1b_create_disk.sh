@@ -1,9 +1,9 @@
 set -e
 
 # # Export variables from .env file
-# set -o allexport
-# source ../.env
-# set +o allexport
+set -o allexport
+source ../.llama.env
+set +o allexport
 
 if ! gcloud compute disks create ${EXT_DISK_NAME} \
     --size ${EXT_DISK_SIZE}  \

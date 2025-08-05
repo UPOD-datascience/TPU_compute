@@ -1,0 +1,35 @@
+# Base requirements for LoRA fine-tuning with TPUs
+torch>=2.0.0
+torch-xla>=2.0.0
+transformers>=4.35.0
+datasets>=2.14.0
+tokenizers>=0.14.0
+
+# PEFT library for LoRA implementation
+peft>=0.6.0
+
+# Additional ML libraries
+accelerate>=0.24.0
+safetensors>=0.4.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+
+# Data handling and storage
+gcsfs>=2023.6.0
+google-cloud-storage>=2.10.0
+fsspec>=2023.6.0
+pyarrow>=12.0.0
+pandas>=2.0.0
+
+# Monitoring and logging
+wandb>=0.15.0
+tqdm>=4.65.0
+
+# Utility libraries
+numpy>=1.24.0
+packaging>=21.0
+typing-extensions>=4.5.0
+requests>=2.31.0
+
+# Optional: For quantization support (if using 4-bit/8-bit training)
+bitsandbytes>=0.41.0

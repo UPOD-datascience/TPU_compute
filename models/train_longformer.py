@@ -19,7 +19,8 @@ DataCollatorForLanguageModeling,
 )
 from Longformer import (
     LongformerForMaskedLM,
-    #LongformerTokenizer
+    LongformerTokenizer,
+    LongformerModelForPreTraining
 )
 
 #from transformers.models.longformer.modeling_longformer import LongformerModel
@@ -440,7 +441,11 @@ def train_fn(tokenized_dataset, device, args):
 
     print(f"Continuing with padded len of {padded_len}", flush=True)
 
-    model = LongformerForMaskedLM(model_config)
+    model_config.mlm = True
+    model_config.srp = True
+    model_config.drp = True
+    model = LongformerModelForPreTraining(model_config)
+
 
     if isinstance(args.checkpoint_path, str) & (args.checkpoint_path != ""):
         if args.checkpoint_path.startswith('gs://'):
@@ -566,6 +571,10 @@ def train_fn(tokenized_dataset, device, args):
         print(f"Starting with epoch {epoch}...", flush=True)
         total_loss = 0.
         sub_total_loss = 0.
+        sub_total_loss_srp = 0.
+        sub_total_loss_mlm = 0.
+        sub_total_loss_drp = 0.
+
         sub_step = 0
         model.train()
         if distributed_sampler:
@@ -605,6 +614,10 @@ def train_fn(tokenized_dataset, device, args):
                 total_loss += loss.item()
                 sub_total_loss += loss.item()
 
+                sub_total_loss_mlm += outputs.loss_mlm.item()
+                sub_total_loss_drp += outputs.loss_drp.item()
+                sub_total_loss_srp += outputs.loss_srp.item()
+
                 if  (step+1) % args.gradient_accumulation_steps == 0:
                     xm.optimizer_step(optimizer)
                     scheduler.step()
@@ -617,8 +630,17 @@ def train_fn(tokenized_dataset, device, args):
 
                     local_avg_loss = total_loss / step
                     local_avg_loss_N = sub_total_loss / sub_step
+
+                    local_avg_loss_srp_N = sub_total_loss_srp / sub_step
+                    local_avg_loss_drp_N = sub_total_loss_drp / sub_step
+                    local_avg_loss_mlm_N = sub_total_loss_mlm / sub_step
+
                     global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
                     global_avg_loss_N = xm.mesh_reduce("loss_N", local_avg_loss_N, np.mean)
+
+                    global_avg_loss_srp_N = xm.mesh_reduce("loss_srp_N", local_avg_loss_srp_N, np.mean)
+                    global_avg_loss_drp_N = xm.mesh_reduce("loss_drp_N", local_avg_loss_drp_N, np.mean)
+                    global_avg_loss_mlm_N = xm.mesh_reduce("loss_mlm_N", local_avg_loss_mlm_N, np.mean)
 
                     perplexity = math.exp(global_avg_loss)
                     perplexity_N = math.exp(global_avg_loss_N)
@@ -630,6 +652,9 @@ def train_fn(tokenized_dataset, device, args):
                         print(f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}", flush=True)
                         wandb.log({
                             "train_global_average_loss": global_avg_loss,
+                            "train_mlm_average_loss": global_avg_loss_mlm_N
+                            "train_srp_average_loss": global_avg_loss_srp_N
+                            "train_drp_average_loss": global_avg_loss_drp_N
                             "train_global_average_loss_N": global_avg_loss_N,
                             "train_perplexity": perplexity,
                             "train_perplexity_N": perplexity_N,

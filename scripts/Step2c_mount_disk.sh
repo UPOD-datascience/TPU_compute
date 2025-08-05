@@ -2,9 +2,9 @@
 #set -e
 
 # Export variables from .env file
-# set -o allexport
-# source ../.longformer.env
-# set +o allexport
+set -o allexport
+source ../.llama.env
+set +o allexport
 
 echo "Managing attachment and mounting of disk ${EXT_DISK_NAME} on TPU VM ${TPU_NAME}..."
 
