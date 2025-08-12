@@ -2,9 +2,9 @@
 set -e
 
 # Export variables from .env file
-# set -o allexport
-# source ../.env
-# set +o allexport
+set -o allexport
+source ../.llama.env
+set +o allexport
 
 TEMP_VM_NAME="temp-disk-setup-vm"
 
@@ -39,43 +39,47 @@ if [[ ! -z "$DISK_EXISTS" ]]; then
             gcloud compute instances detach-disk $INSTANCE_NAME --disk=${EXT_DISK_NAME} --zone=$ZONE --project=${PROJECT_ID}
         done
     else
-        echo "Cannot proceed without detaching the disk. Exiting."
-        exit 1
+        echo "Proceeding without detaching the disk.."
     fi
 fi
 
-# Create a temporary VM to mount the disk
-echo "Creating temporary VM: ${TEMP_VM_NAME}..."
-gcloud compute instances create ${TEMP_VM_NAME} \
-    --zone=${ZONE} \
-    --project=${PROJECT_ID} \
-    --machine-type=n2-standard-8 \
-    --disk="name=${EXT_DISK_NAME},device-name=${EXT_DISK_NAME},mode=rw" \
-    --scopes=cloud-platform
-
-echo "Waiting for VM to initialize..."
-sleep 45  # Increased wait time to ensure disk is properly recognized
-
-# Detect the actual device name of the attached disk
-echo "Detecting actual device name of the attached disk..."
-ACTUAL_DEVICE=$(gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="lsblk -d -o NAME,SERIAL | grep -i ${EXT_DISK_NAME} | awk '{print \$1}'" 2>/dev/null || echo "")
-
-if [ -z "$ACTUAL_DEVICE" ]; then
-    echo "Failed to detect device name automatically. Listing all block devices for reference:"
-    gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="lsblk -d"
-    echo "Falling back to specified device name: ${EXT_DISK_PART}"
-    ACTUAL_DEVICE="${EXT_DISK_PART}"
+# Check if disk is already attached and has data - if so, skip setup
+if [[ ! -z "$DISK_EXISTS" ]]; then
+    echo "Disk ${EXT_DISK_NAME} is already attached. Skipping disk setup."
 else
-    echo "Detected disk device name: /dev/${ACTUAL_DEVICE}"
+    # Create a temporary VM to mount the disk
+    echo "Creating temporary VM: ${TEMP_VM_NAME}..."
+    gcloud compute instances create ${TEMP_VM_NAME} \
+        --zone=${ZONE} \
+        --project=${PROJECT_ID} \
+        --machine-type=n2-standard-8 \
+        --disk="name=${EXT_DISK_NAME},device-name=${EXT_DISK_NAME},mode=rw" \
+        --scopes=cloud-platform
+
+    echo "Waiting for VM to initialize..."
+    sleep 45  # Increased wait time to ensure disk is properly recognized
+
+    # Detect the actual device name of the attached disk
+    echo "Detecting actual device name of the attached disk..."
+    ACTUAL_DEVICE=$(gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="lsblk -d -o NAME,SERIAL | grep -i ${EXT_DISK_NAME} | awk '{print \$1}'" 2>/dev/null || echo "")
+
+    if [ -z "$ACTUAL_DEVICE" ]; then
+        echo "Failed to detect device name automatically. Listing all block devices for reference:"
+        gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="lsblk -d"
+        echo "Falling back to specified device name: ${EXT_DISK_PART}"
+        ACTUAL_DEVICE="${EXT_DISK_PART}"
+    else
+        echo "Detected disk device name: /dev/${ACTUAL_DEVICE}"
+    fi
+
+    # Format disk if it's newly created (only if not already formatted)
+    echo "Checking if disk needs formatting..."
+    gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="if [ -e /dev/${ACTUAL_DEVICE} ] && ! sudo blkid /dev/${ACTUAL_DEVICE}; then echo 'Formatting disk...'; sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/${ACTUAL_DEVICE}; else echo 'Disk already formatted or not found'; fi"
+
+    # Mount the disk
+    echo "Mounting disk to temporary VM..."
+    gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="sudo mkdir -p ${EXT_MOUNT_POINT} && (sudo mount -o discard,defaults /dev/${ACTUAL_DEVICE} ${EXT_MOUNT_POINT} || (echo 'Disk already mounted or failed to mount. Listing current mounts:' && mount)) && sudo chmod 777 ${EXT_MOUNT_POINT}"
 fi
-
-# Format disk if it's newly created (only if not already formatted)
-echo "Checking if disk needs formatting..."
-gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="if [ -e /dev/${ACTUAL_DEVICE} ] && ! sudo blkid /dev/${ACTUAL_DEVICE}; then echo 'Formatting disk...'; sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/${ACTUAL_DEVICE}; else echo 'Disk already formatted or not found'; fi"
-
-# Mount the disk
-echo "Mounting disk to temporary VM..."
-gcloud compute ssh ${TEMP_VM_NAME} --zone=${ZONE} --project=${PROJECT_ID} --command="sudo mkdir -p ${EXT_MOUNT_POINT} && (sudo mount -o discard,defaults /dev/${ACTUAL_DEVICE} ${EXT_MOUNT_POINT} || (echo 'Disk already mounted or failed to mount. Listing current mounts:' && mount)) && sudo chmod 777 ${EXT_MOUNT_POINT}"
 
 # Download the dataset from GCS
 echo "Checking if dataset file already exists on disk..."

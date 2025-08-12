@@ -23,7 +23,7 @@ while true; do
     --save_epoch_percentage=${SAVE_PERCENTAGE} \
     --logging_steps=${LOGGING_STEPS} \
     --num_warmup_steps=${NUM_WARMUP} \
-    --num_cores=8 \
+    --num_cores=1 \
     --hidden_size=${HIDDEN_SIZE} \
     --intermediate_size=${INTERMEDIATE_SIZE} \
     --num_hidden_layers=${HIDDEN_LAYERS} \
@@ -33,6 +33,7 @@ while true; do
     --mlm_probability=${MLM_PROB} \
     --streaming_data \
     --shuffle_dataset \
+    --causal_training \
     --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
     --shuffle_dataset_ext=${SHUFFLED_DATASET_EXT} \
     --checkpoint_path=${MODEL_CHECKPOINT} \

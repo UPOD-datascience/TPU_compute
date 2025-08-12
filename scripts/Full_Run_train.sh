@@ -3,7 +3,7 @@ set -e
 
 # Export variables from .env file
 set -o allexport
-source ../.longformer.env
+source ../.env
 set +o allexport
 
 ./Step1b_create_disk.sh
