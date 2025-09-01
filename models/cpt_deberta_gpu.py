@@ -356,6 +356,7 @@ def train_fn(index, args):
                         subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
                 else:
                     model_cpu = copy.deepcopy(model).to("cpu")
+                    model_cpu = model_cpu.to(torch.bfloat16)
                     model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
         val_ppl,val_loss = evaluate(model, validation_loader, device, args.bf16)
