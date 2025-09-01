@@ -717,6 +717,8 @@ def train_fn(tokenized_dataset, device, args):
                 else:
                     # Original logic for multi-core
                     batch = {k: v.to(device=device, dtype=torch.bfloat16) if v.dtype==torch.float32 else v.to(device) for k, v in batch.items()}
+
+                samples_seen_global = (step+1) * args.per_device_train_batch_size * world_size()
                 loss = model(**batch).loss / args.gradient_accumulation_steps
                 nan = torch.isnan(loss)
                 if nan:
@@ -785,12 +787,12 @@ def train_fn(tokenized_dataset, device, args):
                 #total_step += 1
                 sub_step +=1
 
-                if ((step+1) % save_steps == 0):
+                if (samples_seen_global % save_steps == 0):
                     xm.rendezvous("before_model_saving")
                     if (global_ordinal() ==0):
                         print("Saving model...", flush=True)
 
-                        wandb.log({"epoch_done": epoch}, commit=True)
+                        wandb.log({"epoch": epoch, "step": samples_seen_global}, commit=True)
                         wandb.finish()
 
                         if args.output_dir.startswith("gs://"):
@@ -938,7 +940,7 @@ def main():
     parser.add_argument("--logging_steps", type=int, default=1_000)
     parser.add_argument("--save_epoch_percentage", type=float, default=1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_cores", type=int, default=8)
+    parser.add_argument("--num_cores", type=int, default=4)
     parser.add_argument("--keep_in_memory", action='store_true')
     parser.add_argument("--streaming_data", action='store_true')
     parser.add_argument("--sharded_data", action='store_true')

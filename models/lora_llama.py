@@ -927,8 +927,7 @@ def main():
     parser.add_argument("--lora_target_modules", type=str, nargs='+',
                         default=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
                         help="Target modules for LoRA adaptation")
-    parser.add_argument("--lora_bias", type=str, default="none", choices=["none", "all", "lora_only"],
-                        help="Bias type for LoRA")
+    parser.add_argument("--lora_bias", type=str, default="none", choices=["none", "all", "lora_only"],help="Bias type for LoRA")
     args = parser.parse_args()
 
     # give error if both keep_in_memory and streaming_data are set to True
