@@ -84,3 +84,14 @@ Load these shuffled sets onto an external read-only drive that is then mounted o
 For training the model use a **streaming** dataloader without shuffling and without tokenization. The training should start within the hour, depending on the TPU network.
 
 Note; we did not do this :D.
+
+# Resources
+
+project clinicalnlp-308710 - access until March 1 2026
+
+32 on-demand Cloud TPU v4 chips in zone us-central2-b
+64 spot Cloud TPU v5e chips in zone us-central1-a
+32 spot Cloud TPU v4 chips in zone us-central2-b
+64 spot Cloud TPU v6e chips in zone us-east1-d
+64 spot Cloud TPU v5e chips in zone europe-west4-b
+64 spot Cloud TPU v6e chips in zone europe-west4-a
