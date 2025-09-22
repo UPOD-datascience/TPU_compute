@@ -214,7 +214,7 @@ def train_fn(tokenized_dataset, device, args):
     # Initialize wandb
     wandb.login(key=args.wandb_key)
     wandb.init(
-        project="Llama 3.2 - 1B GPU CPT",
+        project="Llama 3.2 - 1B GPU CPT - clinical",
         config={
             "learning_rate": args.learning_rate,
             "architecture": "Llama 3.2 - 1B",
@@ -541,7 +541,7 @@ def main():
 
     # External service arguments
     parser.add_argument("--wandb_key", type=str, required=True)
-    parser.add_argument("--huggingface_token", type=str, required=True)
+    parser.add_argument("--huggingface_token", type=str, default=None)
 
     # Debug
     parser.add_argument("--debug", action='store_true')
