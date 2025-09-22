@@ -54,14 +54,39 @@ def shuffle_and_save_dataset(dataset, save_path):
     print("Dataset shuffled and saved!")
 
 
+# Global debug flag to limit debug output
+_debug_tokenization = True
+
 def tokenize_function(examples, tokenizer):
+    global _debug_tokenization
+
     # Tokenize the text
     tokenized = tokenizer(examples["text"], padding=False, truncation=False)
 
+    # Debug: Print data types (only first time)
+    if _debug_tokenization and len(tokenized["input_ids"]) > 0:
+        first_seq = tokenized["input_ids"][0]
+        print(f"DEBUG: tokenized input_ids type: {type(first_seq)}")
+        print(f"DEBUG: first sequence length: {len(first_seq)}")
+        _debug_tokenization = False  # Disable further debug output
+
     # Add EOS token to the end of each sequence
     for i in range(len(tokenized["input_ids"])):
+        # Convert to list if it's not already
+        if hasattr(tokenized["input_ids"][i], 'tolist'):
+            tokenized["input_ids"][i] = tokenized["input_ids"][i].tolist()
+        elif not isinstance(tokenized["input_ids"][i], list):
+            tokenized["input_ids"][i] = list(tokenized["input_ids"][i])
+
         tokenized["input_ids"][i].append(tokenizer.eos_token_id)
+
         if "attention_mask" in tokenized:
+            # Convert attention mask to list as well
+            if hasattr(tokenized["attention_mask"][i], 'tolist'):
+                tokenized["attention_mask"][i] = tokenized["attention_mask"][i].tolist()
+            elif not isinstance(tokenized["attention_mask"][i], list):
+                tokenized["attention_mask"][i] = list(tokenized["attention_mask"][i])
+
             tokenized["attention_mask"][i].append(1)
 
     return tokenized
@@ -131,9 +156,18 @@ def group_texts(examples, max_seq_length, pad_token=0):
             for j in range(0, example_length, max_seq_length):
                 chunk = tokens[j:min(j + max_seq_length, example_length)]
 
+                # Convert to list if it's not already (handles numpy arrays, tensors, etc.)
+                if hasattr(chunk, 'tolist'):
+                    # NumPy array or tensor
+                    chunk = chunk.tolist()
+                elif not isinstance(chunk, list):
+                    # Other sequence types
+                    chunk = list(chunk)
+
                 # Pad if necessary
                 if len(chunk) < max_seq_length:
-                    chunk = chunk + [pad_token] * (max_seq_length - len(chunk))
+                    padding = [pad_token] * (max_seq_length - len(chunk))
+                    chunk = chunk + padding
 
                 chunks.append(chunk)
 
