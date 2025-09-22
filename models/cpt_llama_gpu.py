@@ -115,7 +115,7 @@ def load_dataset_from_args(args):
     dataset = load_dataset(args.dataset_format, data_files={
         "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
         "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
-    }, streaming=args.streaming_data)
+    }, streaming=False)
 
     return dataset
 
@@ -354,7 +354,7 @@ def train_fn(tokenized_dataset, device, args):
         weight_decay=args.weight_decay
     )
 
-    steps_per_epoch = args.max_steps_per_epoch if args.streaming_data else len(train_dataloader)
+    steps_per_epoch = len(train_dataloader)
     total_steps = steps_per_epoch * args.num_train_epochs
 
     if args.lr_schedule == 'linear':
@@ -447,9 +447,6 @@ def train_fn(tokenized_dataset, device, args):
                         "train/global_step": global_step,
                     })
 
-            # Break if max steps reached (for streaming data)
-            if args.streaming_data and step >= args.max_steps_per_epoch:
-                break
 
             # Debug mode - only run a few steps
             if args.debug and step >= 10:
@@ -577,8 +574,6 @@ def main():
 
     # Data processing arguments
     parser.add_argument("--keep_in_memory", action='store_true')
-    parser.add_argument("--streaming_data", action='store_true')
-    parser.add_argument("--sharded_data", action='store_true')
     parser.add_argument("--max_steps_per_epoch", type=int, default=50_000_000)
 
     # System arguments
@@ -593,10 +588,6 @@ def main():
     parser.add_argument("--bf16", action='store_true', help="Use bfloat16 precision for training")
 
     args = parser.parse_args()
-
-    # Validation
-    if args.keep_in_memory and args.streaming_data:
-        raise ValueError("keep_in_memory and streaming_data are mutually exclusive")
 
 
     # Set seed
