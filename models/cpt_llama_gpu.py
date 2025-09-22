@@ -80,7 +80,16 @@ class ShardedShuffleDataset:
 
 
 def tokenize_function(examples, tokenizer):
-    return tokenizer(examples["text"], padding=False, truncation=False)
+    # Tokenize the text
+    tokenized = tokenizer(examples["text"], padding=False, truncation=False)
+
+    # Add EOS token to the end of each sequence
+    for i in range(len(tokenized["input_ids"])):
+        tokenized["input_ids"][i].append(tokenizer.eos_token_id)
+        if "attention_mask" in tokenized:
+            tokenized["attention_mask"][i].append(1)
+
+    return tokenized
 
 
 def load_from_gcs(bucket_name, blob_name, local_path, device):
@@ -223,6 +232,13 @@ def train_fn(tokenized_dataset, device, args):
             "weight_decay": args.weight_decay,
             "max_seq_length": args.max_seq_length,
             "batch_size": args.per_device_train_batch_size,
+            "bf16": args.bf16,
+            "precision": "bfloat16" if args.bf16 else "float32",
+            "vocab_size": len(args.tokenizer),
+            "pad_token": args.tokenizer.pad_token,
+            "eos_token": args.tokenizer.eos_token,
+            "pad_token_id": args.tokenizer.pad_token_id,
+            "eos_token_id": args.tokenizer.eos_token_id,
         },
         mode="online",
         dir="/tmp"
@@ -263,12 +279,17 @@ def train_fn(tokenized_dataset, device, args):
         model = LlamaForCausalLM.from_pretrained(
             args.model_name,
             token=args.huggingface_token,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.bfloat16 if args.bf16 else torch.float32,
             low_cpu_mem_usage=True
         )
 
     print(f"Moving model to device {device}")
-    model = model.to(device)
+    if args.bf16:
+        model = model.to(device, dtype=torch.bfloat16)
+        print("Model moved to device with bfloat16 precision")
+    else:
+        model = model.to(device)
+        print("Model moved to device with float32 precision")
     print("Model setup complete")
 
     # Set up data collator
@@ -351,6 +372,13 @@ def train_fn(tokenized_dataset, device, args):
     # Enable gradient checkpointing for memory efficiency
     model.gradient_checkpointing_enable()
 
+    # Set up automatic mixed precision if bf16 is enabled
+    scaler = None
+    if args.bf16:
+        print("Using bfloat16 automatic mixed precision")
+    else:
+        print("Using float32 precision")
+
     for epoch in range(args.num_train_epochs):
         print(f"Starting epoch {epoch}")
 
@@ -362,9 +390,14 @@ def train_fn(tokenized_dataset, device, args):
             # Move batch to device
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-            # Forward pass
-            outputs = model(**batch)
-            loss = outputs.loss
+            # Forward pass with automatic mixed precision
+            if args.bf16:
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    outputs = model(**batch)
+                    loss = outputs.loss
+            else:
+                outputs = model(**batch)
+                loss = outputs.loss
 
             # Backward pass
             loss.backward()
@@ -413,7 +446,7 @@ def train_fn(tokenized_dataset, device, args):
 
         # Evaluation at end of epoch
         print("Running validation...")
-        val_results = evaluate(model, validation_dataloader, device)
+        val_results = evaluate(model, validation_dataloader, device, args)
         print(f"Validation Loss: {val_results['eval_loss']:.4f}, Perplexity: {val_results['perplexity']:.4f}")
 
         if wandb.run is not None:
@@ -453,7 +486,7 @@ def train_fn(tokenized_dataset, device, args):
     wandb.finish()
 
 
-def evaluate(model, validation_dataloader, device):
+def evaluate(model, validation_dataloader, device, args):
     """Evaluate the model"""
     model.eval()
     total_loss = 0.0
@@ -462,8 +495,14 @@ def evaluate(model, validation_dataloader, device):
     with torch.no_grad():
         for batch in validation_dataloader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            outputs = model(**batch)
-            loss = outputs.loss
+
+            if args.bf16:
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    outputs = model(**batch)
+                    loss = outputs.loss
+            else:
+                outputs = model(**batch)
+                loss = outputs.loss
 
             total_loss += loss.item() * batch['input_ids'].size(0)
             total_samples += batch['input_ids'].size(0)
@@ -543,8 +582,9 @@ def main():
     parser.add_argument("--wandb_key", type=str, required=True)
     parser.add_argument("--huggingface_token", type=str, default=None)
 
-    # Debug
+    # Debug and precision
     parser.add_argument("--debug", action='store_true')
+    parser.add_argument("--bf16", action='store_true', help="Use bfloat16 precision for training")
 
     args = parser.parse_args()
 
@@ -601,6 +641,13 @@ def main():
     args.tokenizer.model_max_length = args.max_seq_length
     if args.tokenizer.pad_token is None:
         args.tokenizer.add_special_tokens({'pad_token': '<pad>'})
+
+    # Ensure EOS token is properly set
+    if args.tokenizer.eos_token is None:
+        print("Warning: No EOS token found in tokenizer, using default")
+        args.tokenizer.add_special_tokens({'eos_token': '</s>'})
+
+    print(f"Tokenizer EOS token: {args.tokenizer.eos_token} (ID: {args.tokenizer.eos_token_id})")
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
