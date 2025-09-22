@@ -119,20 +119,6 @@ def load_dataset_from_args(args):
 
     return dataset
 
-
-def group_texts(examples, max_seq_length, pad_token=0):
-    """
-    Group already tokenized texts into chunks of max_seq_length while respecting sample boundaries.
-
-    Args:
-        examples: Dictionary with keys like 'input_ids', 'attention_mask', etc. where each value
-                 is a list of tokenized examples
-        max_seq_length: Maximum sequence length
-        pad_token: Token to use for padding (default: 0)
-
-    Returns:
-        Dictionary with same keys but values chunked to max_seq_length with padding
-    """
 # Global debug flag for group_texts
 _debug_group_texts = True
 
@@ -147,29 +133,29 @@ def group_texts(examples, max_seq_length, pad_token=0):
         pad_token: Token to use for padding (default: 0)
 
     Returns:
-        Dictionary with same keys but values chunked to max_seq_length with padding
+        Dictionary with chunked input_ids, attention_mask, and labels
     """
     global _debug_group_texts
 
     # Debug: Print the structure of examples (only first batch)
     if _debug_group_texts:
         print(f"DEBUG group_texts: examples keys: {list(examples.keys())}")
-        sample_key = list(examples.keys())[0]
-        print(f"DEBUG group_texts: type of examples['{sample_key}']: {type(examples[sample_key])}")
-        print(f"DEBUG group_texts: len of examples['{sample_key}']: {len(examples[sample_key])}")
-        if len(examples[sample_key]) > 0:
-            print(f"DEBUG group_texts: type of first item: {type(examples[sample_key][0])}")
-            if hasattr(examples[sample_key][0], '__len__'):
-                print(f"DEBUG group_texts: length of first item: {len(examples[sample_key][0])}")
+        print(f"DEBUG group_texts: type of examples['input_ids']: {type(examples['input_ids'])}")
+        print(f"DEBUG group_texts: len of examples['input_ids']: {len(examples['input_ids'])}")
+        if len(examples['input_ids']) > 0:
+            print(f"DEBUG group_texts: type of first item: {type(examples['input_ids'][0])}")
+            if hasattr(examples['input_ids'][0], '__len__'):
+                print(f"DEBUG group_texts: length of first item: {len(examples['input_ids'][0])}")
         _debug_group_texts = False  # Disable further debug output
 
-    sample_key = list(examples.keys())[0]
-    result = {k: [] for k in examples.keys()}
+    # Only process input_ids and attention_mask
+    keys_to_process = ['input_ids', 'attention_mask']
+    result = {k: [] for k in keys_to_process}
 
     # Loop through each tokenized example
-    for i in range(len(examples[sample_key])):
-        # Extract the current tokenized example for each feature
-        current_example = {k: examples[k][i] for k in examples.keys()}
+    for i in range(len(examples['input_ids'])):
+        # Extract the current tokenized example for input_ids and attention_mask only
+        current_example = {k: examples[k][i] for k in keys_to_process if k in examples}
 
         # Ensure current example values are lists
         for k in current_example:
@@ -179,7 +165,7 @@ def group_texts(examples, max_seq_length, pad_token=0):
                 current_example[k] = list(current_example[k])
 
         # Calculate how many chunks we need for this example
-        example_length = len(current_example[sample_key])
+        example_length = len(current_example['input_ids'])
         num_chunks = (example_length + max_seq_length - 1) // max_seq_length  # Ceiling division
 
         # Split each feature into chunks
@@ -191,14 +177,22 @@ def group_texts(examples, max_seq_length, pad_token=0):
 
                 # Pad if necessary
                 if len(chunk) < max_seq_length:
-                    padding = [pad_token] * (max_seq_length - len(chunk))
+                    if k == 'attention_mask':
+                        # Pad attention mask with 0s
+                        padding = [0] * (max_seq_length - len(chunk))
+                    else:
+                        # Pad input_ids with pad_token
+                        padding = [pad_token] * (max_seq_length - len(chunk))
                     chunk = chunk + padding
 
                 chunks.append(chunk)
 
             # If we don't have enough chunks (unlikely but possible with different length features)
             while len(chunks) < num_chunks:
-                chunks.append([pad_token] * max_seq_length)
+                if k == 'attention_mask':
+                    chunks.append([0] * max_seq_length)
+                else:
+                    chunks.append([pad_token] * max_seq_length)
 
             # Add the chunks to the result
             result[k].extend(chunks)

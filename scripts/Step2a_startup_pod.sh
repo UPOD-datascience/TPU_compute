@@ -5,9 +5,9 @@ gcloud components update
 # set -e
 
 # # Export variables from .env file
-set -o allexport
-source ../.llama.env
-set +o allexport
+# set -o allexport
+# source ../.llama.env
+# set +o allexport
 
 echo "Checking if TPU ${TPU_NAME} exists..."
 

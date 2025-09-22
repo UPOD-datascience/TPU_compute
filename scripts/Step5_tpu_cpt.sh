@@ -1,7 +1,7 @@
 #!/bin/bash#
-set -o allexport
-source ../.llama.env
-set +o allexport
+# set -o allexport
+# source ../.llama.env
+# set +o allexport
 
 ENV=".llama.env"
 

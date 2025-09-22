@@ -2,9 +2,9 @@
 set -e
 
 # Export variables from .env file
-set -o allexport
-source ../.llama.env
-set +o allexport
+# set -o allexport
+# source ../.llama.env
+# set +o allexport
 
 TEMP_VM_NAME="temp-disk-setup-vm"
 

@@ -2,9 +2,9 @@
 # set -e
 
 # # Export variables from .env file
-set -o allexport
-source ../.llama.env
-set +o allexport
+# set -o allexport
+# source ../.llama.env
+# set +o allexport
 
 echo "Installing XLA..."
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
