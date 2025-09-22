@@ -135,10 +135,27 @@ class ShardedShuffleDataset(torch.utils.data.IterableDataset):
 
 def tokenize_function(examples, tokenizer, max_seq_length):
     # here you can actually add a chunker to split the text into smaller parts, of max_len
-    return tokenizer(examples["text"],
+    tokenized = tokenizer(examples["text"],
                     truncation=False,
                     max_length=max_seq_length,
                     padding="max_length")
+
+    # Add EOS token to the end of each sequence (before padding)
+    for i in range(len(tokenized["input_ids"])):
+        # Find the first pad token or use full length if no padding
+        seq_len = len(tokenized["input_ids"][i])
+        if tokenizer.pad_token_id in tokenized["input_ids"][i]:
+            pad_start = tokenized["input_ids"][i].index(tokenizer.pad_token_id)
+        else:
+            pad_start = seq_len
+
+        # Insert EOS token before padding (if there's space)
+        if pad_start > 0:
+            tokenized["input_ids"][i][pad_start - 1] = tokenizer.eos_token_id
+            if "attention_mask" in tokenized:
+                tokenized["attention_mask"][i][pad_start - 1] = 1
+
+    return tokenized
 
 def load_from_gcs(bucket_name, blob_name, local_path, device):
     # Initialize a client
@@ -391,6 +408,11 @@ def train_fn(tokenized_dataset, device, args):
                 "weight_decay": args.weight_decay,
                 "max_seq_length": args.max_seq_length,
                 "batch_size": args.per_device_train_batch_size,
+                "vocab_size": len(args.tokenizer),
+                "pad_token": args.tokenizer.pad_token,
+                "eos_token": args.tokenizer.eos_token,
+                "pad_token_id": args.tokenizer.pad_token_id,
+                "eos_token_id": args.tokenizer.eos_token_id,
             },
             mode="online",
             dir="/home/bes3/temp"
@@ -1045,6 +1067,13 @@ def main():
     args.tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name_or_path, token=args.huggingface_token)
     args.tokenizer.model_max_length = args.max_seq_length
     args.tokenizer.add_special_tokens({'pad_token': '<pad>'})
+
+    # Ensure EOS token is properly set
+    if args.tokenizer.eos_token is None:
+        print("Warning: No EOS token found in tokenizer, using default", flush=True)
+        args.tokenizer.add_special_tokens({'eos_token': '</s>'})
+
+    print(f"Tokenizer EOS token: {args.tokenizer.eos_token} (ID: {args.tokenizer.eos_token_id})", flush=True)
 
     if args.shuffle_dataset:
             args.dataset_dir = args.shuffle_dataset_path
