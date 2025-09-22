@@ -54,31 +54,6 @@ def shuffle_and_save_dataset(dataset, save_path):
     print("Dataset shuffled and saved!")
 
 
-class ShardedShuffleDataset:
-    def __init__(self, dataset, buffer_size=1000, seed=42):
-        self.dataset = dataset
-        self.buffer_size = buffer_size
-        self.seed = seed
-
-    def __iter__(self):
-        rng = random.Random(self.seed)
-        buffer = []
-
-        for example in self.dataset:
-            buffer.append(example)
-            if len(buffer) >= self.buffer_size:
-                rng.shuffle(buffer)
-                for item in buffer:
-                    yield item
-                buffer = []
-
-        # Yield remaining items in buffer
-        if buffer:
-            rng.shuffle(buffer)
-            for item in buffer:
-                yield item
-
-
 def tokenize_function(examples, tokenizer):
     # Tokenize the text
     tokenized = tokenizer(examples["text"], padding=False, truncation=False)
@@ -90,7 +65,6 @@ def tokenize_function(examples, tokenizer):
             tokenized["attention_mask"][i].append(1)
 
     return tokenized
-
 
 def load_from_gcs(bucket_name, blob_name, local_path, device):
     """Download file from Google Cloud Storage"""
@@ -115,17 +89,10 @@ def load_dataset_from_args(args):
     """Load dataset based on arguments"""
     print(f"Loading dataset from {args.dataset_dir}")
 
-    if args.shuffle_dataset and os.path.exists(args.shuffle_dataset_path):
-        print("Loading shuffled dataset from disk")
-        dataset = load_dataset("arrow", data_files={
-            "train": args.shuffle_dataset_path + "/train",
-            "validation": args.shuffle_dataset_path + "/validation"
-        })
-    else:
-        dataset = load_dataset(args.dataset_format, data_files={
-            "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
-            "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
-        }, streaming=args.streaming_data)
+    dataset = load_dataset(args.dataset_format, data_files={
+        "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
+        "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
+    }, streaming=args.streaming_data)
 
     return dataset
 
@@ -183,7 +150,6 @@ def group_texts(examples, max_seq_length, pad_token=0):
 
     return result
 
-
 def prep_fn(args):
     """Prepare dataset for training"""
     print("Starting dataset preparation")
@@ -191,15 +157,13 @@ def prep_fn(args):
     # Load dataset
     dataset = load_dataset_from_args(args)
 
-    if not args.pre_tokenized:
-        print("Tokenizing dataset...")
-        tokenize_fn = partial(tokenize_function, tokenizer=args.tokenizer)
-        dataset = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
+    print("Tokenizing dataset...")
+    tokenize_fn = partial(tokenize_function, tokenizer=args.tokenizer)
+    dataset = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
 
-    if not args.streaming_data:
-        print("Grouping texts...")
-        group_fn = partial(group_texts, max_seq_length=args.max_seq_length, pad_token=args.tokenizer.pad_token_id)
-        dataset = dataset.map(group_fn, batched=True)
+    print("Grouping texts...")
+    group_fn = partial(group_texts, max_seq_length=args.max_seq_length, pad_token=args.tokenizer.pad_token_id)
+    dataset = dataset.map(group_fn, batched=True)
 
     print("Dataset preparation complete")
     return dataset
@@ -300,27 +264,16 @@ def train_fn(tokenized_dataset, device, args):
 
     print("Creating DataLoader...")
 
-    if args.streaming_data:
-        train_dataloader = torch.utils.data.DataLoader(
-            tokenized_dataset["train"],
-            batch_size=args.per_device_train_batch_size,
-            collate_fn=data_collator,
-            num_workers=2,
-            pin_memory=True,
-            drop_last=True,
-            shuffle=False  # Streaming datasets handle shuffling differently
-        )
-    else:
-        train_dataloader = torch.utils.data.DataLoader(
-            tokenized_dataset["train"],
-            batch_size=args.per_device_train_batch_size,
-            collate_fn=data_collator,
-            num_workers=2,
-            pin_memory=True,
-            drop_last=True,
-            shuffle=True
-        )
 
+    train_dataloader = torch.utils.data.DataLoader(
+        tokenized_dataset["train"],
+        batch_size=args.per_device_train_batch_size,
+        collate_fn=data_collator,
+        num_workers=2,
+        pin_memory=True,
+        drop_last=True,
+        shuffle=True
+    )
     # Validation dataloader
     validation_dataloader = torch.utils.data.DataLoader(
         tokenized_dataset["validation"],
@@ -330,9 +283,8 @@ def train_fn(tokenized_dataset, device, args):
         pin_memory=True
     )
 
-    if not args.streaming_data:
-        del tokenized_dataset
-        gc.collect()
+    del tokenized_dataset
+    gc.collect()
 
     print("DataLoader created")
 
@@ -569,11 +521,6 @@ def main():
     parser.add_argument("--streaming_data", action='store_true')
     parser.add_argument("--sharded_data", action='store_true')
     parser.add_argument("--max_steps_per_epoch", type=int, default=50_000_000)
-    parser.add_argument("--shuffle_buffer_size", type=int, default=1000)
-    parser.add_argument("--shuffle_dataset_path", type=str, default="/tmp/shuffle_dataset")
-    parser.add_argument("--shuffle_dataset_ext", type=str, default=None)
-    parser.add_argument("--shuffle_dataset", action='store_true')
-    parser.add_argument("--shuffle_force_update", action='store_true')
 
     # System arguments
     parser.add_argument("--seed", type=int, default=42)
@@ -592,8 +539,6 @@ def main():
     if args.keep_in_memory and args.streaming_data:
         raise ValueError("keep_in_memory and streaming_data are mutually exclusive")
 
-    if args.streaming_data and args.shuffle_buffer_size is None:
-        raise ValueError("shuffle_buffer_size is required when streaming_data is True")
 
     # Set seed
     torch.manual_seed(args.seed)
@@ -601,37 +546,6 @@ def main():
     np.random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-
-    # Handle dataset shuffling
-    if args.shuffle_dataset:
-        shuffle_dir = args.shuffle_dataset_path
-        if os.path.exists(shuffle_dir) and not args.shuffle_force_update:
-            print(f"Shuffled dataset exists, skipping creation: {shuffle_dir}")
-        else:
-            if os.path.exists(shuffle_dir):
-                print(f"Removing existing shuffled dataset: {shuffle_dir}")
-                shutil.rmtree(shuffle_dir)
-
-            # Load and shuffle dataset
-            if args.shuffle_dataset_ext is not None:
-                dataset = load_dataset(args.dataset_format, data_files={
-                    "train": args.shuffle_dataset_ext,
-                    "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
-                }, keep_in_memory=True)
-            else:
-                dataset = load_dataset(args.dataset_format, data_files={
-                    "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
-                    "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
-                }, keep_in_memory=True)
-
-            shuffle_and_save_dataset(dataset, args.shuffle_dataset_path)
-
-            del dataset
-            gc.collect()
-
-        # Update dataset directory to use shuffled data
-        args.dataset_dir = args.shuffle_dataset_path
-        args.dataset_format = 'arrow'
 
     # Initialize tokenizer
     args.tokenizer = LlamaTokenizerFast.from_pretrained(
