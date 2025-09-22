@@ -60,34 +60,32 @@ _debug_tokenization = True
 def tokenize_function(examples, tokenizer):
     global _debug_tokenization
 
+    # Debug the input (only first batch)
+    if _debug_tokenization:
+        print(f"DEBUG tokenize: examples keys: {list(examples.keys())}")
+        print(f"DEBUG tokenize: number of texts: {len(examples['text'])}")
+
     # Tokenize the text
     tokenized = tokenizer(examples["text"], padding=False, truncation=False)
 
-    # Debug: Print data types (only first time)
-    if _debug_tokenization and len(tokenized["input_ids"]) > 0:
-        first_seq = tokenized["input_ids"][0]
-        print(f"DEBUG: tokenized input_ids type: {type(first_seq)}")
-        print(f"DEBUG: first sequence length: {len(first_seq)}")
-        _debug_tokenization = False  # Disable further debug output
+    # Debug the output (only first batch)
+    if _debug_tokenization:
+        print(f"DEBUG tokenize: tokenized keys: {list(tokenized.keys())}")
+        print(f"DEBUG tokenize: number of sequences: {len(tokenized['input_ids'])}")
+        if len(tokenized["input_ids"]) > 0:
+            first_seq = tokenized["input_ids"][0]
+            print(f"DEBUG tokenize: first sequence type: {type(first_seq)}")
+            print(f"DEBUG tokenize: first sequence length: {len(first_seq)}")
 
     # Add EOS token to the end of each sequence
     for i in range(len(tokenized["input_ids"])):
-        # Convert to list if it's not already
-        if hasattr(tokenized["input_ids"][i], 'tolist'):
-            tokenized["input_ids"][i] = tokenized["input_ids"][i].tolist()
-        elif not isinstance(tokenized["input_ids"][i], list):
-            tokenized["input_ids"][i] = list(tokenized["input_ids"][i])
-
         tokenized["input_ids"][i].append(tokenizer.eos_token_id)
-
         if "attention_mask" in tokenized:
-            # Convert attention mask to list as well
-            if hasattr(tokenized["attention_mask"][i], 'tolist'):
-                tokenized["attention_mask"][i] = tokenized["attention_mask"][i].tolist()
-            elif not isinstance(tokenized["attention_mask"][i], list):
-                tokenized["attention_mask"][i] = list(tokenized["attention_mask"][i])
-
             tokenized["attention_mask"][i].append(1)
+
+    if _debug_tokenization:
+        print(f"DEBUG tokenize: after EOS, first sequence length: {len(tokenized['input_ids'][0])}")
+        _debug_tokenization = False  # Disable further debug output
 
     return tokenized
 
@@ -135,15 +133,50 @@ def group_texts(examples, max_seq_length, pad_token=0):
     Returns:
         Dictionary with same keys but values chunked to max_seq_length with padding
     """
-    result = {k: [] for k in examples.keys()}
+# Global debug flag for group_texts
+_debug_group_texts = True
 
-    # Get a sample key to determine the number of examples
+def group_texts(examples, max_seq_length, pad_token=0):
+    """
+    Group already tokenized texts into chunks of max_seq_length while respecting sample boundaries.
+
+    Args:
+        examples: Dictionary with keys like 'input_ids', 'attention_mask', etc. where each value
+                 is a list of tokenized examples
+        max_seq_length: Maximum sequence length
+        pad_token: Token to use for padding (default: 0)
+
+    Returns:
+        Dictionary with same keys but values chunked to max_seq_length with padding
+    """
+    global _debug_group_texts
+
+    # Debug: Print the structure of examples (only first batch)
+    if _debug_group_texts:
+        print(f"DEBUG group_texts: examples keys: {list(examples.keys())}")
+        sample_key = list(examples.keys())[0]
+        print(f"DEBUG group_texts: type of examples['{sample_key}']: {type(examples[sample_key])}")
+        print(f"DEBUG group_texts: len of examples['{sample_key}']: {len(examples[sample_key])}")
+        if len(examples[sample_key]) > 0:
+            print(f"DEBUG group_texts: type of first item: {type(examples[sample_key][0])}")
+            if hasattr(examples[sample_key][0], '__len__'):
+                print(f"DEBUG group_texts: length of first item: {len(examples[sample_key][0])}")
+        _debug_group_texts = False  # Disable further debug output
+
     sample_key = list(examples.keys())[0]
+    result = {k: [] for k in examples.keys()}
 
     # Loop through each tokenized example
     for i in range(len(examples[sample_key])):
         # Extract the current tokenized example for each feature
         current_example = {k: examples[k][i] for k in examples.keys()}
+
+        # Ensure current example values are lists
+        for k in current_example:
+            if hasattr(current_example[k], 'tolist'):
+                current_example[k] = current_example[k].tolist()
+            elif not isinstance(current_example[k], list):
+                current_example[k] = list(current_example[k])
 
         # Calculate how many chunks we need for this example
         example_length = len(current_example[sample_key])
@@ -155,14 +188,6 @@ def group_texts(examples, max_seq_length, pad_token=0):
             chunks = []
             for j in range(0, example_length, max_seq_length):
                 chunk = tokens[j:min(j + max_seq_length, example_length)]
-
-                # Convert to list if it's not already (handles numpy arrays, tensors, etc.)
-                if hasattr(chunk, 'tolist'):
-                    # NumPy array or tensor
-                    chunk = chunk.tolist()
-                elif not isinstance(chunk, list):
-                    # Other sequence types
-                    chunk = list(chunk)
 
                 # Pad if necessary
                 if len(chunk) < max_seq_length:
