@@ -298,7 +298,7 @@ def train_fn(tokenized_dataset, device, args):
             torch_dtype=torch.bfloat16 if args.bf16 else torch.float32,
             low_cpu_mem_usage=True
         )
-
+    model.config.pad_token_id = args.tokenizer.pad_token_id
     print(f"Moving model to device {device}")
     if args.bf16:
         model = model.to(device, dtype=torch.bfloat16)
@@ -597,12 +597,15 @@ def main():
     )
     args.tokenizer.model_max_length = args.max_seq_length
     if args.tokenizer.pad_token is None:
-        args.tokenizer.add_special_tokens({'pad_token': '<pad>'})
+        args.tokenizer.pad_token = args.tokenizer.eos_token
 
     # Ensure EOS token is properly set
     if args.tokenizer.eos_token is None:
-        print("Warning: No EOS token found in tokenizer, using default")
-        args.tokenizer.add_special_tokens({'eos_token': '</s>'})
+        print("Warning: No EOS token found in tokenizer, using default", flush=True)
+        args.tokenizer.add_special_tokens({'eos_token': '<|eot_id|>'})
+    if args.tokenizer.bos_token is None:
+        print("Warning: No BOS token found in tokenizer, using default", flush=True)
+        args.tokenizer.add_special_tokens({'bos_token': '<|begin_of_text|>'})
 
     print(f"Tokenizer EOS token: {args.tokenizer.eos_token} (ID: {args.tokenizer.eos_token_id})")
 
