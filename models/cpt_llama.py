@@ -801,7 +801,7 @@ def train_fn(tokenized_dataset, device, args):
                             "epoch": epoch,
                             "step": step,
                             "total_step": total_step
-                        }, commit = False)
+                        }, commit = True)
                     xm.rendezvous("after_wandb_log")
                 if args.debug:
                     break
@@ -815,7 +815,7 @@ def train_fn(tokenized_dataset, device, args):
                         print("Saving model...", flush=True)
 
                         wandb.log({"epoch": epoch, "step": samples_seen_global}, commit=True)
-                        wandb.finish()
+                        #wandb.finish()
 
                         if args.output_dir.startswith("gs://"):
                             with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:

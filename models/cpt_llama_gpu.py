@@ -121,7 +121,6 @@ def load_dataset_from_args(args):
 
 # Global debug flag for group_texts
 _debug_group_texts = True
-
 def group_texts(examples, max_seq_length, pad_token=0):
     """
     Group already tokenized texts into chunks of max_seq_length while respecting sample boundaries.
