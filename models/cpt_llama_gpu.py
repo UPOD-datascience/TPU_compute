@@ -354,6 +354,7 @@ def train_fn(tokenized_dataset, device, args):
 
     steps_per_epoch = len(train_dataloader)
     total_steps = steps_per_epoch * args.num_train_epochs
+    save_steps = int(steps_per_epoch * args.save_epoch_percentage)
 
     if args.lr_schedule == 'linear':
         scheduler = get_linear_schedule_with_warmup(
@@ -372,6 +373,7 @@ def train_fn(tokenized_dataset, device, args):
     print("Starting training...")
     print(f"Total steps: {total_steps}")
     print(f"Steps per epoch: {steps_per_epoch}")
+    print(f"Steps before saving: {save_steps}")
     print(f"Total epochs: {args.num_train_epochs}")
     print(f"Warmup steps: {args.num_warmup_steps}")
 
@@ -456,6 +458,15 @@ def train_fn(tokenized_dataset, device, args):
             # Debug mode - only run a few steps
             if args.debug and step >= 10:
                 break
+                
+            if (step % save_steps == 0) and (step > 0):
+                print("Running validation...")
+                val_results = evaluate(model, validation_dataloader, device, args)
+                print(f"Validation Loss: {val_results['eval_loss']:.4f}, Perplexity: {val_results['perplexity']:.4f}")
+                
+                print("Saving model...")
+                model_cpu = copy.deepcopy(model).to("cpu")
+                model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
         # Evaluation at end of epoch
         print("Running validation...")
@@ -571,7 +582,7 @@ def main():
     parser.add_argument("--lr_schedule", type=str, choices=["linear", "cosine"], default="cosine")
     parser.add_argument("--num_cycles", type=float, default=10)
     parser.add_argument("--eta_min", type=float, default=1e-6)
-    parser.add_argument("--max_grad_norm", type=float, default=17.0)
+    parser.add_argument("--max_grad_norm", type=float, default=21.0)
 
     # Logging and checkpointing
     parser.add_argument("--logging_steps", type=int, default=1000)
