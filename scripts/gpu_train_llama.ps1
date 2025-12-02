@@ -32,7 +32,7 @@ $cmd = 'cd /d ' + $env:FULL_SCRIPT_DIR + ' && poetry run python ../models/cpt_ll
        '--keep_in_memory ' +
        '--weight_decay=0.0000001 ' +
        '--num_train_epochs=1 ' +
-	   '--bf16'
+	   '--bf16 '
 
 Start-Process -NoNewWindow -FilePath "cmd.exe" -ArgumentList "/k", $cmd -Wait
 Write-Output "Training started."

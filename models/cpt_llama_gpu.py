@@ -27,7 +27,7 @@ from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_wi
 from datasets import load_dataset, DatasetDict
 from safetensors.torch import load_file as load_safetensors
 
-import wandb
+# import wandb
 from gcsfs import GCSFileSystem
 from google.cloud import storage
 import fsspec
@@ -138,7 +138,7 @@ def group_texts(examples, max_seq_length, pad_token=0):
 
     # Debug: Print the structure of examples (only first batch)
     if _debug_group_texts:
-        print(f"DEBUG group_texts: examples keys: {list(examples.keys())}")
+        print(f"\nDEBUG group_texts: examples keys: {list(examples.keys())}")
         print(f"DEBUG group_texts: type of examples['input_ids']: {type(examples['input_ids'])}")
         print(f"DEBUG group_texts: len of examples['input_ids']: {len(examples['input_ids'])}")
         if len(examples['input_ids']) > 0:
@@ -211,7 +211,10 @@ def prep_fn(args):
 
     print("Tokenizing dataset...")
     tokenize_fn = partial(tokenize_function, tokenizer=args.tokenizer)
-    dataset = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
+    dataset = dataset.map(tokenize_fn, batched=True, 
+                          remove_columns=["text", "id", "source", 
+                                          "approx_token_counts_translated", 
+                                          "approx_token_counts_original"])
 
     print("Grouping texts...")
     group_fn = partial(group_texts, max_seq_length=args.max_seq_length, pad_token=args.tokenizer.pad_token_id)
@@ -237,29 +240,29 @@ def train_fn(tokenized_dataset, device, args):
     print("Starting train_fn...")
 
     # Initialize wandb
-    wandb.login(key=args.wandb_key)
-    wandb.init(
-        project="Llama 3.2 - 1B GPU CPT - clinical",
-        config={
-            "learning_rate": args.learning_rate,
-            "architecture": "Llama 3.2 - 1B",
-            "dataset": args.dataset_dir,
-            "epochs": args.num_train_epochs,
-            "weight_decay": args.weight_decay,
-            "max_seq_length": args.max_seq_length,
-            "batch_size": args.per_device_train_batch_size,
-            "bf16": args.bf16,
-            "precision": "bfloat16" if args.bf16 else "float32",
-            "vocab_size": len(args.tokenizer),
-            "pad_token": args.tokenizer.pad_token,
-            "eos_token": args.tokenizer.eos_token,
-            "pad_token_id": args.tokenizer.pad_token_id,
-            "eos_token_id": args.tokenizer.eos_token_id,
-        },
-        mode="online",
-        dir="/tmp"
-    )
-    wandb.run.log_code(root=".", name="cpt_llama_gpu")
+    # wandb.login(key=args.wandb_key)
+    # wandb.init(
+    #     project="Llama 3.2 - 1B GPU CPT - clinical",
+    #     config={
+    #         "learning_rate": args.learning_rate,
+    #         "architecture": "Llama 3.2 - 1B",
+    #         "dataset": args.dataset_dir,
+    #         "epochs": args.num_train_epochs,
+    #         "weight_decay": args.weight_decay,
+    #         "max_seq_length": args.max_seq_length,
+    #         "batch_size": args.per_device_train_batch_size,
+    #         "bf16": args.bf16,
+    #         "precision": "bfloat16" if args.bf16 else "float32",
+    #         "vocab_size": len(args.tokenizer),
+    #         "pad_token": args.tokenizer.pad_token,
+    #         "eos_token": args.tokenizer.eos_token,
+    #         "pad_token_id": args.tokenizer.pad_token_id,
+    #         "eos_token_id": args.tokenizer.eos_token_id,
+    #     },
+    #     mode="online",
+    #     dir="/tmp"
+    # )
+    # wandb.run.log_code(root=".", name="cpt_llama_gpu")
 
     # Load model
     print("Loading the LM...")
@@ -269,6 +272,8 @@ def train_fn(tokenized_dataset, device, args):
 
         config = LlamaConfig.from_pretrained(args.model_name, token=args.huggingface_token)
         model = LlamaForCausalLM(config)
+        model.config.use_cache = False
+
         print("Empty model created")
 
         if args.checkpoint_path.startswith('gs://'):
@@ -349,6 +354,7 @@ def train_fn(tokenized_dataset, device, args):
 
     steps_per_epoch = len(train_dataloader)
     total_steps = steps_per_epoch * args.num_train_epochs
+    save_steps = int(steps_per_epoch * args.save_epoch_percentage)
 
     if args.lr_schedule == 'linear':
         scheduler = get_linear_schedule_with_warmup(
@@ -367,6 +373,7 @@ def train_fn(tokenized_dataset, device, args):
     print("Starting training...")
     print(f"Total steps: {total_steps}")
     print(f"Steps per epoch: {steps_per_epoch}")
+    print(f"Steps before saving: {save_steps}")
     print(f"Total epochs: {args.num_train_epochs}")
     print(f"Warmup steps: {args.num_warmup_steps}")
 
@@ -403,11 +410,18 @@ def train_fn(tokenized_dataset, device, args):
                 outputs = model(**batch)
                 loss = outputs.loss
 
+            nan = torch.isnan(loss)
+            if nan:
+                optimizer.zero_grad(set_to_none=True)
+                print("NaN loss; skipping backward but keeping sync", flush=True)
+                loss = torch.nan_to_num(loss, nan=0.0)
+
             # Backward pass
             loss.backward()
 
             # Gradient clipping
             if args.max_grad_norm > 0:
+                print(f"Clipping grad norm to {args.max_grad_norm}")
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             # Update parameters
@@ -430,32 +444,41 @@ def train_fn(tokenized_dataset, device, args):
                 print(f"Loss: {loss.item():.4f}, Avg Loss: {avg_loss:.4f}, Perplexity: {perplexity:.4f}")
                 print(f"Learning Rate: {current_lr:.2e}")
 
-                if wandb.run is not None:
-                    wandb.log({
-                        "train/loss": loss.item(),
-                        "train/avg_loss": avg_loss,
-                        "train/perplexity": perplexity,
-                        "train/learning_rate": current_lr,
-                        "train/epoch": epoch,
-                        "train/global_step": global_step,
-                    })
+                # if wandb.run is not None:
+                #     wandb.log({
+                #         "train/loss": loss.item(),
+                #         "train/avg_loss": avg_loss,
+                #         "train/perplexity": perplexity,
+                #         "train/learning_rate": current_lr,
+                #         "train/epoch": epoch,
+                #         "train/global_step": global_step,
+                #     })
 
 
             # Debug mode - only run a few steps
             if args.debug and step >= 10:
                 break
+                
+            if (step % save_steps == 0) and (step > 0):
+                print("Running validation...")
+                val_results = evaluate(model, validation_dataloader, device, args)
+                print(f"Validation Loss: {val_results['eval_loss']:.4f}, Perplexity: {val_results['perplexity']:.4f}")
+                
+                print("Saving model...")
+                model_cpu = copy.deepcopy(model).to("cpu")
+                model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
         # Evaluation at end of epoch
         print("Running validation...")
         val_results = evaluate(model, validation_dataloader, device, args)
         print(f"Validation Loss: {val_results['eval_loss']:.4f}, Perplexity: {val_results['perplexity']:.4f}")
 
-        if wandb.run is not None:
-            wandb.log({
-                "eval/loss": val_results['eval_loss'],
-                "eval/perplexity": val_results['perplexity'],
-                "epoch": epoch,
-            })
+        # if wandb.run is not None:
+        #     wandb.log({
+        #         "eval/loss": val_results['eval_loss'],
+        #         "eval/perplexity": val_results['perplexity'],
+        #         "epoch": epoch,
+        #     })
 
         # Save checkpoint at end of epoch
         checkpoint_path = f"{args.output_dir}/checkpoint-epoch-{epoch}"
@@ -484,7 +507,7 @@ def train_fn(tokenized_dataset, device, args):
             subprocess.run(["gsutil", "-m", "cp", "-r", checkpoint_path, args.output_dir], check=True)
 
     print("Training completed!")
-    wandb.finish()
+    #wandb.finish()
 
 
 def evaluate(model, validation_dataloader, device, args):
@@ -555,11 +578,11 @@ def main():
     parser.add_argument("--num_warmup_steps", type=int, default=1000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.001)
-    parser.add_argument("--lr_schedule", type=str, choices=["linear", "cosine"], default="linear")
+    parser.add_argument("--weight_decay", type=float, default=0.0001)
+    parser.add_argument("--lr_schedule", type=str, choices=["linear", "cosine"], default="cosine")
     parser.add_argument("--num_cycles", type=float, default=10)
     parser.add_argument("--eta_min", type=float, default=1e-6)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--max_grad_norm", type=float, default=21.0)
 
     # Logging and checkpointing
     parser.add_argument("--logging_steps", type=int, default=1000)
