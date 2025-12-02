@@ -430,8 +430,6 @@ def train_fn(tokenized_dataset, device, args):
 
     # Load pre-trained model
     xm.master_print("Loading the LM ...")
-
-
     if args.checkpoint_handling in ['start_with_checkpoint', 'start_with_init']:
         model_config = BigBirdConfig.from_pretrained(args.model_name)
         model_config.bos_token_id = args.tokenizer.bos_token_id
@@ -441,6 +439,11 @@ def train_fn(tokenized_dataset, device, args):
         model_config.sep_token_id = args.tokenizer.sep_token_id
         model_config.mask_token_id = args.tokenizer.mask_token_id
         model_config.vocab_size = args.tokenizer.vocab_size
+        model_config.num_hidden_layers = args.num_hidden_layers
+        model_config.num_attention_heads = args.num_attention_heads
+        model_config.hidden_size = args.hidden_size
+        model_config.intermediate_size = args.intermediate_size
+        model_config.max_position_embeddings = args.max_seq_length
 
         # Debug: Print all special token IDs
         print(f"Tokenizer vocab_size: {args.tokenizer.vocab_size}")
@@ -451,33 +454,6 @@ def train_fn(tokenized_dataset, device, args):
         print(f"  cls_token_id: {model_config.cls_token_id}")
         print(f"  sep_token_id: {model_config.sep_token_id}")
         print(f"  mask_token_id: {model_config.mask_token_id}")
-
-        # Calculate max token ID and ensure vocab_size is large enough
-        special_token_ids = [
-            model_config.bos_token_id,
-            model_config.eos_token_id,
-            model_config.pad_token_id,
-            model_config.cls_token_id,
-            model_config.sep_token_id,
-            model_config.mask_token_id
-        ]
-        # Filter out None values
-        special_token_ids = [tid for tid in special_token_ids if tid is not None]
-
-        if special_token_ids:
-            max_token_id = max(special_token_ids)
-            print(f"Max special token ID: {max_token_id}")
-
-            if model_config.vocab_size <= max_token_id:
-                new_vocab_size = max_token_id + 1
-                print(f"Increasing vocab size from {model_config.vocab_size} to {new_vocab_size}")
-                model_config.vocab_size = new_vocab_size
-
-        model_config.num_hidden_layers = args.num_hidden_layers
-        model_config.num_attention_heads = args.num_attention_heads
-        model_config.hidden_size = args.hidden_size
-        model_config.intermediate_size = args.intermediate_size
-        model_config.max_position_embeddings = args.max_seq_length
 
         if args.causal_training==True:
             model = BigBirdForCausalLM(model_config)

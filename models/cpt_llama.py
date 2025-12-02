@@ -27,7 +27,7 @@ DataCollatorForLanguageModeling
 )
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-from datasets import load_dataset, DatasetDict, DatasetInfo
+from datasets import load_dataset, DatasetDict, DatasetInfo, interleave_datasets
 from safetensors.torch import load_file as load_safetensors
 
 import wandb
@@ -133,27 +133,42 @@ class ShardedShuffleDataset(torch.utils.data.IterableDataset):
 #         })
 #     return {"input_ids": input_batch}
 
-def tokenize_function(examples, tokenizer, max_seq_length):
+def tokenize_function(examples, tokenizer, max_seq_length, skip_eos=False):
     # here you can actually add a chunker to split the text into smaller parts, of max_len
+    # Tokenize without padding first to properly add EOS tokens
     tokenized = tokenizer(examples["text"],
                     truncation=False,
-                    max_length=max_seq_length,
-                    padding="max_length")
+                    padding=False,
+                    return_attention_mask=True)
 
-    # Add EOS token to the end of each sequence (before padding)
+    # Add EOS token to the end of each sequence (skip for pre-tokenized data)
+    if not skip_eos:
+        for i in range(len(tokenized["input_ids"])):
+            # Check if EOS token is already present at the end
+            if len(tokenized["input_ids"][i]) == 0 or tokenized["input_ids"][i][-1] != tokenizer.eos_token_id:
+                # Add EOS token at the end (don't replace, append)
+                tokenized["input_ids"][i].append(tokenizer.eos_token_id)
+                tokenized["attention_mask"][i].append(1)
+
+    # Truncate if sequence is too long (keeping EOS token for non-skip cases)
     for i in range(len(tokenized["input_ids"])):
-        # Find the first pad token or use full length if no padding
-        seq_len = len(tokenized["input_ids"][i])
-        if tokenizer.pad_token_id in tokenized["input_ids"][i]:
-            pad_start = tokenized["input_ids"][i].index(tokenizer.pad_token_id)
-        else:
-            pad_start = seq_len
+        if len(tokenized["input_ids"][i]) > max_seq_length:
+            if not skip_eos:
+                tokenized["input_ids"][i] = tokenized["input_ids"][i][:max_seq_length-1] + [tokenizer.eos_token_id]
+                tokenized["attention_mask"][i] = tokenized["attention_mask"][i][:max_seq_length-1] + [1]
+            else:
+                tokenized["input_ids"][i] = tokenized["input_ids"][i][:max_seq_length]
+                tokenized["attention_mask"][i] = tokenized["attention_mask"][i][:max_seq_length]
 
-        # Insert EOS token before padding (if there's space)
-        if pad_start > 0:
-            tokenized["input_ids"][i][pad_start - 1] = tokenizer.eos_token_id
-            if "attention_mask" in tokenized:
-                tokenized["attention_mask"][i][pad_start - 1] = 1
+    # Now pad all sequences to max_length manually since tokenizer.pad might not be available
+    for i in range(len(tokenized["input_ids"])):
+        current_length = len(tokenized["input_ids"][i])
+        if current_length < max_seq_length:
+            # Pad input_ids with pad_token_id
+            padding_length = max_seq_length - current_length
+            tokenized["input_ids"][i].extend([tokenizer.pad_token_id] * padding_length)
+            # Pad attention_mask with 0s
+            tokenized["attention_mask"][i].extend([0] * padding_length)
 
     return tokenized
 
@@ -208,15 +223,16 @@ def load_sharded_dataset(datasets, dformat, args):
     return DatasetDict(sharded_dataset)
 
 
-def group_texts(examples, max_seq_length, pad_token=0):
+def group_texts(examples, max_seq_length, pad_token=0, eos_token_id=None):
     """
-    Group already tokenized texts into chunks of max_seq_length while respecting sample boundaries.
+    Group already tokenized texts into chunks of max_seq_length while preserving EOS tokens at document boundaries.
 
     Args:
         examples: Dictionary with keys like 'input_ids', 'attention_mask', etc. where each value
                  is a list of tokenized examples
         max_seq_length: Maximum sequence length
         pad_token: Token to use for padding (default: 0)
+        eos_token_id: EOS token ID to preserve at document boundaries
 
     Returns:
         Dictionary with same keys but values chunked to max_seq_length with padding
@@ -233,27 +249,51 @@ def group_texts(examples, max_seq_length, pad_token=0):
 
         # Calculate how many chunks we need for this example
         example_length = len(current_example[sample_key])
-        num_chunks = (example_length + max_seq_length - 1) // max_seq_length  # Ceiling division
 
-        # Split each feature into chunks
-        for k, tokens in current_example.items():
-            # Create chunks of max_seq_length
-            chunks = []
-            for j in range(0, example_length, max_seq_length):
-                chunk = tokens[j:min(j + max_seq_length, example_length)]
-
+        # If the sequence fits in one chunk, just pad it
+        if example_length <= max_seq_length:
+            for k, tokens in current_example.items():
+                chunk = tokens[:]  # Make a copy
                 # Pad if necessary
                 if len(chunk) < max_seq_length:
-                    chunk = chunk + [pad_token] * (max_seq_length - len(chunk))
+                    pad_value = pad_token if k == 'input_ids' else 0
+                    chunk = chunk + [pad_value] * (max_seq_length - len(chunk))
+                result[k].append(chunk)
+        else:
+            # Need to split into multiple chunks
+            # For input_ids, preserve EOS token at the end of the last chunk
+            input_ids = current_example['input_ids']
+            has_eos_at_end = (eos_token_id is not None and
+                             len(input_ids) > 0 and
+                             input_ids[-1] == eos_token_id)
 
-                chunks.append(chunk)
+            # Split each feature into chunks
+            for k, tokens in current_example.items():
+                chunks = []
 
-            # If we don't have enough chunks (unlikely but possible with different length features)
-            while len(chunks) < num_chunks:
-                chunks.append([pad_token] * max_seq_length)
+                # Create chunks of max_seq_length
+                for j in range(0, example_length, max_seq_length):
+                    chunk = tokens[j:min(j + max_seq_length, example_length)]
 
-            # Add the chunks to the result
-            result[k].extend(chunks)
+                    # For the last chunk of input_ids, ensure EOS token is preserved
+                    if (k == 'input_ids' and has_eos_at_end and
+                        j + max_seq_length >= example_length):
+                        # This is the last chunk, make sure it ends with EOS
+                        if len(chunk) > 0 and chunk[-1] != eos_token_id:
+                            if len(chunk) < max_seq_length:
+                                chunk.append(eos_token_id)
+                            else:
+                                chunk[-1] = eos_token_id
+
+                    # Pad if necessary
+                    if len(chunk) < max_seq_length:
+                        pad_value = pad_token if k == 'input_ids' else 0
+                        chunk = chunk + [pad_value] * (max_seq_length - len(chunk))
+
+                    chunks.append(chunk)
+
+                # Add the chunks to the result
+                result[k].extend(chunks)
 
     return result
 
@@ -271,6 +311,7 @@ def prep_fn(args):
 
     # Load and tokenize dataset
     if args.pre_tokenized:
+        print(f"Process {current_ordinal}: Loading pre-tokenized data - EOS tokens should already be present", flush=True)
         datasets = {
             "train": args.dataset_dir + f"/train_{args.max_seq_length}.{args.dataset_format}",
             "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.{args.dataset_format}"
@@ -317,6 +358,10 @@ def prep_fn(args):
                     streaming=True,
                     keep_in_memory=False
                 )
+            # add more datasets, and use interleave_datasets
+            # dataset2 = load_dataset()
+            # dataset = dataset.interleave_datasets([dataset, dataset2],
+            # probabilities=[0.5, 0.5], stopping_strategy='all_exhausted')
         else:
             print(f"Process {current_ordinal}: Init non-streaming dataset...", flush=True)
             if args.sharded_data:
@@ -333,7 +378,7 @@ def prep_fn(args):
         # For streaming data, don't use multiprocessing (num_proc=1 or omit)
         # Each TPU core is already a separate process
         print(f"Process {current_ordinal}: Tokenizing dataset...", flush=True)
-        tokenize_fn = partial(tokenize_function, tokenizer=args.tokenizer, max_seq_length=args.max_seq_length)
+        tokenize_fn = partial(tokenize_function, tokenizer=args.tokenizer, max_seq_length=args.max_seq_length, skip_eos=args.pre_tokenized)
 
         # Remove num_proc for streaming to avoid conflicts
         if args.streaming_data:
@@ -351,7 +396,7 @@ def prep_fn(args):
             )
 
         print(f"Process {current_ordinal}: Performing chunking tokenized data...", flush=True)
-        group_fn = partial(group_texts, max_seq_length=args.max_seq_length, pad_token=args.tokenizer.pad_token_id)
+        group_fn = partial(group_texts, max_seq_length=args.max_seq_length, pad_token=args.tokenizer.pad_token_id, eos_token_id=args.tokenizer.eos_token_id)
 
         if args.streaming_data:
             tokenized_dataset = tokenized_dataset_raw.map(group_fn, batched=True)
@@ -367,10 +412,161 @@ def prep_fn(args):
 
     print(f"Process {current_ordinal}: Dataset preparation complete", flush=True)
 
+    # Validate EOS token placement (only for master process to avoid duplicate output)
+    if current_ordinal == 0 and not args.streaming_data:
+        try:
+            validate_eos_tokens(tokenized_dataset, args.tokenizer, num_samples=5)
+        except Exception as e:
+            print(f"EOS validation failed: {e}", flush=True)
+
     # Optional: Add a barrier to ensure all processes finish around the same time
     xm.rendezvous("dataset_prep_complete")
 
     return tokenized_dataset
+
+
+def validate_eos_tokens(dataset, tokenizer, num_samples=10):
+    """
+    Validate that EOS tokens are properly placed in the dataset samples.
+
+    Args:
+        dataset: The tokenized dataset to validate
+        tokenizer: The tokenizer used for tokenization
+        num_samples: Number of samples to check (default: 10)
+
+    Returns:
+        dict: Validation results with statistics
+    """
+    print(f"Validating EOS token placement in {num_samples} samples...", flush=True)
+
+    results = {
+        'total_checked': 0,
+        'samples_with_eos': 0,
+        'samples_without_eos': 0,
+        'eos_at_end_of_content': 0,
+        'eos_in_padding': 0,
+        'issues': []
+    }
+
+    sample_count = 0
+
+    # Handle both streaming and non-streaming datasets
+    try:
+        if hasattr(dataset, 'take'):
+            # Streaming dataset
+            dataset_iter = dataset['train'].take(num_samples)
+        else:
+            # Regular dataset - take first num_samples
+            dataset_iter = dataset['train'].select(range(min(num_samples, len(dataset['train']))))
+    except:
+        # Fallback - try to iterate directly
+        dataset_iter = dataset['train']
+
+    for batch in dataset_iter:
+        if sample_count >= num_samples:
+            break
+
+        input_ids = batch['input_ids']
+        attention_mask = batch.get('attention_mask', [1] * len(input_ids))
+
+        results['total_checked'] += 1
+        sample_count += 1
+
+        # Find where actual content ends (last non-pad token)
+        content_end = len(input_ids) - 1
+        while content_end >= 0 and input_ids[content_end] == tokenizer.pad_token_id:
+            content_end -= 1
+
+        # Check if EOS token is present
+        has_eos = tokenizer.eos_token_id in input_ids
+        if has_eos:
+            results['samples_with_eos'] += 1
+            eos_positions = [i for i, token in enumerate(input_ids) if token == tokenizer.eos_token_id]
+
+            # Check if EOS is at the end of content
+            if content_end >= 0 and input_ids[content_end] == tokenizer.eos_token_id:
+                results['eos_at_end_of_content'] += 1
+            else:
+                # EOS is in padding or middle of content
+                if any(pos > content_end for pos in eos_positions):
+                    results['eos_in_padding'] += 1
+                    results['issues'].append(f"Sample {sample_count}: EOS token found in padding area")
+        else:
+            results['samples_without_eos'] += 1
+            results['issues'].append(f"Sample {sample_count}: No EOS token found")
+
+    # Print validation summary
+    print(f"EOS Token Validation Results:", flush=True)
+    print(f"  Total samples checked: {results['total_checked']}", flush=True)
+    print(f"  Samples with EOS token: {results['samples_with_eos']}", flush=True)
+    print(f"  Samples without EOS token: {results['samples_without_eos']}", flush=True)
+    print(f"  EOS at end of content: {results['eos_at_end_of_content']}", flush=True)
+    print(f"  EOS in padding area: {results['eos_in_padding']}", flush=True)
+
+    if results['issues']:
+        print(f"  Issues found: {len(results['issues'])}", flush=True)
+        for issue in results['issues'][:5]:  # Show first 5 issues
+            print(f"    {issue}", flush=True)
+
+    return results
+
+
+def test_eos_token_handling(tokenizer, max_seq_length=512):
+    """
+    Test function to demonstrate proper EOS token handling.
+
+    Args:
+        tokenizer: The tokenizer to test
+        max_seq_length: Maximum sequence length for testing
+
+    Returns:
+        bool: True if tests pass, False otherwise
+    """
+    print("Testing EOS token handling...", flush=True)
+
+    # Test cases
+    test_texts = [
+        "This is a short text.",
+        "This is a longer text that should demonstrate how EOS tokens are properly added to sequences of various lengths.",
+        "A" * (max_seq_length - 10),  # Near max length
+        "B" * max_seq_length,         # At max length
+        "C" * (max_seq_length + 50)   # Over max length
+    ]
+
+    all_tests_passed = True
+
+    for i, text in enumerate(test_texts):
+        print(f"Testing case {i+1}: text length {len(text)}", flush=True)
+
+        # Test tokenization
+        examples = {"text": [text]}
+        result = tokenize_function(examples, tokenizer, max_seq_length, skip_eos=False)
+
+        input_ids = result["input_ids"][0]
+        attention_mask = result["attention_mask"][0]
+
+        # Find end of actual content (before padding)
+        content_end = len(input_ids) - 1
+        while content_end >= 0 and input_ids[content_end] == tokenizer.pad_token_id:
+            content_end -= 1
+
+        # Check if EOS token is at the end of content
+        has_eos_at_end = (content_end >= 0 and input_ids[content_end] == tokenizer.eos_token_id)
+
+        if has_eos_at_end:
+            print(f"  ✓ EOS token correctly placed at end of content (position {content_end})", flush=True)
+        else:
+            print(f"  ✗ EOS token missing or misplaced at end of content", flush=True)
+            all_tests_passed = False
+
+        # Check sequence length
+        if len(input_ids) == max_seq_length:
+            print(f"  ✓ Sequence properly padded to max_seq_length", flush=True)
+        else:
+            print(f"  ✗ Sequence length {len(input_ids)} != max_seq_length {max_seq_length}", flush=True)
+            all_tests_passed = False
+
+    return all_tests_passed
 
 
 def safe_iter(iterable):
@@ -1081,6 +1277,14 @@ def main():
         args.tokenizer.add_special_tokens({'bos_token': '<|begin_of_text|>'})
 
     print(f"Tokenizer EOS token: {args.tokenizer.eos_token} (ID: {args.tokenizer.eos_token_id})", flush=True)
+
+    # Test EOS token handling (only on master process)
+    if global_ordinal() == 0:
+        try:
+            test_passed = test_eos_token_handling(args.tokenizer, args.max_seq_length)
+            print(f"EOS token handling test: {'PASSED' if test_passed else 'FAILED'}", flush=True)
+        except Exception as e:
+            print(f"EOS token test failed with error: {e}", flush=True)
 
     if args.shuffle_dataset:
             args.dataset_dir = args.shuffle_dataset_path
