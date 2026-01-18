@@ -103,19 +103,19 @@ meta_data = {
     "MIMICIII_*.jsonl": {"id_field": "HADM_ID", "text_field": "text"},
     "GeminiFlash2_*": {"id_field": "id", "text_field": "text"},
     "MIMIC3_Gemini15_*.jsonl": {"id_field": "HADM_ID", "text_field": "text"},
-    "*_oa_comm_xml.incr.*.jsonl": {
+    "*output_oa_comm_xml.incr.*.jsonl": {
         "id_field": "meta_filename",
         "text_field": "translated_text",
     },
-    "*_oa_noncomm_xml.incr.*.jsonl": {
+    "*output_oa_noncomm_xml.incr.*.jsonl": {
         "id_field": "meta_filename",
         "text_field": "translated_text",
     },
-    "*_oa_comm_xml.*.baseline.*.jsonl": {
+    "*output_oa_comm_xml.*.baseline.*.jsonl": {
         "id_field": "meta_filename",
         "text_field": "translated_text",
     },
-    "*_oa_noncomm_xml.*.baseline.*.jsonl": {
+    "*output_oa_noncomm_xml.*.baseline.*.jsonl": {
         "id_field": "meta_filename",
         "text_field": "translated_text",
     },
@@ -154,17 +154,34 @@ def clean_text(text):
 # base assumptions are: there is a 'text' column/field
 # name of id column may vary
 # We load the datafiles from GCS one by one
-def load_datafiles_from_gcs(gcs_dir, out_dir, separator=None):
+def get_existing_files(out_dir):
+    """Get set of existing file names in output directory (local or GCS)."""
+    if out_dir.startswith("gs://"):
+        out_dir_stripped = out_dir[5:]  # Remove gs://
+        client = get_storage_client()
+        bucket = client.get_bucket(out_dir_stripped.split("/")[0])
+        existing_files = set(
+            ".".join(blob.name.split("/")[-1].split(".")[:-1])
+            for blob in bucket.list_blobs(prefix=out_dir_stripped.split("/")[1])
+        )
+    else:
+        if os.path.exists(out_dir):
+            existing_files = set(
+                [".".join(file.split(".")[:-1]) for file in os.listdir(out_dir)]
+            )
+        else:
+            existing_files = set()
+    return existing_files
+
+
+def load_datafiles_from_gcs(gcs_dir, existing_files, separator=None):
     client = get_storage_client()
     bucket = client.get_bucket(gcs_dir.split("/")[0])
     blobs = bucket.list_blobs(prefix=gcs_dir.split("/")[1])
-    existing_files = set(
-        blob.name for blob in bucket.list_blobs(prefix=out_dir.split("/")[1])
-    )
 
     print(f"Currently existing files {existing_files}")
 
-    namer = lambda x: x.name.split("/")[-1].split(".")[0]
+    namer = lambda x: ".".join(x.name.split("/")[-1].split(".")[:-1])
 
     blobs = [
         blob
@@ -174,7 +191,7 @@ def load_datafiles_from_gcs(gcs_dir, out_dir, separator=None):
 
     failed_lines = []
     fix_needed = []
-    print(f"Downloading files from GCS")
+    print(f"Downloading files from GCS: {[blob.name.split('/')[-1] for blob in blobs]}")
     for blob in blobs:
         _, file_extension = os.path.splitext(blob.name)
         filename = blob.name.split("/")[-1]
@@ -222,19 +239,19 @@ def load_datafiles_from_gcs(gcs_dir, out_dir, separator=None):
             yield "txt", filename, lines
 
 
-def load_datafiles_from_local(in_dir, out_dir, seperator=None):
+def load_datafiles_from_local(in_dir, existing_files, separator=None):
     files = os.listdir(in_dir)
-    existing_files = set([file.split(".")[0] for file in os.listdir(out_dir)])
 
     print(f"Currently existing files {existing_files}")
-
-    namer = lambda x: x.name.split("/")[-1].split(".")[0]
 
     files = [
         file
         for file in files
         if not any(
-            [file.split(".")[0] in _existing_file for _existing_file in existing_files]
+            [
+                ".".join(file.split(".")[:-1]) in _existing_file
+                for _existing_file in existing_files
+            ]
         )
     ]
 
@@ -375,11 +392,12 @@ def normalise_data(data, file_type, incoming_file_name, min_words=MIN_WORDS_DEFA
     return normalised_data, word_count
 
 
-def data_transfer(data, output_dir, file_name):
-    # write to local
+def data_transfer_gcs(data, output_dir, file_name):
+    """Upload data to GCS."""
+    # write to local temp file first
     local_file_path = "../tmp/normalised_data.jsonl"
     with open(local_file_path, "w") as f:
-        for entry in data:
+        for entry in tqdm.tqdm(data):
             json.dump(entry, f)
             f.write("\n")
 
@@ -395,13 +413,21 @@ def data_transfer(data, output_dir, file_name):
 
 
 def data_transfer_local(data, output_dir, file_name):
-    # write to local
-    local_file_path = os.path.join(output_dir, "normalised_data.jsonl")
+    """Write data to local filesystem."""
+    local_file_path = os.path.join(output_dir, file_name + "_normalised.jsonl")
     with open(local_file_path, "w") as f:
         for entry in tqdm.tqdm(data):
             json.dump(entry, f)
             f.write("\n")
     return True
+
+
+def data_transfer(data, output_dir, file_name):
+    """Transfer data to output directory (local or GCS)."""
+    if output_dir.startswith("gs://"):
+        return data_transfer_gcs(data, output_dir[5:], file_name)
+    else:
+        return data_transfer_local(data, output_dir, file_name)
 
 
 # We then normalise the data and save it to a new .json and upload to the GCS normalised data folder
@@ -419,25 +445,19 @@ if __name__ == "__main__":
     )
     args = argparser.parse_args()
 
-    if args.input_dir.startswith("gs://") and args.output_dir.startswith("gs://"):
-        file_iterator = load_datafiles_from_gcs(
-            args.input_dir.strip("gs://"), args.output_dir.strip("gs://")
-        )
+    # Get existing files from output directory (works for both local and GCS)
+    existing_files = get_existing_files(args.output_dir)
 
-        for file_type, file_name, data in file_iterator:
-            normalised_data, word_count = normalise_data(
-                data, file_type, file_name, min_words=args.min_words
-            )
-            data_transfer(normalised_data, args.output_dir.strip("gs://"), file_name)
-            print(f"Normalised and uploaded {file_name}, Wordcount: {word_count}.")
-
+    # Load data from input directory (local or GCS)
+    if args.input_dir.startswith("gs://"):
+        file_iterator = load_datafiles_from_gcs(args.input_dir[5:], existing_files)
     else:
-        file_iterator = load_datafiles_from_local(args.input_dir, args.output_dir)
-        for file_type, file_name, data in file_iterator:
-            normalised_data, word_count = normalise_data(
-                data, file_type, file_name, min_words=args.min_words
-            )
-            data_transfer_local(
-                normalised_data, args.output_dir.strip("gs://"), file_name
-            )
-            print(f"Normalised and saved {file_name}, Wordcount: {word_count}.")
+        file_iterator = load_datafiles_from_local(args.input_dir, existing_files)
+
+    # Process and save to output directory (local or GCS)
+    for file_type, file_name, data in file_iterator:
+        normalised_data, word_count = normalise_data(
+            data, file_type, file_name, min_words=args.min_words
+        )
+        data_transfer(normalised_data, args.output_dir, file_name)
+        print(f"Normalised and saved {file_name}, Wordcount: {word_count}.")
