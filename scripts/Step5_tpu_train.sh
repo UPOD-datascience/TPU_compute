@@ -1,9 +1,9 @@
 #!/bin/bash
 set -o allexport
-source ../.bigbird.env
+source ../.neobert.env
 set +o allexport
 
-ENV=".bigbird.env"
+ENV=".neobert.env"
 
 echo "Setting environment variables... (TPU_NAME=${TPU_NAME}, ZONE=${ZONE}, PROJECT_ID=${PROJECT_ID})"
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -26,8 +26,8 @@ gcloud compute tpus tpu-vm scp ../${ENV} ${TPU_NAME}:/home/${USERNAME}/.env \
     --project=${PROJECT_ID} \
     --worker=all
 
-# Copy the training wrapper script
-gcloud compute tpus tpu-vm scp train_wrapper.sh ${TPU_NAME}:/home/${USERNAME}/train_wrapper.sh \
+# Copy the NeoBERT training wrapper script
+gcloud compute tpus tpu-vm scp train_wrapper_neobert.sh ${TPU_NAME}:/home/${USERNAME}/train_wrapper.sh \
     --zone=${ZONE} \
     --project=${PROJECT_ID} \
     --worker=all
