@@ -5,6 +5,7 @@
 import argparse
 import json
 import os
+import re
 from posixpath import extsep
 
 import numpy as np
@@ -17,6 +18,49 @@ from datasets import Dataset, DatasetDict, Features, Value, load_dataset
 from google.cloud import storage
 from tokenizers import ByteLevelBPETokenizer
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+
+def sanitize_text(text):
+    """
+    Sanitize text to remove or escape characters that can cause PyArrow JSON parsing errors.
+    This handles unescaped quotes, control characters, and other problematic content.
+    """
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        return str(text)
+    # Remove null bytes and other control characters (except newlines and tabs)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    # Remove all types of quotes to avoid JSON parsing issues
+    # Single quotes: ' (U+0027), ' (U+2018), ' (U+2019), ‚ (U+201A), ‛ (U+201B), ′ (U+2032)
+    text = re.sub(r"[\u0027\u2018\u2019\u201a\u201b\u2032']", "", text)
+    # Double quotes: " (U+0022), " (U+201C), " (U+201D), „ (U+201E), ‟ (U+201F), ″ (U+2033)
+    text = re.sub(r"[\u0022\u201c\u201d\u201e\u201f\u2033]", "", text)
+
+    return text
+
+
+def sanitize_batch(batch):
+    """
+    Sanitize all string fields in a batch of records.
+    """
+    sanitized = []
+    for item in batch:
+        sanitized_item = dict(item)
+        for key in ["text", "id", "source"]:
+            if key in sanitized_item:
+                sanitized_item[key] = sanitize_text(sanitized_item[key])
+        sanitized.append(sanitized_item)
+    return sanitized
+
+
+def is_json_file(filepath):
+    """
+    Check if a file has a valid JSON or JSONL extension.
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    return ext in [".json", ".jsonl"]
+
 
 # Create an argument parser to accept file paths, tokenizer model, and max_seq_length.
 argparser = argparse.ArgumentParser(
@@ -131,7 +175,36 @@ print("Connecting to Google Cloud Storage...")
 client = get_storage_client()
 bucket = client.get_bucket(args.data_bucket.split("gs://")[-1])
 
+
+def format_size(size_bytes):
+    """Format size in bytes to human-readable format."""
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.2f} PB"
+
+
+def needs_download(blob, local_file_path):
+    """
+    Check if a file needs to be downloaded by comparing existence and file size.
+    Returns True if file doesn't exist or size differs from remote blob.
+    """
+    if not os.path.exists(local_file_path):
+        return True
+    local_size = os.path.getsize(local_file_path)
+    remote_size = blob.size
+    if local_size != remote_size:
+        print(
+            f"Size mismatch for {local_file_path}: local={local_size}, remote={remote_size}. Re-downloading..."
+        )
+        return True
+    return False
+
+
 local_train_files = []
+total_gcs_size_train = 0
+total_local_size_train = 0
 if args.validation_only == False:
     counter = 0
     print(f"Downloading training data from {args.train_loc}...")
@@ -140,18 +213,28 @@ if args.validation_only == False:
     ):
         local_file_path = os.path.join(train_loc_dir, blob.name.split("/")[-1])
         current_files = os.listdir(train_loc_dir)
-        local_train_files = [os.path.join(train_loc_dir, f) for f in current_files]
-        if (".json" in local_file_path) and (
-            local_file_path.split("/")[-1] not in current_files
-        ):
-            print(f"Downloading to {local_file_path}")
-            blob.download_to_filename(local_file_path)
-            local_train_files.append(local_file_path)
-            counter += 1
-            if (counter == 1) & (args.debug_mode):
-                break
+        local_train_files = [
+            os.path.join(train_loc_dir, f) for f in current_files if is_json_file(f)
+        ]
+        if is_json_file(local_file_path):
+            total_gcs_size_train += blob.size or 0
+            if needs_download(blob, local_file_path):
+                print(f"Downloading to {local_file_path}")
+                blob.download_to_filename(local_file_path)
+                if local_file_path not in local_train_files:
+                    local_train_files.append(local_file_path)
+                counter += 1
+                if (counter == 1) & (args.debug_mode):
+                    break
+            if os.path.exists(local_file_path):
+                total_local_size_train += os.path.getsize(local_file_path)
+    print(
+        f"Train data - Total filesize on GCS: {format_size(total_gcs_size_train)}, local: {format_size(total_local_size_train)}"
+    )
 
 local_validation_files = []
+total_gcs_size_val = 0
+total_local_size_val = 0
 counter = 0
 print(f"Downloading validation data from {args.validation_loc}...")
 for blob in bucket.list_blobs(
@@ -159,16 +242,24 @@ for blob in bucket.list_blobs(
 ):
     local_file_path = os.path.join(val_loc_dir, blob.name.split("/")[-1])
     current_files = os.listdir(val_loc_dir)
-    local_validation_files = [os.path.join(val_loc_dir, f) for f in current_files]
-    if (".json" in local_file_path) and (
-        local_file_path.split("/")[-1] not in current_files
-    ):
-        print(f"Downloading to {local_file_path}")
-        blob.download_to_filename(local_file_path)
-        local_validation_files.append(local_file_path)
-        counter += 1
-        if (counter == 1) & (args.debug_mode):
-            break
+    local_validation_files = [
+        os.path.join(val_loc_dir, f) for f in current_files if is_json_file(f)
+    ]
+    if is_json_file(local_file_path):
+        total_gcs_size_val += blob.size or 0
+        if needs_download(blob, local_file_path):
+            print(f"Downloading to {local_file_path}")
+            blob.download_to_filename(local_file_path)
+            if local_file_path not in local_validation_files:
+                local_validation_files.append(local_file_path)
+            counter += 1
+            if (counter == 1) & (args.debug_mode):
+                break
+        if os.path.exists(local_file_path):
+            total_local_size_val += os.path.getsize(local_file_path)
+print(
+    f"Validation data - Total filesize on GCS: {format_size(total_gcs_size_val)}, local: {format_size(total_local_size_val)}"
+)
 
 data_files = {"train": local_train_files, "validation": local_validation_files}
 print("Data files loaded.")
@@ -264,17 +355,19 @@ else:
                     for dataset, name in tqdm.tqdm(raw_datasets[split]):
                         for item in dataset:
                             batch.append(item)
-                            if len(batch) == 5_000:
+                            if len(batch) == 2_048:
+                                sanitized = sanitize_batch(batch)
                                 table = pa.Table.from_pandas(
-                                    pd.DataFrame(batch), schema=pa_schema
+                                    pd.DataFrame(sanitized), schema=pa_schema
                                 )
-                                writer.write_table(table, row_group_size=5_000)
+                                writer.write_table(table, row_group_size=2_048)
                                 batch = []
                         if batch:  # Write any remaining items
+                            sanitized = sanitize_batch(batch)
                             table = pa.Table.from_pandas(
-                                pd.DataFrame(batch), schema=pa_schema
+                                pd.DataFrame(sanitized), schema=pa_schema
                             )
-                            writer.write_table(table, row_group_size=5_000)
+                            writer.write_table(table, row_group_size=2_048)
 
             elif args.write_mode == "jsonl":
                 output_file = os.path.join(args.save_dir_local, f"{split}.jsonl")
