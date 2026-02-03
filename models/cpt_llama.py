@@ -2,6 +2,25 @@ import argparse
 import torch
 import traceback
 import sys
+import os
+
+os.environ['HF_DATASETS_CACHE'] = '/home/bes3/datasets_cache'
+os.environ['HF_HOME'] = '/home/bes3/hf_cache'
+
+# Ensure cache directories exist
+os.makedirs('/home/bes3/datasets_cache', exist_ok=True)
+os.makedirs('/home/bes3/hf_cache', exist_ok=True)
+
+import shutil
+cache_dirs = [
+    os.path.expanduser("~/.cache/huggingface"),
+    os.path.expanduser("~/.cache/datasets"),
+    "/tmp/datasets"
+]
+for cache_dir in cache_dirs:
+    if os.path.exists(cache_dir):
+        print(f"Removing cache directory: {cache_dir}", flush=True)
+        shutil.rmtree(cache_dir)
 
 #import deepspeed
 try:
@@ -31,7 +50,6 @@ from datasets import load_dataset, DatasetDict, DatasetInfo, interleave_datasets
 from safetensors.torch import load_file as load_safetensors
 
 import wandb
-import os
 import io
 import tempfile
 import subprocess
@@ -312,10 +330,13 @@ def prep_fn(args):
     # Load and tokenize dataset
     if args.pre_tokenized:
         print(f"Process {current_ordinal}: Loading pre-tokenized data - EOS tokens should already be present", flush=True)
-        datasets = {
-            "train": args.dataset_dir + f"/train_{args.max_seq_length}.{args.dataset_format}",
-            "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.{args.dataset_format}"
-        }
+        if args.training_file and args.validation_file:
+            datasets = {"train": args.training_file, "validation": args.validation_file}
+        else:
+            datasets = {
+                "train": args.dataset_dir + f"/train_{args.max_seq_length}.{args.dataset_format}",
+                "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.{args.dataset_format}"
+            }
         if args.streaming_data:
             print(f"Process {current_ordinal}: Loading pre-tokenized streaming dataset...", flush=True)
             tokenized_dataset = load_dataset(
@@ -336,20 +357,26 @@ def prep_fn(args):
         print(f"Process {current_ordinal}: Loading raw dataset for tokenization...", flush=True)
         print(f"Dataset location: {args.dataset_dir}", flush=True)
 
-        train_loc = "train" if not args.debug else "validation"
-        datasets = {"train": args.dataset_dir+f"/{train_loc}/*.{args.dataset_format}",
-                    "validation": args.dataset_dir+f"/validation/*.{args.dataset_format}"}
+        if args.training_file and args.validation_file:
+            datasets = {"train": args.training_file, "validation": args.validation_file}
+        else:
+            train_loc = "train" if not args.debug else "validation"
+            datasets = {"train": args.dataset_dir+f"/{train_loc}/*.{args.dataset_format}",
+                        "validation": args.dataset_dir+f"/validation/*.{args.dataset_format}"}
 
         if args.streaming_data:
-            try:
-                if current_ordinal == 0:  # Only master process calculates this
-                    ds_train_info = DatasetInfo.from_directory(args.dataset_dir+f"/{train_loc}/")
-                    num_examples = ds_train_info['num_examples']
-                    args.max_steps_per_epoch = num_examples // args.per_device_train_batch_size // max(world_size(), 1)
-                    print(f"Maximum steps per epoch: {args.max_steps_per_epoch}", flush=True)
-            except Exception as e:
-                print(f"Could not obtain datasetinfo:{e}")
-                pass
+            # Estimate steps/epoch only when loading from a directory
+            if (not args.training_file) and (not args.validation_file):
+                try:
+                    if current_ordinal == 0:  # Only master process calculates this
+                        train_loc = "train" if not args.debug else "validation"
+                        ds_train_info = DatasetInfo.from_directory(args.dataset_dir+f"/{train_loc}/")
+                        num_examples = ds_train_info['num_examples']
+                        args.max_steps_per_epoch = num_examples // args.per_device_train_batch_size // max(world_size(), 1)
+                        print(f"Maximum steps per epoch: {args.max_steps_per_epoch}", flush=True)
+                except Exception as e:
+                    print(f"Could not obtain datasetinfo:{e}")
+                    pass
 
             print(f"Process {current_ordinal}: Init streaming dataset...", flush=True)
             dataset = load_dataset(
@@ -358,10 +385,7 @@ def prep_fn(args):
                     streaming=True,
                     keep_in_memory=False
                 )
-            # add more datasets, and use interleave_datasets
-            # dataset2 = load_dataset()
-            # dataset = dataset.interleave_datasets([dataset, dataset2],
-            # probabilities=[0.5, 0.5], stopping_strategy='all_exhausted')
+
         else:
             print(f"Process {current_ordinal}: Init non-streaming dataset...", flush=True)
             if args.sharded_data:
@@ -379,19 +403,31 @@ def prep_fn(args):
         # Each TPU core is already a separate process
         print(f"Process {current_ordinal}: Tokenizing dataset...", flush=True)
         tokenize_fn = partial(tokenize_function, tokenizer=args.tokenizer, max_seq_length=args.max_seq_length, skip_eos=args.pre_tokenized)
+        # Compute safe remove_columns based on actual columns present in dataset/split
+        candidate_remove = ["text", "id", "source", "approx_token_counts_translated", "approx_token_counts_original"]
+        try:
+            # Prefer the train split if available
+            colnames = dataset["train"].column_names
+        except Exception:
+            try:
+                # Fallback to dataset-level column names if present
+                colnames = dataset.column_names
+            except Exception:
+                colnames = []
+        safe_remove = [c for c in candidate_remove if c in (colnames or [])]
 
         # Remove num_proc for streaming to avoid conflicts
         if args.streaming_data:
             tokenized_dataset_raw = dataset.map(
                 tokenize_fn,
                 batched=True,
-                remove_columns=["text", "id", "source", "approx_token_counts_translated", "approx_token_counts_original"]
+                remove_columns=safe_remove
             )
         else:
             tokenized_dataset_raw = dataset.map(
                 tokenize_fn,
                 batched=True,
-                remove_columns=["text", "id", "source", "approx_token_counts_translated", "approx_token_counts_original"],
+                remove_columns=safe_remove,
                 num_proc=1  # Use single process to avoid conflicts
             )
 
@@ -746,7 +782,12 @@ def train_fn(tokenized_dataset, device, args):
             print(f"Process {global_ordinal()}: Sharded dataset created successfully", flush=True)
         except Exception as e:
             print(f"Process {global_ordinal()}: Error creating sharded dataset: {e}", flush=True)
-            raise
+            print(f"Process {global_ordinal()}: Falling back to index-based streaming filter sharding...", flush=True)
+            sharded_train_dataset = tokenized_dataset["train"].filter(
+                lambda ex, idx: idx % num_shards == shard_id,
+                with_indices=True
+            )
+            print(f"Process {global_ordinal()}: Fallback sharded dataset created successfully", flush=True)
 
         print(f"Process {global_ordinal()}: Creating streaming DataLoader...", flush=True)
 
@@ -1093,6 +1134,14 @@ def prep_and_train_fn(index, args):
 
     print(f"Process {index}: ordinal={ordinal}, world_size={world_size_val}, device={device}", flush=True)
 
+    # Rank 0 runs EOS token handling test after XLA runtime is initialized
+    if global_ordinal() == 0:
+        try:
+            test_passed = test_eos_token_handling(args.tokenizer, args.max_seq_length)
+            print(f"EOS token handling test: {'PASSED' if test_passed else 'FAILED'}", flush=True)
+        except Exception as e:
+            print(f"EOS token test failed with error: {e}", flush=True)
+
     xm.rendezvous("prep_start")
     tokenized_dataset = prep_fn(args)
 
@@ -1140,6 +1189,8 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--dataset_dir", type=str, required=True)
+    parser.add_argument("--training_file", type=str, default=None, help="Path to training parquet file (local path or gs://)")
+    parser.add_argument("--validation_file", type=str, default=None, help="Path to validation parquet file (local path or gs://)")
     parser.add_argument("--dataset_format", default="json", choices=["json", "parquet", "arrow"])
     parser.add_argument("--tmp_dir", type=str, required=True)
     parser.add_argument("--tokenizer_name_or_path", type=str, required=True)
@@ -1173,7 +1224,7 @@ def main():
     parser.add_argument("--shuffle_force_update", action='store_true')
     parser.add_argument("--debug", action='store_true')
     parser.add_argument("--checkpoint_path", type=str)
-    parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
+    parser.add_argument("--model_name", type=str, default="UMCU/CardioLlama.nl_clinical")
     parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
     parser.add_argument("--huggingface_token", type=str, required=True)
     parser.add_argument("--TPU_NAME", type=str, default="unknown, please set with --TPU_ID")
@@ -1191,76 +1242,7 @@ def main():
     # Set the same seed for all processes
     torch.manual_seed(args.seed)
 
-    if args.shuffle_dataset:
-        shuffle_dir = args.shuffle_dataset_path
-        if (os.path.exists(shuffle_dir)) and (args.shuffle_force_update==False):
-            print(f"Shuffled dataset exists, skipping creation: {shuffle_dir}", flush=True)
-        else:
-            if (os.path.exists(shuffle_dir)):
-                print(f"Removing shuffled dataset: {shuffle_dir}", flush=True)
-                shutil.rmtree(shuffle_dir)
-
-            if args.shuffle_dataset_ext is not None:
-                print("Loading pre-shuffled dataset...", flush=True)
-                dataset = load_dataset(args.dataset_format, data_files={
-                    "train": args.shuffle_dataset_ext,
-                    "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
-                }, keep_in_memory=True)
-
-                print("Clearing cache!", flush=True)
-                cache_dir = os.path.expanduser("~/.cache/huggingface")
-                if os.path.exists(cache_dir):
-                    print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
-                    shutil.rmtree(cache_dir)
-                else:
-                    print("Hugging Face cache directory not found.", flush=True)
-
-                dataset.save_to_disk(args.shuffle_dataset_path)
-
-                print("Clearing cache a-posteriori !", flush=True)
-                cache_dir = os.path.expanduser("~/.cache/huggingface")
-                if os.path.exists(cache_dir):
-                    print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
-                    shutil.rmtree(cache_dir)
-                else:
-                    print("Hugging Face cache directory not found.", flush=True)
-
-            else:
-                print("Loading dataset for shuffling...", flush=True)
-                dataset = load_dataset(args.dataset_format, data_files={
-                    "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
-                    "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
-                }, keep_in_memory=True)
-
-                print("Clearing cache!", flush=True)
-                cache_dir = os.path.expanduser("~/.cache/huggingface")
-                if os.path.exists(cache_dir):
-                    print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
-                    shutil.rmtree(cache_dir)
-                else:
-                    print("Hugging Face cache directory not found.", flush=True)
-
-                print("Shuffling and saving dataset...", flush=True)
-                shuffle_and_save_dataset(dataset, args.shuffle_dataset_path)
-
-                print("Clearing cache a-posteriori !", flush=True)
-                cache_dir = os.path.expanduser("~/.cache/huggingface")
-                if os.path.exists(cache_dir):
-                    print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
-                    shutil.rmtree(cache_dir)
-                else:
-                    print("Hugging Face cache directory not found.", flush=True)
-
-            # Update the dataset directory to the shuffled dataset path
-            # Clear the dataset from memory
-            del dataset
-            gc.collect()
-            print("Cleared shuffled dataset from master's memory", flush=True)
-    else:
-        shuffle_dir = args.shuffle_dataset_path
-        if os.path.exists(shuffle_dir):
-            print(f"Removing shuffled dataset: {shuffle_dir}", flush=True)
-            shutil.rmtree(shuffle_dir)
+    # Using explicit --training_file/--validation_file with streaming; shuffle-related logic removed.
 
 
     args.tokenizer = LlamaTokenizerFast.from_pretrained(args.tokenizer_name_or_path, token=args.huggingface_token)
@@ -1278,18 +1260,9 @@ def main():
 
     print(f"Tokenizer EOS token: {args.tokenizer.eos_token} (ID: {args.tokenizer.eos_token_id})", flush=True)
 
-    # Test EOS token handling (only on master process)
-    if global_ordinal() == 0:
-        try:
-            test_passed = test_eos_token_handling(args.tokenizer, args.max_seq_length)
-            print(f"EOS token handling test: {'PASSED' if test_passed else 'FAILED'}", flush=True)
-        except Exception as e:
-            print(f"EOS token test failed with error: {e}", flush=True)
+    # EOS test moved into prep_and_train_fn(rank 0) to avoid pre-spawn XLA init
 
-    if args.shuffle_dataset:
-            args.dataset_dir = args.shuffle_dataset_path
-            args.dataset_format = 'arrow'
-            print("Continuing with Arrow format", flush=True)
+    # Using training/validation files; no shuffle dataset redirection.
 
     sleep(5)
 
@@ -1306,6 +1279,7 @@ def main():
         # Ensure XLA uses all available cores
         os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=' + str(args.num_cores)
         try:
+            print("STARTING SPAWN", flush=True)
             xmp.spawn(prep_and_train_fn, args=(args,), start_method='spawn')
         except Exception as e:
             print(f"Error spawning processes: {e}", flush=True)

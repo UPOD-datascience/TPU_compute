@@ -29,9 +29,8 @@ while true; do
     --eta_min=${LR_MIN} \
     --mlm_probability=${MLM_PROB} \
     --streaming_data \
-    --shuffle_dataset \
-    --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
-    --shuffle_dataset_ext=${SHUFFLED_DATASET_EXT} \
+    --training_file=${SHUFFLED_DATASET_EXT} \
+    --validation_file=${DATASET_FOLDER}/validation/*.${DATASET_FORMAT} \
     --checkpoint_path=${MODEL_CHECKPOINT} \
     --max_steps_per_epoch=${MAX_STEPS_PER_EPOCH} \
     --weight_decay=${WEIGHT_DECAY} \

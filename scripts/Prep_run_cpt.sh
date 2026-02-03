@@ -6,8 +6,8 @@ set -o allexport
 source ../.llama.env
 set +o allexport
 
-./Step1b_create_disk.sh
-./Step1c_upload_to_disk.sh
+# ./Step1b_create_disk.sh
+# ./Step1c_upload_to_disk.sh
 ./Step2a_startup_pod.sh
 ./Step2b_install_prequisites.sh
 ./Step2c_mount_disk.sh
