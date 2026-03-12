@@ -55,5 +55,11 @@ while true; do
 
   EXIT_CODE=$?
   echo "Training exited with code ${EXIT_CODE} at $(date). Restarting in 60 seconds..." | tee -a ~/logs.txt
+
+  # Truncate log file to last 50,000 lines to prevent unbounded growth
+  if [ -f ~/logs.txt ]; then
+    tail -n 50000 ~/logs.txt > ~/logs.txt.tmp && mv ~/logs.txt.tmp ~/logs.txt
+  fi
+
   sleep 60
 done

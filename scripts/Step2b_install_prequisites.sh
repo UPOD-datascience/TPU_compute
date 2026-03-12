@@ -18,6 +18,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --project=${PROJECT_ID} \
   --worker=all --command="
 pip install torch==2.6.0 torch_xla[tpu]==2.6.0 -f https://storage.googleapis.com/libtpu-releases/index.html -f https://storage.googleapis.com/libtpu-wheels/index.html &&
+pip install pyOpenSSL --upgrade &&
 pip install google-cloud-storage &&
 pip install transformers==4.52.4 &&
 pip install tokenizers datasets tqdm wandb safetensors nltk huggingface_hub[cli] &&

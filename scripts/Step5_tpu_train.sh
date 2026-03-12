@@ -1,9 +1,9 @@
 #!/bin/bash
 set -o allexport
-source ../.neobert.env
+source ../.deberta.env
 set +o allexport
 
-ENV=".neobert.env"
+ENV=".deberta.env"
 
 echo "Setting environment variables... (TPU_NAME=${TPU_NAME}, ZONE=${ZONE}, PROJECT_ID=${PROJECT_ID})"
 gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
