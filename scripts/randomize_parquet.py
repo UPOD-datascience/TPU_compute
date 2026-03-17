@@ -8,7 +8,70 @@ import shutil
 from tqdm import tqdm
 import random
 
-def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_dir=None, seed=None, iterations=1, write_every_iteration=False):
+
+def concatenate_parquet_files(input_dir, temp_dir=None):
+    """
+    Concatenates all Parquet files in a directory into a single Parquet file.
+
+    Returns the path to the concatenated Parquet file.
+    """
+    if temp_dir is None:
+        temp_dir = tempfile.mkdtemp()
+    else:
+        os.makedirs(temp_dir, exist_ok=True)
+
+    output_path = os.path.join(temp_dir, "concatenated.parquet")
+    print(f"Writing temp to : {output_path}")
+    parquet_files = [
+        os.path.join(input_dir, f)
+        for f in os.listdir(input_dir)
+        if f.endswith(".parquet")
+    ]
+    if not parquet_files:
+        raise ValueError(f"No Parquet files found in directory: {input_dir}")
+
+    print(f"Concatenating {len(parquet_files)} Parquet files from {input_dir}...")
+
+    # Read first file metadata to get schema without loading full data
+    first_file = pq.ParquetFile(parquet_files[0])
+    schema = first_file.schema_arrow
+
+    with pq.ParquetWriter(output_path, schema, compression="snappy") as writer:
+        for pf in parquet_files:
+            print(f"Processing: {pf}")
+            parquet_file = pq.ParquetFile(pf)
+            print(f"Num rows:{parquet_file.metadata.num_rows}")
+            print(f"Num row groups:{parquet_file.metadata.num_row_groups}")
+            file_schema = parquet_file.schema_arrow
+            schema_matches = file_schema == schema
+            print(f"Schema match: {schema_matches}")
+            if not schema_matches:
+                print(f"Expected schema: {schema}")
+                print(f"File schema: {file_schema}")
+            row_group_count = parquet_file.metadata.num_row_groups
+            row_groups_written = 0
+            for rg in tqdm(range(row_group_count), desc="Row groups"):
+                table = parquet_file.read_row_group(rg)
+                table = table.cast(schema)
+                writer.write_table(table)
+                row_groups_written += 1
+                del table
+            print(f"Row groups written:{row_groups_written}")
+            del parquet_file
+
+    print(f"Concatenated Parquet file saved to: {output_path}")
+    return output_path
+
+
+def recursive_shuffle_parquet(
+    input_path,
+    output_path,
+    window_size=50000,
+    temp_dir=None,
+    seed=None,
+    iterations=1,
+    write_every_iteration=False,
+):
     """
     Shuffles a Parquet file using a batch-based approach with minimal disk usage.
 
@@ -60,7 +123,7 @@ def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_d
         current_input = input_path
 
         for iteration in range(iterations):
-            print(f"Starting shuffle iteration {iteration+1}/{iterations}")
+            print(f"Starting shuffle iteration {iteration + 1}/{iterations}")
 
             # Determine the current schema
             if iteration == 0:
@@ -80,21 +143,25 @@ def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_d
             batch_files = []
 
             # Process each batch from the input file
-            for i, batch in enumerate(tqdm(
-                current_file.iter_batches(batch_size=window_size),
-                desc="Processing batches",
-                total=(total_rows + window_size - 1) // window_size
-            )):
+            for i, batch in enumerate(
+                tqdm(
+                    current_file.iter_batches(batch_size=window_size),
+                    desc="Processing batches",
+                    total=(total_rows + window_size - 1) // window_size,
+                )
+            ):
                 # Convert to pandas, shuffle, and convert back
                 df = batch.to_pandas()
                 df = df.sample(frac=1.0)
 
                 # Create a temporary file for this batch
-                batch_file = os.path.join(temp_dir, f"batch_{i}_{random.randint(1000000, 9999999)}.parquet")
+                batch_file = os.path.join(
+                    temp_dir, f"batch_{i}_{random.randint(1000000, 9999999)}.parquet"
+                )
 
                 # Use compression to save disk space
                 table = pa.Table.from_pandas(df, schema=current_schema)
-                pq.write_table(table, batch_file, compression='snappy')
+                pq.write_table(table, batch_file, compression="snappy")
 
                 # Add to our list of batch files
                 batch_files.append(batch_file)
@@ -111,12 +178,16 @@ def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_d
             print("Step 3: Recombining batches and cleaning up...")
 
             # Create a writer for the output
-            with pq.ParquetWriter(iter_output, current_schema, compression='snappy') as writer:
+            with pq.ParquetWriter(
+                iter_output, current_schema, compression="snappy"
+            ) as writer:
                 for batch_file in tqdm(batch_files, desc="Combining batches"):
                     try:
                         # Read this batch, write to output, and immediately delete
                         table = pq.read_table(batch_file)
-                        table = table.cast(current_schema)  # Ensure schema compatibility
+                        table = table.cast(
+                            current_schema
+                        )  # Ensure schema compatibility
                         writer.write_table(table)
 
                         # Clean up memory and disk
@@ -151,30 +222,58 @@ def recursive_shuffle_parquet(input_path, output_path, window_size=50000, temp_d
             print(f"Warning: Failed to clean up temporary directory {temp_dir}: {e}")
         print("Done!")
 
+
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Shuffle a Parquet file using a batch-based approach")
-    parser.add_argument("--input_path", required=True, help="Path to the input Parquet file")
-    parser.add_argument("--output_path", required=True, help="Path for the output shuffled Parquet file")
-    parser.add_argument("--window-size", type=int, default=50000,
-                        help="Number of rows to process in each batch (default: 50000)")
-    parser.add_argument("--temp-dir", default=None,
-                        help="Directory to store temporary files (default: system temp directory)")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="Random seed for reproducibility")
-    parser.add_argument("--iterations", type=int, default=1,
-                        help="Number of times to repeat the shuffling process (default: 1)")
+    parser = argparse.ArgumentParser(
+        description="Shuffle a Parquet file or a directory of Parquet files"
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--input_path", help="Path to the input Parquet file")
+    group.add_argument(
+        "--input_dir",
+        help="Path to a directory of Parquet files to concatenate and shuffle",
+    )
+    parser.add_argument(
+        "--output_path", required=True, help="Path for the output shuffled Parquet file"
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=50_000,
+        help="Number of rows to process in each batch (default: 50000)",
+    )
+    parser.add_argument(
+        "--temp-dir",
+        default=None,
+        help="Directory to store temporary files (default: system temp directory)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None, help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=1,
+        help="Number of times to repeat the shuffling process (default: 1)",
+    )
     parser.add_argument("--write_every_iteration", action="store_true", default=False)
 
     args = parser.parse_args()
 
+    if args.input_dir:
+        concat_path = concatenate_parquet_files(args.input_dir, temp_dir=args.temp_dir)
+        input_path = concat_path
+    else:
+        input_path = args.input_path
+
     recursive_shuffle_parquet(
-        args.input_path,
+        input_path,
         args.output_path,
         window_size=args.window_size,
         temp_dir=args.temp_dir,
         seed=args.seed,
         iterations=args.iterations,
-        write_every_iteration=args.write_every_iteration
+        write_every_iteration=args.write_every_iteration,
     )

@@ -1,20 +1,24 @@
 """
 This is the main script to continue pre-training a Roberta model on GPU.
 """
+
 import argparse
 import torch
 
 from transformers import (
+    AutoModel,
+    AutoModelForMaskedLM,
     DebertaV2TokenizerFast,
     DebertaV2Config,
     DebertaV2ForMaskedLM,
-    DataCollatorForLanguageModeling
+    DataCollatorForLanguageModeling,
 )
 from transformers import Trainer, TrainingArguments
 from transformers import get_linear_schedule_with_warmup
 
 from datasets import load_dataset
-#import wandb
+
+# import wandb
 import os
 import tempfile
 import subprocess
@@ -27,7 +31,7 @@ import shutil
 import numpy as np
 from itertools import chain
 from functools import partial
-
+from pathlib import Path
 
 def prep_fn(args):
     def group_texts(examples, pad_token=0):
@@ -55,14 +59,16 @@ def prep_fn(args):
 
             # Calculate how many chunks we need for this example
             example_length = len(current_example[sample_key])
-            num_chunks = (example_length + args.max_seq_length - 1) // args.max_seq_length  # Ceiling division
+            num_chunks = (
+                example_length + args.max_seq_length - 1
+            ) // args.max_seq_length  # Ceiling division
 
             # Split each feature into chunks
             for k, tokens in current_example.items():
                 # Create chunks of max_seq_length
                 chunks = []
                 for j in range(0, example_length, args.max_seq_length):
-                    chunk = tokens[j:min(j + args.max_seq_length, example_length)]
+                    chunk = tokens[j : min(j + args.max_seq_length, example_length)]
 
                     # Pad if necessary
                     if len(chunk) < args.max_seq_length:
@@ -86,46 +92,73 @@ def prep_fn(args):
     if args.pre_tokenized:
         print("Loading pre-tokenized dataset...", flush=True)
         datasets = {
-            "train": args.dataset_dir + f"/train_{args.max_seq_length}.json",
-            "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.json"
+            "train": args.dataset_dir + f"/train_{args.max_seq_length}.parquet",
+            "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.parquet",
         }
         tokenized_dataset = load_dataset(
-            "json",
+            "parquet",
             data_files=datasets,
             streaming=args.streaming_data,
-            keep_in_memory=args.keep_in_memory
+            keep_in_memory=args.keep_in_memory,
         )
+        
     else:
-        print(f"Tokenizing dataset... with streaming: {args.streaming_data} and keep_in_memory: {args.keep_in_memory}", flush=True)
-        datasets = {"train": args.dataset_dir+f"/train/*.json",
-                    "validation": args.dataset_dir+f"/validation/*.json"}
-        dataset = load_dataset(args.dataset_dir, streaming=args.streaming_data, keep_in_memory=args.keep_in_memory)
+        print(
+            f"Tokenizing dataset... with streaming: {args.streaming_data} and keep_in_memory: {args.keep_in_memory}",
+            flush=True,
+        )
+        base = Path(args.dataset_dir)
+
+        data_files = {
+            "train": str(base / "train" / "*.parquet"),
+            "validation": str(base / "validation" / "*.parquet"),
+        }
+
+        dataset = load_dataset(
+            "parquet",
+            data_files=data_files,
+            streaming=args.streaming_data,
+            keep_in_memory=args.keep_in_memory,
+)
 
         def tokenize_function(examples):
             # here you can actually add a chunker to split the text into smaller parts, of max_len
-            return tokenizer(examples["text"],
-                             truncation=False,
-                             max_length=args.max_seq_length)
-        opt_kwargs = {'num_proc': args.num_cores} if args.streaming_data==False else {}
+            return tokenizer(
+                examples["text"], truncation=False, max_length=args.max_seq_length
+            )
 
-        tokenized_dataset_raw = dataset.map(tokenize_function,
-                                         batched=True,
-                                         remove_columns=["text",
-                                                         "id",
-                                                         "source",
-                                                         "approx_token_counts_translated",
-                                                         "approx_token_counts_original"],
-                                         **opt_kwargs)
+        opt_kwargs = (
+            {"num_proc": args.num_cores} if args.streaming_data == False else {}
+        )
 
-        opt_kwargs = {'num_proc': args.num_cores, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
+        tokenized_dataset_raw = dataset.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=[
+                "text",
+                "id",
+                "source",
+                "approx_token_counts_translated",
+                "approx_token_counts_original",
+            ],
+            **opt_kwargs,
+        )
+
+        opt_kwargs = (
+            {
+                "num_proc": args.num_cores,
+                "desc": f"Grouping texts in chunks of {args.max_seq_length}",
+            }
+            if args.streaming_data == False
+            else {}
+        )
         group_fn = partial(group_texts, pad_token=tokenizer.pad_token_id)
         tokenized_dataset = tokenized_dataset_raw.map(
-                group_fn,
-                batched=True,
-                **opt_kwargs
-            )
+            group_fn, batched=True, **opt_kwargs
+        )
         del tokenized_dataset_raw
     return tokenized_dataset, tokenizer
+
 
 def get_optimizer(model, args):
     """
@@ -136,11 +169,19 @@ def get_optimizer(model, args):
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if not any(nd in n for nd in no_decay)
+            ],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if any(nd in n for nd in no_decay)
+            ],
             "weight_decay": 0.0,
         },
     ]
@@ -151,6 +192,7 @@ def get_optimizer(model, args):
         weight_decay=args.weight_decay,
     )
     return optimizer
+
 
 def evaluate(model, dataloader, device, bf16=False):
     model.eval()
@@ -163,11 +205,11 @@ def evaluate(model, dataloader, device, bf16=False):
         labels = batch["labels"].to(device)
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=bf16, dtype=torch.bfloat16 if bf16 else torch.float32):
+            with torch.cuda.amp.autocast(
+                enabled=bf16, dtype=torch.bfloat16 if bf16 else torch.float32
+            ):
                 outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
+                    input_ids=input_ids, attention_mask=attention_mask, labels=labels
                 )
         loss = outputs.loss
         total_loss += loss.item()
@@ -178,14 +220,15 @@ def evaluate(model, dataloader, device, bf16=False):
     model.train()  # Switch back to train mode
     return ppl, global_avg_loss
 
+
 def train_fn(index, args):
     # Set up device for GPU (or CPU if no GPU available)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running on {device}")
-    print(50*"+")
+    print(50 * "+")
 
     # Initialize wandb for the master process (we use index==0 as master)
-    #if index == 0:
+    # if index == 0:
     #    wandb.init(
     #        project="Deberta GPU CPT",
     #        config={
@@ -199,9 +242,31 @@ def train_fn(index, args):
     #    )
 
     # Load pre-trained model
-    model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
-    model.to(device)
+    if args.init_training:
+        print(f"INITIAL TRAINING RUN FOR MedDeBERTa.nl!")
+        config = DebertaV2Config(
+            vocab_size=args.tokenizer.vocab_size,
+            hidden_size=1024,
+            num_hidden_layers=24,
+            num_attention_heads=32,
+            intermediate_size=4096,
+            max_position_embeddings=1024,
+
+            # important: keep specials consistent with tokenizer
+            pad_token_id=args.tokenizer.pad_token_id,
+            bos_token_id=args.tokenizer.bos_token_id,
+            eos_token_id=args.tokenizer.eos_token_id,
+            cls_token_id=args.tokenizer.cls_token_id,
+            sep_token_id=args.tokenizer.sep_token_id,
+
+        )
     
+        model = AutoModelForMaskedLM.from_config(config)
+        model.to(device)
+    else:
+        model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
+        model.to(device)
+
     if args.bf16:
         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             print(f"Using BF16 mixed precision training")
@@ -212,9 +277,9 @@ def train_fn(index, args):
         print(f"Using FP32 precision training")
 
     # Set up data collator
-    data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
-                                                     mlm=True,
-                                                     mlm_probability=0.15)
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=args.tokenizer, mlm=True, mlm_probability=0.15
+    )
 
     # For GPU training, assume a single process (non-distributed)
     sampler_rank = 0
@@ -228,7 +293,7 @@ def train_fn(index, args):
             args.tokenized_datasets["train"],
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
-            num_workers=0
+            num_workers=0,
         )
     elif args.sharded_data:
         print("Loading sharded dataloader")
@@ -237,7 +302,7 @@ def train_fn(index, args):
             sharded_dataset,
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
-            shuffle=True
+            shuffle=True,
         )
     else:
         print("Loading normal dataloader")
@@ -245,13 +310,13 @@ def train_fn(index, args):
             args.tokenized_datasets["train"],
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
-            shuffle=True
+            shuffle=True,
         )
 
     validation_dataloader = torch.utils.data.DataLoader(
         args.tokenized_datasets["validation"],
         batch_size=args.per_device_train_batch_size,
-        collate_fn=data_collator
+        collate_fn=data_collator,
     )
 
     del args.tokenized_datasets
@@ -263,13 +328,17 @@ def train_fn(index, args):
 
     # Set up optimizer and scheduler
     optimizer = get_optimizer(model, args)
-    steps_per_epoch = args.max_steps_per_epoch if args.streaming_data else len(train_dataloader)
+    steps_per_epoch = (
+        args.max_steps_per_epoch if args.streaming_data else len(train_dataloader)
+    )
     save_steps = int(steps_per_epoch * args.save_epoch_percentage)
     total_steps = steps_per_epoch * args.num_train_epochs
-    scheduler = get_linear_schedule_with_warmup(optimizer,
-                                                 num_warmup_steps=args.num_warmup_steps,
-                                                 num_training_steps=total_steps)
-    
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.num_warmup_steps,
+        num_training_steps=total_steps,
+    )
+
     # Set up gradient scaler for mixed precision training
     scaler = torch.cuda.amp.GradScaler(enabled=args.bf16)
 
@@ -284,27 +353,29 @@ def train_fn(index, args):
     # Training loop
     total_step = 0
     for epoch in range(args.num_train_epochs):
-        total_loss = 0.
-        sub_total_loss = 0.
+        total_loss = 0.0
+        sub_total_loss = 0.0
         sub_step = 0
         model.train()
-        optimizer.zero_grad(set_to_none=True) 
+        optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(train_loader):
             # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
-            
-            with torch.cuda.amp.autocast(enabled=args.bf16, dtype=torch.bfloat16 if args.bf16 else torch.float32):
+
+            with torch.cuda.amp.autocast(
+                enabled=args.bf16, dtype=torch.bfloat16 if args.bf16 else torch.float32
+            ):
                 outputs = model(**batch)
                 loss = outputs.loss / args.gradient_accumulation_steps
-            
+
             if torch.isnan(loss):
-                optimizer.zero_grad(set_to_none=True) 
+                optimizer.zero_grad(set_to_none=True)
                 continue
-            
+
             scaler.scale(loss).backward()
-            
-            total_loss += loss.item()*args.gradient_accumulation_steps
-            sub_total_loss += loss.item()*args.gradient_accumulation_steps
+
+            total_loss += loss.item() * args.gradient_accumulation_steps
+            sub_total_loss += loss.item() * args.gradient_accumulation_steps
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 scaler.unscale_(optimizer)
@@ -313,19 +384,22 @@ def train_fn(index, args):
                 scaler.update()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-                
 
-            if (step + 1) % max(args.logging_steps, args.gradient_accumulation_steps) == 0:
+            if (step + 1) % max(
+                args.logging_steps, args.gradient_accumulation_steps
+            ) == 0:
                 global_avg_loss = total_loss / step
                 global_avg_loss_N = sub_total_loss / sub_step
                 perplexity = math.exp(global_avg_loss)
                 perplexity_N = math.exp(global_avg_loss_N)
-                print(f"Epoch {epoch+1}, step {step}, samples {args.per_device_train_batch_size*step}, loss: {global_avg_loss}, train perplexity: {perplexity}")
+                print(
+                    f"Epoch {epoch + 1}, step {step}, samples {args.per_device_train_batch_size * step}, loss: {global_avg_loss}, train perplexity: {perplexity}"
+                )
 
                 sub_step = 0
-                sub_total_loss = 0.
+                sub_total_loss = 0.0
 
-                #if index == 0:
+                # if index == 0:
                 #    wandb.log({
                 #        "train_global_average_loss_epoch": global_avg_loss,
                 #        f"train_global_average_loss_N{args.logging_steps}": global_avg_loss_N,
@@ -337,7 +411,7 @@ def train_fn(index, args):
                 #    })
 
             total_step += 1
-            sub_step +=1
+            sub_step += 1
 
             if (index == 0) and (step % save_steps == 0) and (step > 0):
                 print("Saving model...")
@@ -347,22 +421,44 @@ def train_fn(index, args):
                         print(f"Saving model to {local_output_dir}...")
                         model_cpu = copy.deepcopy(model).to("cpu")
                         model_cpu = model_cpu.to(torch.bfloat16)
-                        model_cpu.save_pretrained(local_output_dir, save_serialization=True)
+                        model_cpu.save_pretrained(
+                            local_output_dir, save_serialization=True
+                        )
                         print(f"Uploading model to {args.output_dir}...")
-                        subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
+                        subprocess.run(
+                            [
+                                "gsutil",
+                                "-m",
+                                "cp",
+                                "-r",
+                                local_output_dir,
+                                args.output_dir,
+                            ],
+                            check=True,
+                        )
                         current_time = datetime.datetime.now().strftime("%Y%m%d")
-                        new_dir_name = f"{args.model_name}_epoch{epoch}_step{step}_{current_time}"
+                        new_dir_name = (
+                            f"{args.model_name}_epoch{epoch}_step{step}_{current_time}"
+                        )
                         new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                        subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
+                        subprocess.run(
+                            [
+                                "gsutil",
+                                "mv",
+                                os.path.join(args.output_dir, local_output_dir),
+                                new_gcs_path,
+                            ],
+                            check=True,
+                        )
                 else:
                     model_cpu = copy.deepcopy(model).to("cpu")
                     model_cpu = model_cpu.to(torch.bfloat16)
                     model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
-        val_ppl,val_loss = evaluate(model, validation_loader, device, args.bf16)
-        print(f"Epoch {epoch+1} Validation Perplexity: {val_ppl:.3f}")
+        val_ppl, val_loss = evaluate(model, validation_loader, device, args.bf16)
+        print(f"Epoch {epoch + 1} Validation Perplexity: {val_ppl:.3f}")
 
-        #if index == 0:
+        # if index == 0:
         #    wandb.log({
         #        "val_perplexity": val_ppl,
         #        "val_eval_loss": val_loss,
@@ -380,18 +476,30 @@ def train_fn(index, args):
                     model_cpu = model_cpu.to(torch.bfloat16)
                     model_cpu.save_pretrained(local_output_dir, save_serialization=True)
                     print(f"Uploading model to {args.output_dir}...")
-                    subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
+                    subprocess.run(
+                        ["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir],
+                        check=True,
+                    )
                     current_time = datetime.datetime.now().strftime("%Y%m%d")
                     new_dir_name = f"{args.model_name}_epoch{epoch}_{current_time}"
                     new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                    subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
+                    subprocess.run(
+                        [
+                            "gsutil",
+                            "mv",
+                            os.path.join(args.output_dir, local_output_dir),
+                            new_gcs_path,
+                        ],
+                        check=True,
+                    )
             else:
                 model_cpu = copy.deepcopy(model).to("cpu")
                 model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
     # Finish wandb run
-    #if index == 0:
+    # if index == 0:
     #    wandb.finish()
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -399,7 +507,7 @@ def main():
     parser.add_argument("--tmp_dir", type=str, required=True)
     parser.add_argument("--tokenizer_name_or_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--pre_tokenized", action='store_true', default=False)
+    parser.add_argument("--pre_tokenized", action="store_true", default=False)
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
     parser.add_argument("--max_seq_length", type=int, default=512)
     parser.add_argument("--num_train_epochs", type=int, default=1)
@@ -411,25 +519,33 @@ def main():
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--save_epoch_percentage", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_cores", type=int, default=1)  # Set to 1 for single GPU training
-    parser.add_argument("--keep_in_memory", action='store_true')
-    parser.add_argument("--streaming_data", action='store_true')
-    parser.add_argument("--sharded_data", action='store_true')
+    parser.add_argument(
+        "--num_cores", type=int, default=1
+    )  # Set to 1 for single GPU training
+    parser.add_argument("--keep_in_memory", action="store_true")
+    parser.add_argument("--streaming_data", action="store_true")
+    parser.add_argument("--sharded_data", action="store_true")
     parser.add_argument("--max_steps_per_epoch", type=int, default=None)
-    parser.add_argument("--shuffle_buffer_size", type=int, default=10_000)
+    parser.add_argument("--shuffle_buffer_size", type=int, default=25_000)
+    parser.add_argument("--init_training", action="store_true", default=False)
     parser.add_argument("--model_name", type=str, default="UMCU/CardioDeberta.nl")
-    parser.add_argument("--bf16", action='store_true', default=False, help="Use BF16 precision")
-    #parser.add_argument("--wandb_key", type=str, required=True, help="Weights & Biases API key")
+    parser.add_argument(
+        "--bf16", action="store_true", default=False, help="Use BF16 precision"
+    )
+    # parser.add_argument("--wandb_key", type=str, required=True, help="Weights & Biases API key")
     args = parser.parse_args()
 
-
-    #wandb.login(key=args.wandb_key)
+    # wandb.login(key=args.wandb_key)
 
     if args.keep_in_memory and args.streaming_data:
-        raise ValueError("keep_in_memory and streaming_data are mutually exclusive. Please set only one of them to True.")
+        raise ValueError(
+            "keep_in_memory and streaming_data are mutually exclusive. Please set only one of them to True."
+        )
 
     if args.streaming_data and args.shuffle_buffer_size is None:
-        raise ValueError("shuffle_buffer_size is required when streaming_data is set to True.")
+        raise ValueError(
+            "shuffle_buffer_size is required when streaming_data is set to True."
+        )
 
     # Set the same seed for reproducibility
     torch.manual_seed(args.seed)
@@ -441,6 +557,7 @@ def main():
     # For GPU training, we are using a single process.
     print("Running on GPU (or CPU if no GPU is available)...")
     train_fn(0, args)
+
 
 if __name__ == "__main__":
     print("Starting...")
