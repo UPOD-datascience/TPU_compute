@@ -1,122 +1,135 @@
 """
-This is the main script to continue pre-training a Roberta model.
+This is the main script to continue pre-training a DeBERTa model.
 """
+
 import argparse
-import torch
-#from transformers.models.deberta_v2.tokenization_deberta_v2_fast import DebertaV2Tokenizer
-
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
-import torch_xla.distributed.xla_multiprocessing as xmp
-#import multiprocessing as mp
-#import torch.multiprocessing as torchmp
-#torchmp.set_sharing_strategy('file_system')
-
-from transformers import (
-DebertaV2TokenizerFast,
-DebertaV2Config,
-DebertaV2ForMaskedLM,
-DataCollatorForLanguageModeling,
-DataCollatorForWholeWordMask
-)
-from transformers import Trainer, TrainingArguments
-from transformers import get_linear_schedule_with_warmup, get_cosine_with_hard_restarts_schedule_with_warmup
-
-from datasets import load_dataset, DatasetDict, DatasetInfo
-from safetensors.torch import load_file as load_safetensors
-
-import wandb
 import os
-import io
 import sys
-import tempfile
-import subprocess
-import copy
-import random
-import math
-import gc
-import datetime
+import traceback
+
+import torch
+
+os.environ["HF_DATASETS_CACHE"] = "/home/bes3/datasets_cache"
+os.environ["HF_HOME"] = "/home/bes3/hf_cache"
+
+# Ensure cache directories exist
+os.makedirs("/home/bes3/datasets_cache", exist_ok=True)
+os.makedirs("/home/bes3/hf_cache", exist_ok=True)
+
 import shutil
-import numpy as np
-from gcsfs import GCSFileSystem
-from google.cloud import storage
-import fsspec
 
-from functools import partial
-from itertools import chain
-
-from time import sleep
-from lazy_grouping import LazyGroupingDataset
+cache_dirs = [
+    os.path.expanduser("~/.cache/huggingface"),
+    os.path.expanduser("~/.cache/datasets"),
+    "/tmp/datasets",
+]
+for cache_dir in cache_dirs:
+    if os.path.exists(cache_dir):
+        print(f"Removing cache directory: {cache_dir}", flush=True)
+        shutil.rmtree(cache_dir)
 
 try:
-    os.environ.pop('TPU_PROCESS_ADDRESSES')
-    os.environ.pop('CLOUD_TPU_TASK_ID')
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    from torch_xla.runtime import global_ordinal, world_size
+
+    print("XLA import successful")
+except ImportError as e:
+    print(f"XLA import failed: {e}")
+    exit(1)
+
+import copy
+import datetime
+import gc
+import io
+import math
+import random
+import subprocess
+import tempfile
+from functools import partial
+from itertools import chain
+from time import sleep
+
+import fsspec
+import numpy as np
+import wandb
+from datasets import DatasetDict, DatasetInfo, load_dataset
+from gcsfs import GCSFileSystem
+from google.cloud import storage
+from lazy_grouping import LazyGroupingDataset
+from safetensors.torch import load_file as load_safetensors
+from transformers import (
+    DataCollatorForLanguageModeling,
+    DataCollatorForWholeWordMask,
+    DebertaV2Config,
+    DebertaV2ForMaskedLM,
+    DebertaV2TokenizerFast,
+    Trainer,
+    TrainingArguments,
+    get_cosine_with_hard_restarts_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
+)
+
+try:
+    os.environ.pop("TPU_PROCESS_ADDRESSES")
+    os.environ.pop("CLOUD_TPU_TASK_ID")
 except:
     print("No TPU_PROCESS_ADDRESSES or CLOUD_TPU_TASK_ID to remove")
 
 print("TPU_NUM_DEVICES:", os.environ.get("TPU_NUM_DEVICES"), flush=True)
-print("TPU_CHIPS_PER_HOST_BOUNDS:", os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS"), flush=True)
+print(
+    "TPU_CHIPS_PER_HOST_BOUNDS:",
+    os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS"),
+    flush=True,
+)
 
-worker_id = int(os.environ.get('TPU_WORKER_ID', '0'))
+worker_id = int(os.environ.get("TPU_WORKER_ID", "0"))
 # Determine total number of shards (for example, from the comma-separated hostnames)
-shards = os.environ.get('TPU_WORKER_HOSTNAMES', '0').split(',')
+shards = os.environ.get("TPU_WORKER_HOSTNAMES", "0").split(",")
 
 print(f"TPU_WORKER_ID: {worker_id}")
 print(f"TPU_WORKER_HOSTNAMES for {worker_id}: {shards}")
 
-def safe_rendezvous(tag, timeout=600):
-    """Rendezvous with timeout using threading approach (TPU-compatible)"""
-    import threading
-    import time
 
-    result_container = [None]
-    exception_container = [None]
-    finished = threading.Event()
+def _barrier(tag, device):
+    """Cross-host barrier using mesh_reduce (true ICI all-reduce).
 
-    def rendezvous_worker():
-        try:
-            result_container[0] = xm.rendezvous(tag)
-        except Exception as e:
-            exception_container[0] = e
-        finally:
-            finished.set()
-
-    # Start rendezvous in separate thread
-    worker_thread = threading.Thread(target=rendezvous_worker)
-    worker_thread.daemon = True
-    worker_thread.start()
-
-    # Wait for completion or timeout
-    if finished.wait(timeout=timeout):
-        if exception_container[0]:
-            print(f"Rendezvous '{tag}' failed with error: {exception_container[0]}, continuing...", flush=True)
-            return None
-        return result_container[0]
-    else:
-        print(f"Rendezvous '{tag}' timed out after {timeout} seconds, continuing...", flush=True)
-        return None
-
+    xm.rendezvous() may only synchronise processes on the *same* host on
+    multi-host TPU pods.  mesh_reduce performs a real all-reduce over the
+    ICI interconnect, so every rank across every host must participate
+    before any of them can proceed.
+    """
+    dummy = torch.tensor([0.0], device=device)
+    xm.mesh_reduce(tag, dummy, lambda x: sum(x))
 
 
 def shuffle_and_save_dataset(dataset, output_path, seed=None, shuffle=True):
     # Shuffle only the training dataset
     if shuffle:
-        shuffled_train = dataset['train'].shuffle(seed=seed)
+        shuffled_train = dataset["train"].shuffle(seed=seed)
     else:
-        shuffled_train = dataset['train']
+        shuffled_train = dataset["train"]
 
     # Save the shuffled training dataset and the original validation dataset
-    shuffled_dataset = DatasetDict({
-        'train': shuffled_train,
-        'validation': dataset['validation']
-    })
+    shuffled_dataset = DatasetDict(
+        {"train": shuffled_train, "validation": dataset["validation"]}
+    )
     print("Saving shuffled data to disk", flush=True)
     shuffled_dataset.save_to_disk(output_path)
     print(f"Shuffled dataset saved to {output_path}", flush=True)
 
 
 class ShardedShuffleDataset(torch.utils.data.IterableDataset):
-    def __init__(self, dataset, num_shards, shard_id, shuffle_buffer_size, max_steps=None, batch_size=1):
+    def __init__(
+        self,
+        dataset,
+        num_shards,
+        shard_id,
+        shuffle_buffer_size,
+        max_steps=None,
+        batch_size=1,
+    ):
         self.dataset = dataset
         self.num_shards = num_shards
         self.shard_id = shard_id
@@ -127,7 +140,11 @@ class ShardedShuffleDataset(torch.utils.data.IterableDataset):
     def __iter__(self):
         buffer = []
         items_yielded = 0
-        max_items = self.max_steps * self.batch_size if self.max_steps is not None else float('inf')
+        max_items = (
+            self.max_steps * self.batch_size
+            if self.max_steps is not None
+            else float("inf")
+        )
 
         for i, item in enumerate(self.dataset):
             if items_yielded >= max_items:
@@ -146,12 +163,16 @@ class ShardedShuffleDataset(torch.utils.data.IterableDataset):
             items_yielded += 1
             yield buffer.pop(0)
 
+
 def tokenize_function(examples, tokenizer, max_seq_length):
-    # here you can actually add a chunker to split the text into smaller parts, of max_len
-    return tokenizer(examples["text"],
-                    truncation=False,
-                    max_length=max_seq_length,
-                    padding="max_length")
+    # Tokenize without truncation first; chunking is handled by group_texts
+    return tokenizer(
+        examples["text"],
+        truncation=False,
+        max_length=max_seq_length,
+        padding="max_length",
+    )
+
 
 def load_from_gcs(bucket_name, blob_name, local_path, device):
     # Initialize a client
@@ -167,31 +188,36 @@ def load_from_gcs(bucket_name, blob_name, local_path, device):
         raise RuntimeError(f"Failed to download checkpoint to {local_path}: {e}")
 
     # Load the checkpoint based on the file extension
-    if local_path.endswith('.safetensors'):
-        checkpoint = load_safetensors(local_path, device='cpu')
+    if local_path.endswith(".safetensors"):
+        checkpoint = load_safetensors(local_path, device="cpu")
         checkpoint = {k: v.to(xm.xla_device()) for k, v in checkpoint.items()}
     else:
         checkpoint = torch.load(local_path, map_location=device)
 
     return checkpoint
 
-def load_sharded_dataset(datasets, dformat):
-    num_shards = max(xm.xrt_world_size() , 16)
-    shard_idx = xm.get_ordinal()
+
+def load_sharded_dataset(datasets, dformat, args):
+    # For single process mode, use process-based indices instead of TPU core indices
+    if args.num_cores == 1:
+        num_shards = 1
+        shard_idx = 0
+    else:
+        num_shards = max(world_size(), 16)
+        shard_idx = global_ordinal()
 
     print(f"Sharding for shard index:{shard_idx} / {num_shards}")
 
     dataset_dict = load_dataset(
-        dformat,
-        data_files=datasets,
-        streaming=False,
-        keep_in_memory=True
+        dformat, data_files=datasets, streaming=False, keep_in_memory=True
     )
 
     # Apply sharding to each split
     sharded_dataset = {}
     for split in dataset_dict.keys():
-        sharded_dataset[split] = dataset_dict[split].shard(num_shards=num_shards, index=shard_idx)
+        sharded_dataset[split] = dataset_dict[split].shard(
+            num_shards=num_shards, index=shard_idx
+        )
 
     del dataset_dict
     gc.collect()
@@ -224,14 +250,16 @@ def group_texts(examples, max_seq_length, pad_token=0):
 
         # Calculate how many chunks we need for this example
         example_length = len(current_example[sample_key])
-        num_chunks = (example_length + max_seq_length - 1) // max_seq_length  # Ceiling division
+        num_chunks = (
+            example_length + max_seq_length - 1
+        ) // max_seq_length  # Ceiling division
 
         # Split each feature into chunks
         for k, tokens in current_example.items():
             # Create chunks of max_seq_length
             chunks = []
             for j in range(0, example_length, max_seq_length):
-                chunk = tokens[j:min(j + max_seq_length, example_length)]
+                chunk = tokens[j : min(j + max_seq_length, example_length)]
 
                 # Pad if necessary
                 if len(chunk) < max_seq_length:
@@ -248,23 +276,46 @@ def group_texts(examples, max_seq_length, pad_token=0):
 
     return result
 
+
 def prep_fn(args):
+    # For streaming data, each process needs to load and tokenize independently
+    # but we stagger the start times to avoid resource contention
+    current_ordinal = global_ordinal()
+    stagger_delay = current_ordinal * 2  # 2 seconds per core
+
+    if stagger_delay > 0:
+        print(
+            f"Process {current_ordinal}: Waiting {stagger_delay}s to stagger dataset loading..."
+        )
+        sleep(stagger_delay)
+
     # Load and tokenize dataset
     if args.pre_tokenized:
-        datasets = {
-            "train": args.dataset_dir + f"/train_{args.max_seq_length}.{args.dataset_format}",
-            "validation": args.dataset_dir + f"/validation_{args.max_seq_length}.{args.dataset_format}"
-        }
-        if args.streaming_data:
-            print("Loading pre-tokenized dataset, streaming with shuffle..", flush=True)
-            tokenized_dataset = load_dataset(
-                    args.dataset_format,
-                    data_files=datasets,
-                    streaming=True,
-                    keep_in_memory=False,
-                ).shuffle(buffer_size=args.shuffle_buffer_size)
+        if args.training_file and args.validation_file:
+            datasets = {"train": args.training_file, "validation": args.validation_file}
         else:
-            print("Loading pre-tokenized dataset, no streaming", flush=True)
+            datasets = {
+                "train": args.dataset_dir
+                + f"/train_{args.max_seq_length}.{args.dataset_format}",
+                "validation": args.dataset_dir
+                + f"/validation_{args.max_seq_length}.{args.dataset_format}",
+            }
+        if args.streaming_data:
+            print(
+                f"Process {current_ordinal}: Loading pre-tokenized streaming dataset..",
+                flush=True,
+            )
+            tokenized_dataset = load_dataset(
+                args.dataset_format,
+                data_files=datasets,
+                streaming=True,
+                keep_in_memory=False,
+            ).shuffle(buffer_size=args.shuffle_buffer_size)
+        else:
+            print(
+                f"Process {current_ordinal}: Loading pre-tokenized dataset, no streaming",
+                flush=True,
+            )
             tokenized_dataset = load_dataset(
                 args.dataset_format,
                 data_files=datasets,
@@ -272,72 +323,142 @@ def prep_fn(args):
                 keep_in_memory=True,
             )
     else:
-        print(f"Tokenizing dataset... with streaming: {args.streaming_data} and keep_in_memory: {args.keep_in_memory}", flush=True)
+        print(
+            f"Process {current_ordinal}: Tokenizing dataset... with streaming: {args.streaming_data} and keep_in_memory: {args.keep_in_memory}",
+            flush=True,
+        )
         print(f"Dataset location: {args.dataset_dir}", flush=True)
 
         train_loc = "train" if not args.debug else "validation"
 
-        datasets = {"train": args.dataset_dir+f"/{train_loc}/*.{args.dataset_format}",
-                    "validation": args.dataset_dir+f"/validation/*.{args.dataset_format}"}
+        if args.training_file and args.validation_file:
+            datasets = {"train": args.training_file, "validation": args.validation_file}
+        else:
+            datasets = {
+                "train": args.dataset_dir + f"/{train_loc}/*.{args.dataset_format}",
+                "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}",
+            }
 
         if args.streaming_data:
-            try:
-                ds_train_info = DatasetInfo.from_directory(args.dataset_dir+f"/{train_loc}/")
-                num_examples = ds_train_info['num_examples']
-                args.max_steps_per_epoch = num_examples // args.per_device_train_batch_size // max(xm.xrt_world_size(), 1)
-            except Exception as e:
-                print(f"Could not obtain datasetinfo:{e}")
-                pass
+            # Estimate steps/epoch only when loading from a directory
+            if (not args.training_file) and (not args.validation_file):
+                try:
+                    if current_ordinal == 0:  # Only master process calculates this
+                        ds_train_info = DatasetInfo.from_directory(
+                            args.dataset_dir + f"/{train_loc}/"
+                        )
+                        num_examples = ds_train_info["num_examples"]
+                        args.max_steps_per_epoch = (
+                            num_examples
+                            // args.per_device_train_batch_size
+                            // max(world_size(), 1)
+                        )
+                        print(
+                            f"Maximum steps per epoch: {args.max_steps_per_epoch}",
+                            flush=True,
+                        )
+                except Exception as e:
+                    print(f"Could not obtain datasetinfo:{e}")
+                    pass
 
-            print("Init streaming dataset...", flush=True)
+            print(f"Process {current_ordinal}: Init streaming dataset...", flush=True)
             dataset = load_dataset(
-                    args.dataset_format,
-                    data_files=datasets,
-                    streaming=True,
-                    keep_in_memory=False
-                )#.shuffle(buffer_size=args.shuffle_buffer_size)
+                args.dataset_format,
+                data_files=datasets,
+                streaming=True,
+                keep_in_memory=False,
+            )
         else:
-            print("Init non-streaming dataset...", flush=True)
+            print(
+                f"Process {current_ordinal}: Init non-streaming dataset...", flush=True
+            )
             if args.sharded_data:
                 print("Sharding data...", flush=True)
-                dataset = load_sharded_dataset(datasets, args.dataset_format)
+                dataset = load_sharded_dataset(datasets, args.dataset_format, args)
             else:
                 dataset = load_dataset(
-                        args.dataset_format,
-                        data_files=datasets,
-                        streaming=False,
-                        keep_in_memory=True
-                    )
+                    args.dataset_format,
+                    data_files=datasets,
+                    streaming=False,
+                    keep_in_memory=True,
+                )
 
-        opt_kwargs = {'num_proc': args.num_cores} if args.streaming_data==False else {}
-        print("Tokenizing dataset...", flush=True)
-        tokenize_fn = partial(tokenize_function, tokenizer=args.tokenizer, max_seq_length=args.max_seq_length)
-        tokenized_dataset_raw = dataset.map(tokenize_fn,
-                                         batched=True,
-                                         remove_columns=["text",
-                                                         "id",
-                                                         "source",
-                                                         "approx_token_counts_translated",
-                                                         "approx_token_counts_original"],
-                                         **opt_kwargs)
+        print(f"Process {current_ordinal}: Tokenizing dataset...", flush=True)
+        tokenize_fn = partial(
+            tokenize_function,
+            tokenizer=args.tokenizer,
+            max_seq_length=args.max_seq_length,
+        )
+
+        # Compute safe remove_columns based on actual columns present in dataset/split
+        candidate_remove = [
+            "text",
+            "id",
+            "source",
+            "approx_token_counts_translated",
+            "approx_token_counts_original",
+        ]
+        try:
+            colnames = dataset["train"].column_names
+        except Exception:
+            try:
+                colnames = dataset.column_names
+            except Exception:
+                colnames = []
+        safe_remove = [c for c in candidate_remove if c in (colnames or [])]
+
+        if args.streaming_data:
+            tokenized_dataset_raw = dataset.map(
+                tokenize_fn, batched=True, remove_columns=safe_remove
+            )
+        else:
+            tokenized_dataset_raw = dataset.map(
+                tokenize_fn,
+                batched=True,
+                remove_columns=safe_remove,
+                num_proc=1,  # Use single process to avoid conflicts
+            )
 
         # If lazy grouping is enabled, return the raw tokenized dataset
         if args.lazy_grouping:
-            print("Lazy grouping enabled. Grouping will be performed on-the-fly during training.", flush=True)
-            print(f"This will reduce startup time but may slightly impact training speed.", flush=True)
+            print(
+                "Lazy grouping enabled. Grouping will be performed on-the-fly during training.",
+                flush=True,
+            )
+            print(
+                f"This will reduce startup time but may slightly impact training speed.",
+                flush=True,
+            )
             return tokenized_dataset_raw
 
         # Otherwise, perform grouping now as before
-        opt_kwargs = {'num_proc': 1, 'desc':f"Grouping texts in chunks of {args.max_seq_length}" } if args.streaming_data==False else {}
-        print("Performing chunking tokenized data...", flush=True)
-        group_fn = partial(group_texts, max_seq_length=args.max_seq_length, pad_token=args.tokenizer.pad_token_id)
-        tokenized_dataset = tokenized_dataset_raw.map(
+        print(
+            f"Process {current_ordinal}: Performing chunking tokenized data...",
+            flush=True,
+        )
+        group_fn = partial(
+            group_texts,
+            max_seq_length=args.max_seq_length,
+            pad_token=args.tokenizer.pad_token_id,
+        )
+        if args.streaming_data:
+            tokenized_dataset = tokenized_dataset_raw.map(group_fn, batched=True)
+        else:
+            tokenized_dataset = tokenized_dataset_raw.map(
                 group_fn,
                 batched=True,
-                **opt_kwargs
+                num_proc=1,
+                desc=f"Grouping texts in chunks of {args.max_seq_length}",
             )
         del tokenized_dataset_raw
+
+    print(f"Process {current_ordinal}: Dataset preparation complete", flush=True)
+
+    # Optional: Add a barrier to ensure all processes finish around the same time
+    _barrier("dataset_prep_complete", xm.xla_device())
+
     return tokenized_dataset
+
 
 def safe_iter(iterable):
     iterator = iter(iterable)
@@ -348,15 +469,25 @@ def safe_iter(iterable):
             break
         except Exception as e:
             print(f"Error encountered in iteration: {e}")
+            print(f"Error type: {type(e).__name__}")
+            traceback.print_exc()
+            # Don't continue on XLA tensor errors - these need to be fixed
+            if "XLA" in str(e) or "tensor" in str(e).lower():
+                print("XLA/tensor error detected - stopping iteration")
+                raise
             continue
+
 
 def train_fn(tokenized_dataset, device, args):
     # Initialize wandb for the master process
-    if xm.get_ordinal() == 0: #.is_master_ordinal():
+    print(f"Process {global_ordinal()}: Starting train_fn...", flush=True)
+    if global_ordinal() == 0:
         wandb.login(key=args.wandb_key)
         wandb.init(
             project="DeBERTaV2 TPU pretraining from scratch",
             config={
+                "TPU ID": args.TPU_NAME,
+                "TPU DISK": args.TPU_DISK,
                 "learning_rate": args.learning_rate,
                 "architecture": "DeBERTaV2",
                 "dataset": args.dataset_dir,
@@ -364,20 +495,20 @@ def train_fn(tokenized_dataset, device, args):
                 "weight_decay": args.weight_decay,
                 "max_seq_length": args.max_seq_length,
                 "batch_size": args.per_device_train_batch_size,
-                "lazy_grouping": args.lazy_grouping
+                "lazy_grouping": args.lazy_grouping,
             },
             mode="online",
-            dir="/home/bes3/temp"
+            dir="/home/bes3/temp",
         )
+        wandb.run.log_code(root="/home/bes3/models", name="train_deberta")
 
     # Load model configuration
-    #config = RobertaConfig.from_pretrained(args.model_name)
+    # config = RobertaConfig.from_pretrained(args.model_name)
 
     # Load pre-trained model
-    xm.master_print("Loading the LM ...")
+    print(f"Process {global_ordinal()}: Loading the LM...", flush=True)
 
-
-    if args.checkpoint_handling in ['start_with_checkpoint', 'start_with_init']:
+    if args.checkpoint_handling in ["start_with_checkpoint", "start_with_init"]:
         model_config = DebertaV2Config.from_pretrained(args.model_name)
         model_config.bos_token_id = args.tokenizer.bos_token_id
         model_config.eos_token_id = args.tokenizer.eos_token_id
@@ -394,85 +525,155 @@ def train_fn(tokenized_dataset, device, args):
         model = DebertaV2ForMaskedLM(model_config)
 
         if isinstance(args.checkpoint_path, str) & (args.checkpoint_path != ""):
-            if args.checkpoint_path.startswith('gs://'):
+            if args.checkpoint_path.startswith("gs://"):
                 # Parse GCS path
-                bucket_name = args.checkpoint_path.split('/')[2]
-                blob_name = '/'.join(args.checkpoint_path.split('/')[3:])
-                local_path = f'/tmp/checkpoint.{args.checkpoint_path.split(".")[-1]}'  # Temporary local path to store the downloaded file
-                checkpoint = load_from_gcs(bucket_name,
-                                        blob_name,
-                                        local_path,
-                                        device)
+                bucket_name = args.checkpoint_path.split("/")[2]
+                blob_name = "/".join(args.checkpoint_path.split("/")[3:])
+                local_path = f"/tmp/checkpoint.{args.checkpoint_path.split('.')[-1]}"  # Temporary local path to store the downloaded file
+                checkpoint = load_from_gcs(bucket_name, blob_name, local_path, device)
+                sleep(1)
+                print(
+                    f"Process {global_ordinal()}: Checkpoint downloaded...", flush=True
+                )
+                _barrier("checkpoint_downloaded", device)
             else:
-                if args.checkpoint_path.endswith('.safetensors'):
+                if args.checkpoint_path.endswith(".safetensors"):
                     checkpoint = load_safetensors(args.checkpoint_path, device=device)
                 else:
                     checkpoint = torch.load(args.checkpoint_path, map_location=device)
+                sleep(1)
+                print(
+                    f"Process {global_ordinal()}: Checkpoint downloaded...", flush=True
+                )
+                _barrier("checkpoint_downloaded", device)
 
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
+            if "model_state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["model_state_dict"])
             else:
                 model.load_state_dict(checkpoint)
+
+            sleep(1)
+            print(
+                f"Process {global_ordinal()}: Checkpoint loaded in memory..", flush=True
+            )
         else:
             pass
-    elif args.checkpoint_handling == 'start_with_basemodel':
+    elif args.checkpoint_handling == "start_with_basemodel":
         model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
     else:
-        raise ValueError("Checkpoint handling should be one of ['start_with_init','start_with_base', 'start_with_checkpoint']")
+        raise ValueError(
+            "Checkpoint handling should be one of ['start_with_init','start_with_base', 'start_with_checkpoint']"
+        )
 
-    # Move model to device BEFORE creating optimizer
-    model = model.to(device=device, dtype=torch.bfloat16)
+    _barrier("checkpoint_loaded_in_memory", device)
 
-    # Force XLA compilation of model
-    xm.mark_step()
+    # Move model to device — stagger across ranks to avoid OOM spikes
+    print(
+        f"Process {global_ordinal()}: world_size={world_size()}, global_ordinal={global_ordinal()}, num_cores={args.num_cores}",
+        flush=True,
+    )
+
+    if args.num_cores == 1:
+        model = model.to(device=device, dtype=torch.bfloat16)
+        xm.mark_step()
+    else:
+        for i in range(world_size()):
+            if global_ordinal() == i:
+                print(
+                    f"Process {global_ordinal()}: My turn to load model to TPU device {device}...",
+                    flush=True,
+                )
+                model = model.to(device=device, dtype=torch.bfloat16)
+                print(
+                    f"Process {global_ordinal()}: Model loaded on device successfully",
+                    flush=True,
+                )
+            _barrier(f"model_to_device_{i}", device)
+
+    print(f"Process {global_ordinal()}: All models loaded to devices", flush=True)
 
     # Set up data collator
-    xm.master_print("Setting up data collator...")
-    # DataCollatorForWholeWordMask
-    data_collator = DataCollatorForLanguageModeling(tokenizer=args.tokenizer,
-                                                    mlm=True,
-                                                    mlm_probability=args.mlm_probability)
+    print(f"Process: {global_ordinal()}. Setting up data collator.")
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=args.tokenizer, mlm=True, mlm_probability=args.mlm_probability
+    )
+    _barrier("datacollator", device)
 
     # Decide on distributed sampler parameters:
     if args.num_cores == 1:
         sampler_rank = 0
         sampler_replicas = 1
+        print(f"Process {global_ordinal()}: Using single core mode", flush=True)
     else:
-        sampler_rank = xm.get_ordinal()
-        sampler_replicas = xm.xrt_world_size()
+        sampler_rank = global_ordinal()
+        sampler_replicas = world_size()
+
+    print(f"Process {global_ordinal()}: About to create DataLoader...", flush=True)
 
     # Create sampler
     distributed_sampler = False
     if args.streaming_data:
-        xm.master_print("Instantiate sharded dataset...")
-        num_shards = xm.xrt_world_size() # Total number of TPU cores (or processes)
-        shard_id = xm.get_ordinal()  # Unique id for the current process
-        print(f"Num shards: {num_shards}, shard id: {shard_id}", flush=True)
-        print(f"Core {shard_id}: Creating sharded dataset...", flush=True)
-        #num_shards = xm.xrt_world_size()
-        #shard_id = xm.get_ordinal()
-        sharded_train_dataset = tokenized_dataset["train"].shard(num_shards=num_shards, index=shard_id)
+        print(f"Process {global_ordinal()}: Creating sharded dataset...", flush=True)
+
+        if args.num_cores == 1:
+            num_shards = 1
+            shard_id = 0
+        else:
+            num_shards = world_size()
+            shard_id = global_ordinal()
+        print(
+            f"Process {global_ordinal()}: Num shards: {num_shards}, shard id: {shard_id}",
+            flush=True,
+        )
+
+        try:
+            sharded_train_dataset = tokenized_dataset["train"].shard(
+                num_shards=num_shards, index=shard_id
+            )
+            print(
+                f"Process {global_ordinal()}: Sharded dataset created successfully",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"Process {global_ordinal()}: Error creating sharded dataset: {e}",
+                flush=True,
+            )
+            print(
+                f"Process {global_ordinal()}: Falling back to index-based streaming filter sharding...",
+                flush=True,
+            )
+            sharded_train_dataset = tokenized_dataset["train"].filter(
+                lambda ex, idx: idx % num_shards == shard_id, with_indices=True
+            )
 
         # Apply lazy grouping if enabled
         if args.lazy_grouping and not args.pre_tokenized:
-            print(f"Applying lazy grouping to sharded dataset for worker {shard_id}...", flush=True)
+            print(
+                f"Applying lazy grouping to sharded dataset for worker {shard_id}...",
+                flush=True,
+            )
             _sharded_train_dataset = LazyGroupingDataset(
                 sharded_train_dataset,
                 max_seq_length=args.max_seq_length,
                 pad_token=args.tokenizer.pad_token_id,
                 batch_size=args.per_device_train_batch_size,
-                streaming=args.streaming_data
+                streaming=args.streaming_data,
             )
         else:
             _sharded_train_dataset = sharded_train_dataset
 
-        xm.master_print("Starting the streaming DataLoader...")
+        print(
+            f"Process {global_ordinal()}: Creating streaming DataLoader...", flush=True
+        )
 
         train_dataloader = torch.utils.data.DataLoader(
             _sharded_train_dataset,
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
-            num_workers=0
+            num_workers=0,
+            pin_memory=False,
+            drop_last=True,
         )
     else:
         xm.master_print("Starting the DistributedSampler...")
@@ -481,7 +682,7 @@ def train_fn(tokenized_dataset, device, args):
             tokenized_dataset["train"],
             num_replicas=sampler_replicas,
             rank=sampler_rank,
-            shuffle=True
+            shuffle=True,
         )
         # Create dataloaders
         xm.master_print("Starting the DataLoader...")
@@ -489,31 +690,79 @@ def train_fn(tokenized_dataset, device, args):
             tokenized_dataset["train"],
             batch_size=args.per_device_train_batch_size,
             collate_fn=data_collator,
-            sampler=train_sampler
+            sampler=train_sampler,
         )
     #################
     validation_dataloader = torch.utils.data.DataLoader(
         tokenized_dataset["validation"],
         batch_size=args.per_device_train_batch_size,
-        collate_fn=data_collator)
+        collate_fn=data_collator,
+    )
 
     if not args.streaming_data:
         del tokenized_dataset
         gc.collect()
 
-    xla_train_loader = pl.MpDeviceLoader(train_dataloader, xm.xla_device())
-    xla_validation_loader = pl.MpDeviceLoader(validation_dataloader, xm.xla_device())
+    if args.num_cores == 1:
+        xla_train_loader = train_dataloader
+        xla_validation_loader = validation_dataloader
+    else:
+        xla_train_loader = pl.MpDeviceLoader(train_dataloader, xm.xla_device())
+        xla_validation_loader = pl.MpDeviceLoader(
+            validation_dataloader, xm.xla_device()
+        )
+
+    print(f"XLA device is: {xm.xla_device()}", flush=True)
+    print(f"Device for training: {device}", flush=True)
+
+    _barrier("data_loader", device)
 
     # Set up optimizer and scheduler AFTER model is on device
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    steps_per_epoch = args.max_steps_per_epoch if args.streaming_data else len(train_dataloader)
-    save_steps = args.save_epoch_percentage if args.save_epoch_percentage>1. else int(steps_per_epoch * args.save_epoch_percentage)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+    )
+    steps_per_epoch = (
+        args.max_steps_per_epoch if args.streaming_data else len(train_dataloader)
+    )
+    save_steps = (
+        int(steps_per_epoch * args.save_epoch_percentage)
+        if args.save_epoch_percentage < 1
+        else int(args.save_epoch_percentage)
+    )
+    # Align save_steps to the nearest accumulation boundary
+    _gas = args.gradient_accumulation_steps
+    if _gas > 1 and save_steps % _gas != 0:
+        save_steps = max(_gas, (save_steps // _gas) * _gas)
+    save_steps = max(save_steps, _gas)
+
+    # Align logging_steps to accumulation boundaries
+    if _gas > 1 and args.logging_steps % _gas != 0:
+        aligned_logging = max(_gas, (args.logging_steps // _gas) * _gas)
+        print(
+            f"[WARNING] logging_steps={args.logging_steps} is not a multiple of "
+            f"gradient_accumulation_steps={_gas}. Aligning to {aligned_logging}.",
+            flush=True,
+        )
+        args.logging_steps = aligned_logging
+
     total_steps = steps_per_epoch * args.num_train_epochs
 
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.num_warmup_steps, num_training_steps=total_steps)
+    if global_ordinal() == 0:
+        print(
+            f"[CONFIG] steps_per_epoch={steps_per_epoch}, save_steps={save_steps} "
+            f"(aligned to GAC={_gas}), logging_steps={args.logging_steps}, "
+            f"total_steps={total_steps}",
+            flush=True,
+        )
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.num_warmup_steps,
+        num_training_steps=total_steps,
+    )
     # Use cyclic scheduler with hard restarts (cosine with restarts)
     # Calculate number of cycles - using 1 cycle per epoch as default, or user-specified value
-    #num_cycles = args.num_cycles if args.num_cycles is not None else args.num_train_epochs
+    # num_cycles = args.num_cycles if args.num_cycles is not None else args.num_train_epochs
     # scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
     #     optimizer,
     #     num_warmup_steps=args.num_warmup_steps,
@@ -521,38 +770,30 @@ def train_fn(tokenized_dataset, device, args):
     #     num_cycles=num_cycles
     # )
 
-    # Debug tensor states before training
-    if xm.get_ordinal() == 0:
-        print("Checking model parameter states...", flush=True)
-        for name, param in model.named_parameters():
-            if param.device.type != 'xla':
-                print(f"WARNING: Parameter {name} is not on XLA device: {param.device}")
-            if param.grad is not None:
-                print(f"WARNING: Parameter {name} has gradient before training starts")
-        print("Model parameter check complete.", flush=True)
-
-    if xm.get_ordinal() == 0: # xm.is_master_ordinal():
+    _barrier("start_training", device)
+    if global_ordinal() == 0:
         print("Starting training...", flush=True)
         print(f"Total steps: {total_steps}", flush=True)
         print(f"Total epochs: {args.num_train_epochs}", flush=True)
         print(f"Total warmup steps: {args.num_warmup_steps}", flush=True)
-        #print(f"Number of cycles: {num_cycles}", flush=True)
 
     # Training loop
     total_step = 0
     miss_steps = 0
-    print(f"ENTERING THE TRAINING LOOP with: {args.num_train_epochs} epochs", flush=True)
-
-    # Check that all cores are participating
-    print(f"Core {xm.get_ordinal()}: About to enter training loop", flush=True)
-    xm.mark_step()  # Synchronize all cores
-    if xm.get_ordinal() == 0:
-        print("All cores synchronized before training loop", flush=True)
+    print(
+        f"ENTERING THE TRAINING LOOP with: {args.num_train_epochs} epochs", flush=True
+    )
 
     for epoch in range(args.num_train_epochs):
-        print(f"Core {xm.get_ordinal()}: Starting with epoch {epoch}...", flush=True)
-        total_loss = 0.
-        sub_total_loss = 0.
+        _barrier(f"start_epoch_{epoch}", device)
+        print(
+            f"Starting with epoch {epoch}...for process {global_ordinal()}", flush=True
+        )
+
+        total_loss = (
+            0.0  # kept as XLA tensor during accumulation, materialised at logging
+        )
+        sub_total_loss = 0.0
         sub_step = 0
         model.train()
         if distributed_sampler:
@@ -561,97 +802,217 @@ def train_fn(tokenized_dataset, device, args):
             print("done with setting epoch..", flush=True)
 
         print(f"Entering data loader iterator for epoch {epoch}...", flush=True)
-
-        # Ensure all previous operations are completed
-        xm.mark_step()
-
-        if xm.get_ordinal() == 0:
-            print(f"Starting data iteration for epoch {epoch}...", flush=True)
-
         step = -1
-        batch_count = 0
 
-        try:
-            print(f"Core {xm.get_ordinal()}: Starting iteration over data loader...", flush=True)
+        # Use a while-loop instead of for-loop so that when one core's data
+        # shard is exhausted it keeps participating in collective operations
+        # (optimizer_step, mesh_reduce, barriers) until ALL cores agree to
+        # stop.  This prevents the cross-deadlock that occurs when one core
+        # exits the loop while others block on a collective op.
+        data_iter = iter(safe_iter(xla_train_loader))
+        local_exhausted = False
+        DIAG_START = 5990  # start verbose logging this many steps before expected hang
 
-            # Add timeout check for data loading
-            data_loader_iter = iter(safe_iter(xla_train_loader))
-            print(f"Core {xm.get_ordinal()}: Created data loader iterator", flush=True)
+        while True:
+            step += 1
+            _diag = step >= DIAG_START
 
-            for step in range(steps_per_epoch):
+            # --- fetch next batch (or mark exhausted) ---
+            batch = None
+            if not local_exhausted:
+                if _diag:
+                    print(
+                        f"[DIAG][Rank {global_ordinal()}] step={step} fetching batch…",
+                        flush=True,
+                    )
                 try:
-                    batch = next(data_loader_iter)
-                    print(f"Core {xm.get_ordinal()}: Got batch {step}", flush=True)
+                    batch = next(data_iter)
+                    if _diag:
+                        print(
+                            f"[DIAG][Rank {global_ordinal()}] step={step} batch OK",
+                            flush=True,
+                        )
                 except StopIteration:
-                    print(f"Core {xm.get_ordinal()}: Data loader exhausted at step {step}", flush=True)
-                    break
+                    local_exhausted = True
+                    print(
+                        f"Process {global_ordinal()}: Data shard exhausted at step {step}",
+                        flush=True,
+                    )
                 except Exception as e:
-                    print(f"Core {xm.get_ordinal()}: Error getting batch {step}: {e}", flush=True)
-                    miss_steps += 1
-                    continue
-                batch_count += 1
-                if batch_count == 1:
-                    print(f"Core {xm.get_ordinal()}: Successfully loaded first batch for epoch {epoch}, step {step}", flush=True)
-                elif batch_count <= 5:
-                    print(f"Core {xm.get_ordinal()}: Loaded batch {batch_count} for epoch {epoch}, step {step}", flush=True)
+                    print(
+                        f"Process {global_ordinal()}: Error fetching batch at step {step}: {e}",
+                        flush=True,
+                    )
+                    if "XLA" in str(e) or "tensor" in str(e).lower():
+                        raise
+                    local_exhausted = True
 
+            # --- at every gradient-accumulation boundary, check whether
+            #     ANY core is done. ---
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                if _diag:
+                    print(
+                        f"[DIAG][Rank {global_ordinal()}] step={step} ENTER epoch_stop_check (exhausted={local_exhausted})",
+                        flush=True,
+                    )
+                flag = torch.tensor([1.0 if local_exhausted else 0.0], device=device)
+                any_done = xm.mesh_reduce("epoch_stop_check", flag, max)
+                if _diag:
+                    print(
+                        f"[DIAG][Rank {global_ordinal()}] step={step} EXIT epoch_stop_check any_done={any_done.item()}",
+                        flush=True,
+                    )
+                if any_done.item() > 0.5:
+                    print(
+                        f"Process {global_ordinal()}: All cores stopping "
+                        f"at step {step} (at least one shard exhausted)",
+                        flush=True,
+                    )
+                    break  # all cores break here together
+
+            # --- exhausted core: still participate in every collective op ---
+            if local_exhausted:
+                if _diag:
+                    print(
+                        f"[DIAG][Rank {global_ordinal()}] step={step} exhausted-path",
+                        flush=True,
+                    )
+                optimizer.zero_grad()
+                step_ok = False
+            else:
+                # --- normal training step ---
+                assert batch is not None, "batch should never be None here"
+
+                step_ok = True
                 try:
-                    batch = {k: v.to(device=device, dtype=torch.bfloat16) if v.dtype==torch.float32 else v.to(device) for k, v in batch.items()}
+                    if step < 3:
+                        print(
+                            f"Process {global_ordinal()}: Processing batch {step}...",
+                            flush=True,
+                        )
+
+                    batch = {
+                        k: v.to(device=device, dtype=torch.bfloat16)
+                        if v.dtype == torch.float32
+                        else v.to(device)
+                        for k, v in batch.items()
+                    }
                     outputs = model(**batch)
                     loss = outputs.loss / args.gradient_accumulation_steps
 
-                    if torch.isnan(loss):
-                        optimizer.zero_grad(set_to_none=True)
-                        continue
+                    # Unconditionally replace NaN/Inf — no data-dependent branch.
+                    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
 
                     loss.backward()
 
-                    total_loss += loss.item()*args.gradient_accumulation_steps
-                    sub_total_loss += loss.item()*args.gradient_accumulation_steps
+                    # Accumulate loss as XLA tensor (avoid .item() every micro-step)
+                    total_loss += loss.detach() * args.gradient_accumulation_steps
+                    sub_total_loss += loss.detach() * args.gradient_accumulation_steps
 
-                    if  (step+1) % args.gradient_accumulation_steps == 0:
-                        # torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                        xm.optimizer_step(optimizer)
-                        scheduler.step()
-                        optimizer.zero_grad()
-                        xm.mark_step()  # Mark step after optimizer step
+                except Exception as e:
+                    print(
+                        f"Error occurred during processing batch {step}: {e}",
+                        flush=True,
+                    )
+                    print("Full traceback:")
+                    traceback.print_exc()
+                    miss_steps += 1
+                    step_ok = False
+                    optimizer.zero_grad()
 
-                        total_step += args.gradient_accumulation_steps
+            # ══════════════════════════════════════════════════════
+            # ── Collective operations — ALWAYS executed ───────────
+            # Both the exhausted-path and the normal-training path
+            # converge here. These are outside try/except so even
+            # if one rank had an exception, it still participates.
+            # ══════════════════════════════════════════════════════
 
-                    if (step+1) % args.logging_steps == 0: # xm.is_master_ordinal():
-                        print(f"Core {xm.get_ordinal()}: Reached logging step {step+1}", flush=True)
-                        # Use mark_step for safer synchronization instead of rendezvous
-                        xm.mark_step()
-                        print(f"Core {xm.get_ordinal()}: Completed mark_step for logging", flush=True)
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                if _diag:
+                    print(
+                        f"[DIAG][Rank {global_ordinal()}] step={step} ENTER grad_clip",
+                        flush=True,
+                    )
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                if _diag:
+                    print(
+                        f"[DIAG][Rank {global_ordinal()}] step={step} ENTER optimizer_step",
+                        flush=True,
+                    )
+                xm.optimizer_step(optimizer, barrier=True)
+                if _diag:
+                    print(
+                        f"[DIAG][Rank {global_ordinal()}] step={step} EXIT optimizer_step",
+                        flush=True,
+                    )
+                scheduler.step()
+                xm.mark_step()
+                optimizer.zero_grad()
 
-                        local_avg_loss = total_loss / max(step, 1)  # Avoid division by zero
-                        local_avg_loss_N = sub_total_loss / max(sub_step, 1)  # Avoid division by zero
+                total_step += args.gradient_accumulation_steps
 
-                        print(f"Core {xm.get_ordinal()}: About to call mesh_reduce for loss", flush=True)
-                        try:
-                            global_avg_loss = xm.mesh_reduce("loss", local_avg_loss, np.mean)
-                            print(f"Core {xm.get_ordinal()}: Completed mesh_reduce for loss", flush=True)
-                        except Exception as e:
-                            print(f"Core {xm.get_ordinal()}: Error in mesh_reduce for loss: {e}", flush=True)
-                            global_avg_loss = local_avg_loss
+                # ══════════════════════════════════════════════════
+                # ── Logging & saving — ONLY at accumulation boundaries ──
+                # All collective ops (mesh_reduce, barriers) MUST be
+                # placed here, right after optimizer_step + mark_step,
+                # where all ranks are provably synchronized.
+                # ══════════════════════════════════════════════════
 
-                        try:
-                            global_avg_loss_N = xm.mesh_reduce("loss_N", local_avg_loss_N, np.mean)
-                            print(f"Core {xm.get_ordinal()}: Completed mesh_reduce for loss_N", flush=True)
-                        except Exception as e:
-                            print(f"Core {xm.get_ordinal()}: Error in mesh_reduce for loss_N: {e}", flush=True)
-                            global_avg_loss_N = local_avg_loss_N
+                # --- Logging ---
+                if (step + 1) % args.logging_steps == 0:
+                    if _diag:
+                        print(
+                            f"[DIAG][Rank {global_ordinal()}] step={step} ENTER mesh_reduce(loss)",
+                            flush=True,
+                        )
+                    total_loss_val = (
+                        total_loss.item()
+                        if isinstance(total_loss, torch.Tensor)
+                        else float(total_loss)
+                    )
+                    sub_total_loss_val = (
+                        sub_total_loss.item()
+                        if isinstance(sub_total_loss, torch.Tensor)
+                        else float(sub_total_loss)
+                    )
+                    total_loss = total_loss_val
+                    sub_total_loss = sub_total_loss_val
 
-                        perplexity = math.exp(min(global_avg_loss, 10))  # Cap to prevent overflow
-                        perplexity_N = math.exp(min(global_avg_loss_N, 10))  # Cap to prevent overflow
+                    local_avg_loss = total_loss_val / max(step + 1, 1)
+                    local_avg_loss_N = sub_total_loss_val / max(sub_step, 1)
 
-                        sub_step = 0
-                        sub_total_loss = 0.
+                    global_avg_loss = xm.mesh_reduce(
+                        f"loss_s{step}", local_avg_loss, np.mean
+                    )
+                    if _diag:
+                        print(
+                            f"[DIAG][Rank {global_ordinal()}] step={step} EXIT mesh_reduce(loss)",
+                            flush=True,
+                        )
+                    global_avg_loss_N = xm.mesh_reduce(
+                        f"loss_N_s{step}", local_avg_loss_N, np.mean
+                    )
+                    if _diag:
+                        print(
+                            f"[DIAG][Rank {global_ordinal()}] step={step} EXIT mesh_reduce(loss_N)",
+                            flush=True,
+                        )
 
-                        if xm.get_ordinal() ==0:
-                            current_lr = scheduler.get_last_lr()[0]
-                            print(f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}, lr: {current_lr:.2e}", flush=True)
-                            wandb.log({
+                    perplexity = math.exp(min(global_avg_loss, 10))
+                    perplexity_N = math.exp(min(global_avg_loss_N, 10))
+
+                    sub_step = 0
+                    sub_total_loss = 0.0
+
+                    _barrier(f"before_wandb_log_s{step}", device)
+                    if global_ordinal() == 0:
+                        current_lr = scheduler.get_last_lr()[0]
+                        print(
+                            f"Logging for epoch: {epoch}, step: {step}, train_perplexity_N:{perplexity_N}, lr: {current_lr:.2e}",
+                            flush=True,
+                        )
+                        wandb.log(
+                            {
                                 "train_global_average_loss": global_avg_loss,
                                 "train_global_average_loss_N": global_avg_loss_N,
                                 "train_perplexity": perplexity,
@@ -659,122 +1020,171 @@ def train_fn(tokenized_dataset, device, args):
                                 "learning_rate": current_lr,
                                 "epoch": epoch,
                                 "step": step,
-                                "total_step": total_step
-                            })
-                        xm.mark_step()  # Final sync after logging
+                                "total_step": total_step,
+                            },
+                            commit=True,
+                        )
+                    _barrier(f"after_wandb_log_s{step}", device)
 
-                    if args.debug:
-                        print(f"Core {xm.get_ordinal()}: Debug mode - breaking after first batch", flush=True)
-                        break
+                # --- Mid-epoch checkpoint saving ---
+                # Uses total_step so condition fires only at accumulation
+                # boundaries where ranks are synced.
+                if save_steps > 0 and total_step % save_steps == 0:
+                    if _diag:
+                        print(
+                            f"[DIAG][Rank {global_ordinal()}] step={step} ENTER barrier(before_model_saving)",
+                            flush=True,
+                        )
+                    _barrier(f"before_model_saving_s{step}", device)
+                    if _diag:
+                        print(
+                            f"[DIAG][Rank {global_ordinal()}] step={step} EXIT barrier(before_model_saving)",
+                            flush=True,
+                        )
+                    if global_ordinal() == 0:
+                        print(f"Saving model at total_step={total_step}...", flush=True)
 
-                    total_step += 1
-                    sub_step +=1
+                        wandb.log({"epoch": epoch, "step": total_step}, commit=True)
 
-                    # Add periodic progress reporting
-                    if step % 10 == 0:
-                        print(f"Core {xm.get_ordinal()}: Completed step {step}, total_step {total_step}", flush=True)
-
-                    if  ((step+1) % save_steps == 0):
-                        # Use mark_step for safer synchronization before saving
-                        xm.mark_step()
-
-                        if (xm.get_ordinal() ==0):
-                            print("Saving model...", flush=True)
-                            if args.output_dir.startswith("gs://"):
-                                with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
-                                    local_output_dir = tmpdirname
-                                    print(f"Saving model to {local_output_dir}...", flush=True)
-                                    model_cpu = copy.deepcopy(model).to("cpu")
-                                    model_cpu.save_pretrained(local_output_dir, save_serialization=True)
-                                    print(f"Uploading model to {args.output_dir}...", flush=True)
-                                    subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
-                                    # rename the directory on GCS to the model name, date, and epoch_step
-                                    # Generate a new directory name with model name, date, and epoch_step
-                                    new_dir_name = f"{args.model_name}_latest"
-                                    new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                                    subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir, "*"), new_gcs_path], check=True)
-                            else:
+                        if args.output_dir.startswith("gs://"):
+                            with tempfile.TemporaryDirectory(
+                                dir=args.tmp_dir
+                            ) as tmpdirname:
+                                local_output_dir = tmpdirname
+                                print(
+                                    f"Saving model to {local_output_dir}...", flush=True
+                                )
                                 model_cpu = copy.deepcopy(model).to("cpu")
-                                model_cpu.save_pretrained(args.output_dir,save_serialization=True)
+                                model_cpu.save_pretrained(
+                                    local_output_dir, safe_serialization=True
+                                )
+                                print(
+                                    f"Uploading model to {args.output_dir}...",
+                                    flush=True,
+                                )
+                                subprocess.run(
+                                    [
+                                        "gsutil",
+                                        "-m",
+                                        "cp",
+                                        "-r",
+                                        local_output_dir,
+                                        args.output_dir,
+                                    ],
+                                    check=True,
+                                )
+                                new_dir_name = f"{args.model_name}_latest"
+                                new_gcs_path = f"{args.output_dir}/{new_dir_name}"
+                                uploaded_gcs_dir = f"{args.output_dir}/{os.path.basename(local_output_dir)}"
+                                print(
+                                    f"Renaming {uploaded_gcs_dir} → {new_gcs_path}",
+                                    flush=True,
+                                )
+                                subprocess.run(
+                                    [
+                                        "gsutil",
+                                        "-m",
+                                        "mv",
+                                        uploaded_gcs_dir,
+                                        new_gcs_path,
+                                    ],
+                                    check=True,
+                                )
+                        else:
+                            model_cpu = copy.deepcopy(model).to("cpu")
+                            model_cpu.save_pretrained(
+                                args.output_dir, safe_serialization=True
+                            )
+                    _barrier(f"after_model_saving_s{step}", device)
+                    if _diag:
+                        print(
+                            f"[DIAG][Rank {global_ordinal()}] step={step} EXIT barrier(after_model_saving)",
+                            flush=True,
+                        )
 
-                        # Use mark_step for safer synchronization after saving
-                        xm.mark_step()
+            if args.debug:
+                break
 
-                    if step > 0 and step % args.synchronization_steps == 0:  # synchronize every synch steps (skip step 0)
-                        # Use mark_step for safer periodic synchronization
-                        xm.mark_step()
+            if step_ok:
+                sub_step += 1
 
-                    if (step+1) % steps_per_epoch == 0:
-                        break
+            if (step + 1) % steps_per_epoch == 0:
+                break
 
-                except Exception as e:
-                    print(f"Core {xm.get_ordinal()}: Error occurred during processing batch {step}: {e}", flush=True)
-                    # Skip this batch and continue
-                    miss_steps += 1
-                    xm.mark_step()  # Ensure synchronization after error
-                    continue
-
-        except Exception as e:
-            print(f"Core {xm.get_ordinal()}: Error in data loader iteration for epoch {epoch}: {e}", flush=True)
-            print(f"Core {xm.get_ordinal()}: Continuing to next epoch...", flush=True)
+        # All cores arrive here together
+        _barrier(f"end_epoch_{epoch}_before_eval", device)
 
         val_ppl = evaluate(model, xla_validation_loader, device)
 
-        if xm.get_ordinal() == 0:
-            wandb.log({
-                "val_perplexity": val_ppl,
-                "epoch": epoch,
-                "miss_steps": miss_steps
-            })
+        if global_ordinal() == 0:
+            wandb.log(
+                {"val_perplexity": val_ppl, "epoch": epoch, "miss_steps": miss_steps},
+                commit=True,
+            )
 
-        # Use mark_step for safer synchronization between epochs
-        xm.mark_step()
-
-        # Use mark_step for safer synchronization before epoch save
-        xm.mark_step()
-
-        if xm.get_ordinal() == 0:
+        # Save model checkpoint
+        if global_ordinal() == 0:
             print("Saving model...", flush=True)
             if args.output_dir.startswith("gs://"):
                 with tempfile.TemporaryDirectory(dir=args.tmp_dir) as tmpdirname:
                     local_output_dir = tmpdirname
                     print(f"Saving model to {local_output_dir}...", flush=True)
                     model_cpu = copy.deepcopy(model).to("cpu")
-                    model_cpu.save_pretrained(local_output_dir, save_serialization=True)
+                    model_cpu.save_pretrained(local_output_dir, safe_serialization=True)
                     print(f"Uploading model to {args.output_dir}...", flush=True)
-                    subprocess.run(["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir], check=True)
-                    # rename the directory on GCS to the model name, date, and epoch_step
-                    # Generate a new directory name with model name, date, and epoch_step
+                    subprocess.run(
+                        ["gsutil", "-m", "cp", "-r", local_output_dir, args.output_dir],
+                        check=True,
+                    )
                     current_time = datetime.datetime.now().strftime("%Y%m%d")
                     new_dir_name = f"{args.model_name}_epoch{epoch}_{current_time}"
-                    new_gcs_path = os.path.join(args.output_dir, new_dir_name)
-                    # Rename the directory on GCS
-                    subprocess.run(["gsutil", "mv", os.path.join(args.output_dir, local_output_dir), new_gcs_path], check=True)
+                    new_gcs_path = f"{args.output_dir}/{new_dir_name}"
+                    uploaded_gcs_dir = (
+                        f"{args.output_dir}/{os.path.basename(local_output_dir)}"
+                    )
+                    print(f"Renaming {uploaded_gcs_dir} → {new_gcs_path}", flush=True)
+                    subprocess.run(
+                        ["gsutil", "-m", "mv", uploaded_gcs_dir, new_gcs_path],
+                        check=True,
+                    )
             else:
                 model_cpu = copy.deepcopy(model).to("cpu")
-                model_cpu.save_pretrained(args.output_dir, save_serialization=True)
+                model_cpu.save_pretrained(args.output_dir, safe_serialization=True)
 
-        # Use mark_step for safer synchronization after epoch save
-        xm.mark_step()
+        # Epoch-end save barrier — all ranks must wait for rank 0's save
+        _barrier(f"end_epoch_{epoch}_after_save", device)
 
     # Finish wandb run
-    if xm.get_ordinal() == 0:
+    if global_ordinal() == 0:
         wandb.finish()
+
 
 def prep_and_train_fn(index, args):
     device = xm.xla_device()
+
+    # Verify all cores are participating
+    world_size_val = world_size()
+    ordinal = global_ordinal()
+
+    print(
+        f"Process {index}: ordinal={ordinal}, world_size={world_size_val}, device={device}",
+        flush=True,
+    )
+
+    _barrier("prep_start", device)
     tokenized_dataset = prep_fn(args)
+
+    _barrier("train_start", device)
     train_fn(tokenized_dataset, device, args)
+
 
 def evaluate(model, dataloader, device):
     model.eval()
     total_loss = 0.0
     total_steps = 0
 
-    # Use mark_step for safer synchronization before evaluation
     xm.mark_step()
 
-    # Loop over the validation set
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
@@ -782,38 +1192,45 @@ def evaluate(model, dataloader, device):
 
         with torch.no_grad():
             outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
+                input_ids=input_ids, attention_mask=attention_mask, labels=labels
             )
         loss = outputs.loss
-
-        # Accumulate the loss locally (on this TPU core)
         total_loss += loss.item()
         total_steps += 1
 
-    # Average loss for this core
-    local_avg_loss = total_loss / total_steps
+    local_avg_loss = total_loss / max(total_steps, 1)
 
-    # Now reduce across all TPU cores to get a "global" average
-    # mesh_reduce can apply a function (here `np.mean`) over the local values
     global_avg_loss = xm.mesh_reduce("eval_loss", local_avg_loss, np.mean)
 
-    # Perplexity = exp(average cross-entropy loss)
-    ppl = math.exp(global_avg_loss)
+    ppl = math.exp(min(global_avg_loss, 10))
 
-    model.train()  # Switch back to train mode
+    model.train()
     return ppl
+
 
 def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--dataset_dir", type=str, required=True)
-    parser.add_argument("--dataset_format", default="json", choices=["json", "parquet", "arrow"])
+    parser.add_argument(
+        "--training_file",
+        type=str,
+        default=None,
+        help="Path to training parquet/json file (local path or gs://)",
+    )
+    parser.add_argument(
+        "--validation_file",
+        type=str,
+        default=None,
+        help="Path to validation parquet/json file (local path or gs://)",
+    )
+    parser.add_argument(
+        "--dataset_format", default="json", choices=["json", "parquet", "arrow"]
+    )
     parser.add_argument("--tmp_dir", type=str, required=True)
     parser.add_argument("--tokenizer_name_or_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--pre_tokenized", action='store_true', default=False)
+    parser.add_argument("--pre_tokenized", action="store_true", default=False)
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
     parser.add_argument("--mlm_probability", type=float, default=0.25)
     parser.add_argument("--max_seq_length", type=int, default=512)
@@ -826,106 +1243,112 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.001)
+    parser.add_argument("--max_grad_norm", type=float, default=14.4)
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--save_epoch_percentage", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_cores", type=int, default=8)
-    parser.add_argument("--keep_in_memory", action='store_true')
-    parser.add_argument("--streaming_data", action='store_true')
-    parser.add_argument("--sharded_data", action='store_true')
-    parser.add_argument("--max_steps_per_epoch", type=int, default=None)
+    parser.add_argument("--keep_in_memory", action="store_true")
+    parser.add_argument("--streaming_data", action="store_true")
+    parser.add_argument("--sharded_data", action="store_true")
+    parser.add_argument("--max_steps_per_epoch", type=int, default=50_000_000)
     parser.add_argument("--shuffle_buffer_size", type=int, default=10_000)
-    parser.add_argument("--shuffle_dataset_path", type=str, default="/home/bob/tmp/shuffle.parquet")
+    parser.add_argument(
+        "--shuffle_dataset_path", type=str, default="/home/bob/tmp/shuffle.parquet"
+    )
     parser.add_argument("--shuffle_dataset_ext", type=str, default=None)
-    parser.add_argument("--shuffle_dataset", action='store_true')
-    parser.add_argument("--shuffle_force_update", action='store_true')
-    parser.add_argument("--synchronization_steps", type=int, default=512)
-    parser.add_argument("--debug", action='store_true')
+    parser.add_argument("--shuffle_dataset", action="store_true")
+    parser.add_argument("--shuffle_force_update", action="store_true")
+    parser.add_argument("--debug", action="store_true")
     parser.add_argument("--checkpoint_path", type=str)
-    parser.add_argument("--checkpoint_handling", type=str, choices=['start_with_checkpoint', 'start_with_basemodel', 'start_with_init'])
+    parser.add_argument(
+        "--checkpoint_handling",
+        type=str,
+        choices=["start_with_checkpoint", "start_with_basemodel", "start_with_init"],
+    )
     parser.add_argument("--model_name", type=str, default="CLTL/MedRoBERTa.nl")
-    parser.add_argument("--lazy_grouping", action='store_true', help="Use lazy grouping to process data on-the-fly during training (incompatible with --pre_tokenized)")
-    parser.add_argument("--num_cycles", type=int, default=4, help="Number of cycles for cyclic learning rate scheduler. If None, defaults to num_train_epochs")
-    parser.add_argument("--wandb_key", type=str, required=True,help="Weights & Biases API key")
+    parser.add_argument(
+        "--lazy_grouping",
+        action="store_true",
+        help="Use lazy grouping to process data on-the-fly during training (incompatible with --pre_tokenized)",
+    )
+    parser.add_argument(
+        "--num_cycles",
+        type=int,
+        default=4,
+        help="Number of cycles for cyclic learning rate scheduler. If None, defaults to num_train_epochs",
+    )
+    parser.add_argument(
+        "--wandb_key", type=str, required=True, help="Weights & Biases API key"
+    )
+    parser.add_argument(
+        "--TPU_NAME", type=str, default="unknown, please set with --TPU_NAME"
+    )
+    parser.add_argument(
+        "--TPU_DISK", type=str, default="unknown, please set with --TPU_DISK"
+    )
     args = parser.parse_args()
-
-    #mp.set_start_method('fork', force=True)
 
     # give error if both keep_in_memory and streaming_data are set to True
     # as they are mutually exclusive
     if args.keep_in_memory and args.streaming_data:
-        raise ValueError("keep_in_memory and streaming_data are mutually exclusive. Please set only one of them to True.")
+        raise ValueError(
+            "keep_in_memory and streaming_data are mutually exclusive. Please set only one of them to True."
+        )
 
-    if args.streaming_data==True and args.shuffle_buffer_size is None:
-        raise ValueError("shuffle_buffer_size is required when streaming_data is set to True.")
+    if args.streaming_data == True and args.shuffle_buffer_size is None:
+        raise ValueError(
+            "shuffle_buffer_size is required when streaming_data is set to True."
+        )
 
     if args.lazy_grouping and args.pre_tokenized:
-        raise ValueError("lazy_grouping cannot be used with pre_tokenized data. Lazy grouping requires raw tokenized data to group on-the-fly.")
+        raise ValueError(
+            "lazy_grouping cannot be used with pre_tokenized data. Lazy grouping requires raw tokenized data to group on-the-fly."
+        )
 
     # Set the same seed for all processes
     torch.manual_seed(args.seed)
 
     if args.shuffle_dataset:
         shuffle_dir = args.shuffle_dataset_path
-        if (os.path.exists(shuffle_dir)) and (args.shuffle_force_update==False):
-            print(f"Shuffled dataset exists, skipping creation: {shuffle_dir}", flush=True)
+        if (os.path.exists(shuffle_dir)) and (args.shuffle_force_update == False):
+            print(
+                f"Shuffled dataset exists, skipping creation: {shuffle_dir}", flush=True
+            )
         else:
-            if (os.path.exists(shuffle_dir)):
+            if os.path.exists(shuffle_dir):
                 print(f"Removing shuffled dataset: {shuffle_dir}", flush=True)
                 shutil.rmtree(shuffle_dir)
 
             if args.shuffle_dataset_ext is not None:
                 print("Loading pre-shuffled dataset...", flush=True)
-                dataset = load_dataset(args.dataset_format, data_files={
-                    "train": args.shuffle_dataset_ext,
-                    "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
-                }, keep_in_memory=True)
-
-                print("Clearing cache!", flush=True)
-                cache_dir = os.path.expanduser("~/.cache/huggingface")
-                if os.path.exists(cache_dir):
-                    print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
-                    shutil.rmtree(cache_dir)
-                else:
-                    print("Hugging Face cache directory not found.", flush=True)
+                dataset = load_dataset(
+                    args.dataset_format,
+                    data_files={
+                        "train": args.shuffle_dataset_ext,
+                        "validation": args.dataset_dir
+                        + f"/validation/*.{args.dataset_format}",
+                    },
+                    keep_in_memory=True,
+                )
 
                 dataset.save_to_disk(args.shuffle_dataset_path)
 
-                print("Clearing cache a-posteriori !", flush=True)
-                cache_dir = os.path.expanduser("~/.cache/huggingface")
-                if os.path.exists(cache_dir):
-                    print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
-                    shutil.rmtree(cache_dir)
-                else:
-                    print("Hugging Face cache directory not found.", flush=True)
-
             else:
                 print("Loading dataset for shuffling...", flush=True)
-                dataset = load_dataset(args.dataset_format, data_files={
-                    "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
-                    "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
-                }, keep_in_memory=True)
-
-                print("Clearing cache!", flush=True)
-                cache_dir = os.path.expanduser("~/.cache/huggingface")
-                if os.path.exists(cache_dir):
-                    print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
-                    shutil.rmtree(cache_dir)
-                else:
-                    print("Hugging Face cache directory not found.", flush=True)
+                dataset = load_dataset(
+                    args.dataset_format,
+                    data_files={
+                        "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
+                        "validation": args.dataset_dir
+                        + f"/validation/*.{args.dataset_format}",
+                    },
+                    keep_in_memory=True,
+                )
 
                 print("Shuffling and saving dataset...", flush=True)
                 shuffle_and_save_dataset(dataset, args.shuffle_dataset_path)
 
-                print("Clearing cache a-posteriori !", flush=True)
-                cache_dir = os.path.expanduser("~/.cache/huggingface")
-                if os.path.exists(cache_dir):
-                    print(f"Removing Hugging Face cache directory: {cache_dir}", flush=True)
-                    shutil.rmtree(cache_dir)
-                else:
-                    print("Hugging Face cache directory not found.", flush=True)
-
-            # Update the dataset directory to the shuffled dataset path
             # Clear the dataset from memory
             del dataset
             gc.collect()
@@ -940,21 +1363,31 @@ def main():
     args.tokenizer.model_max_length = args.max_seq_length
 
     if args.shuffle_dataset:
-            args.dataset_dir = args.shuffle_dataset_path
-            args.dataset_format = 'arrow'
-            print("Continuing with Arrow format", flush=True)
+        args.dataset_dir = args.shuffle_dataset_path
+        args.dataset_format = "arrow"
+        print("Continuing with Arrow format", flush=True)
 
-    sleep(20)
+    sleep(5)
 
     # Spawn processes
     print(f"Initializing TPU...with {args.num_cores} cores")
     print("Spawning processes...")
 
     if args.num_cores == 1:
-        print("Running single process...")
+        print("Running single process...", flush=True)
         prep_and_train_fn(0, args)
     else:
-        xmp.spawn(prep_and_train_fn, args=(args,)) #, nprocs=args.num_cores )
+        os.environ["TPU_NUM_DEVICES"] = str(args.num_cores)
+        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=" + str(
+            args.num_cores
+        )
+        try:
+            print("STARTING SPAWN", flush=True)
+            xmp.spawn(prep_and_train_fn, args=(args,), start_method="spawn")
+        except Exception as e:
+            print(f"Error spawning processes: {e}", flush=True)
+            raise e
+
 
 if __name__ == "__main__":
     print("Starting...")

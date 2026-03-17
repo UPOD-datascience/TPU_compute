@@ -23,7 +23,7 @@ while true; do
     --save_epoch_percentage=${SAVE_PERCENTAGE} \
     --logging_steps=${LOGGING_STEPS} \
     --num_warmup_steps=${NUM_WARMUP} \
-    --num_cores=1 \
+    --num_cores=8 \
     --hidden_size=${HIDDEN_SIZE} \
     --intermediate_size=${INTERMEDIATE_SIZE} \
     --num_hidden_layers=${HIDDEN_LAYERS} \
@@ -33,7 +33,6 @@ while true; do
     --mlm_probability=${MLM_PROB} \
     --streaming_data \
     --shuffle_dataset \
-    --causal_training \
     --shuffle_dataset_path=${SHUFFLED_DATASET_PATH} \
     --shuffle_dataset_ext=${SHUFFLED_DATASET_EXT} \
     --checkpoint_path=${MODEL_CHECKPOINT} \
@@ -41,6 +40,8 @@ while true; do
     --max_steps_per_epoch=${MAX_STEPS_PER_EPOCH} \
     --weight_decay=${WEIGHT_DECAY} \
     --wandb_key=${WANDB_KEY} \
+    --TPU_NAME=${TPU_NAME} \
+    --TPU_DISK=${EXT_DISK_NAME} \
     --num_train_epochs=1 2>&1 | tee -a ~/logs.txt
 
   EXIT_CODE=$?

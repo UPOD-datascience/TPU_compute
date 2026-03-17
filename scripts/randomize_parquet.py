@@ -1,66 +1,114 @@
+import glob
 import os
-import numpy as np
-import pyarrow.parquet as pq
-import pyarrow as pa
-import pandas as pd
-import tempfile
-import shutil
-from tqdm import tqdm
 import random
+import shutil
+import tempfile
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from tqdm import tqdm
 
 
-def concatenate_parquet_files(input_dir, temp_dir=None):
+def merge_parquet_files(input_paths, output_path, schema=None, batch_size=50000):
     """
-    Concatenates all Parquet files in a directory into a single Parquet file.
+    Merge multiple Parquet files into a single file using incremental out-of-core processing.
 
-    Returns the path to the concatenated Parquet file.
+    This function processes files in batches to minimize memory usage, making it
+    suitable for merging large Parquet files that don't fit in memory.
+
+    Parameters:
+    -----------
+    input_paths : list of str
+        List of paths to input Parquet files
+    output_path : str
+        Path for the merged output Parquet file
+    schema : pyarrow.Schema, optional
+        Schema to use for the merged file. If None, uses schema from first file.
+    batch_size : int
+        Number of rows to process in each batch (default: 50000)
+
+    Returns:
+    --------
+    str : Path to the merged file
     """
-    if temp_dir is None:
-        temp_dir = tempfile.mkdtemp()
-    else:
-        os.makedirs(temp_dir, exist_ok=True)
+    if len(input_paths) == 0:
+        raise ValueError("No input files provided for merging")
 
-    output_path = os.path.join(temp_dir, "concatenated.parquet")
-    print(f"Writing temp to : {output_path}")
-    parquet_files = [
-        os.path.join(input_dir, f)
-        for f in os.listdir(input_dir)
-        if f.endswith(".parquet")
-    ]
-    if not parquet_files:
-        raise ValueError(f"No Parquet files found in directory: {input_dir}")
+    if len(input_paths) == 1:
+        print(f"Only one input file provided, copying to {output_path}")
+        shutil.copy2(input_paths[0], output_path)
+        return output_path
 
-    print(f"Concatenating {len(parquet_files)} Parquet files from {input_dir}...")
+    print(
+        f"Merging {len(input_paths)} Parquet files (out-of-core, batch_size={batch_size})..."
+    )
 
-    # Read first file metadata to get schema without loading full data
-    first_file = pq.ParquetFile(parquet_files[0])
-    schema = first_file.schema_arrow
+    # Get schema from first file if not provided
+    if schema is None:
+        first_file = pq.ParquetFile(input_paths[0])
+        schema = first_file.schema_arrow
 
+    # Calculate total rows for progress bar
+    total_rows = 0
+    file_row_counts = []
+    for path in input_paths:
+        pf = pq.ParquetFile(path)
+        row_count = pf.metadata.num_rows
+        file_row_counts.append(row_count)
+        total_rows += row_count
+
+    print(f"Total rows to merge: {total_rows}")
+    total_batches = (total_rows + batch_size - 1) // batch_size
+
+    # Write merged file incrementally
     with pq.ParquetWriter(output_path, schema, compression="snappy") as writer:
-        for pf in parquet_files:
-            print(f"Processing: {pf}")
-            parquet_file = pq.ParquetFile(pf)
-            print(f"Num rows:{parquet_file.metadata.num_rows}")
-            print(f"Num row groups:{parquet_file.metadata.num_row_groups}")
-            file_schema = parquet_file.schema_arrow
-            schema_matches = file_schema == schema
-            print(f"Schema match: {schema_matches}")
-            if not schema_matches:
-                print(f"Expected schema: {schema}")
-                print(f"File schema: {file_schema}")
-            row_group_count = parquet_file.metadata.num_row_groups
-            row_groups_written = 0
-            for rg in tqdm(range(row_group_count), desc="Row groups"):
-                table = parquet_file.read_row_group(rg)
-                table = table.cast(schema)
-                writer.write_table(table)
-                row_groups_written += 1
-                del table
-            print(f"Row groups written:{row_groups_written}")
-            del parquet_file
+        with tqdm(total=total_batches, desc="Merging batches") as pbar:
+            for file_idx, path in enumerate(input_paths):
+                try:
+                    parquet_file = pq.ParquetFile(path)
+                    num_batches_in_file = (
+                        file_row_counts[file_idx] + batch_size - 1
+                    ) // batch_size
 
-    print(f"Concatenated Parquet file saved to: {output_path}")
+                    # Process file in batches
+                    for batch in parquet_file.iter_batches(batch_size=batch_size):
+                        # Convert batch to table and cast to target schema
+                        table = pa.Table.from_batches([batch])
+                        table = table.cast(schema)
+                        writer.write_table(table)
+                        del table
+                        del batch
+                        pbar.update(1)
+
+                except Exception as e:
+                    print(f"Error processing file {path}: {e}")
+                    raise
+
+    print(f"Merged file saved to: {output_path}")
     return output_path
+
+
+def get_parquet_files_from_dir(directory, pattern="*.parquet"):
+    """
+    Get all Parquet files from a directory.
+
+    Parameters:
+    -----------
+    directory : str
+        Path to directory containing Parquet files
+    pattern : str
+        Glob pattern to match files (default: "*.parquet")
+
+    Returns:
+    --------
+    list of str : Sorted list of paths to Parquet files
+    """
+    search_pattern = os.path.join(directory, pattern)
+    files = glob.glob(search_pattern)
+    files.sort()  # Sort for reproducibility
+    return files
 
 
 def recursive_shuffle_parquet(
@@ -97,6 +145,8 @@ def recursive_shuffle_parquet(
         Random seed for reproducibility
     iterations : int
         Number of times to repeat the shuffling process
+    write_every_iteration : bool
+        Whether to save intermediate results after each iteration
     """
     if seed is not None:
         random.seed(seed)
@@ -198,11 +248,18 @@ def recursive_shuffle_parquet(
 
             # Update for next iteration
             if iteration < iterations - 1:
+                # Clean up previous iteration's output file if it exists
+                if iteration > 0 and current_input != input_path:
+                    try:
+                        os.remove(current_input)
+                    except Exception as e:
+                        print(f"Warning: Could not remove previous iteration file: {e}")
+
                 current_input = iter_output
                 _output_path = f"{output_path.rstrip('.parquet')}_{iteration}.parquet"
                 if write_every_iteration:
                     shutil.copy2(iter_output, _output_path)
-                print(f"Shuffled parquet file saved to: {_output_path}")
+                    print(f"Shuffled parquet file saved to: {_output_path}")
             else:
                 # Final iteration - copy to output_path
                 shutil.copy2(iter_output, output_path)
@@ -211,6 +268,12 @@ def recursive_shuffle_parquet(
                     os.remove(iter_output)
                 except Exception as e:
                     print(f"Warning: Could not remove final iteration file: {e}")
+                # Clean up previous iteration's output file if it exists (for iterations > 1)
+                if iteration > 0 and current_input != input_path:
+                    try:
+                        os.remove(current_input)
+                    except Exception as e:
+                        print(f"Warning: Could not remove previous iteration file: {e}")
         print(f"Shuffled parquet file saved to: {output_path}")
 
     finally:
@@ -223,25 +286,166 @@ def recursive_shuffle_parquet(
         print("Done!")
 
 
+def merge_and_shuffle_parquet(
+    input_paths=None,
+    input_dir=None,
+    output_path=None,
+    window_size=50000,
+    temp_dir=None,
+    seed=None,
+    iterations=1,
+    write_every_iteration=False,
+    merge_only=False,
+    shuffle_only=False,
+    input_path=None,
+):
+    """
+    Merge multiple Parquet files and then shuffle the result.
+
+    Parameters:
+    -----------
+    input_paths : list of str, optional
+        List of paths to input Parquet files to merge
+    input_dir : str, optional
+        Directory containing Parquet files to merge
+    output_path : str
+        Path for the output file
+    window_size : int
+        Number of rows to process in each batch during shuffling
+    temp_dir : str, optional
+        Directory to store temporary files
+    seed : int, optional
+        Random seed for reproducibility
+    iterations : int
+        Number of times to repeat the shuffling process
+    write_every_iteration : bool
+        Whether to save intermediate results after each iteration
+    merge_only : bool
+        If True, only merge files without shuffling
+    shuffle_only : bool
+        If True, skip merging (use single input_path)
+    input_path : str, optional
+        Single input path (for backward compatibility / shuffle_only mode)
+    """
+    # Determine input files
+    files_to_merge = []
+
+    if shuffle_only and input_path:
+        # Single file mode - skip merging
+        files_to_merge = [input_path]
+    elif input_paths:
+        files_to_merge = input_paths
+    elif input_dir:
+        files_to_merge = get_parquet_files_from_dir(input_dir)
+        if not files_to_merge:
+            raise ValueError(f"No Parquet files found in directory: {input_dir}")
+        print(f"Found {len(files_to_merge)} Parquet files in {input_dir}")
+    elif input_path:
+        files_to_merge = [input_path]
+    else:
+        raise ValueError("Must provide either input_paths, input_dir, or input_path")
+
+    # Create temp directory
+    if temp_dir is None:
+        temp_dir = tempfile.mkdtemp()
+        cleanup_temp = True
+    else:
+        os.makedirs(temp_dir, exist_ok=True)
+        cleanup_temp = False
+
+    try:
+        # Determine if we need to merge
+        if len(files_to_merge) == 1:
+            merged_path = files_to_merge[0]
+            needs_cleanup = False
+        else:
+            # Merge files first
+            merged_path = os.path.join(temp_dir, "merged_temp.parquet")
+            merge_parquet_files(files_to_merge, merged_path, batch_size=window_size)
+            needs_cleanup = True
+
+        if merge_only:
+            # Just copy merged file to output
+            if merged_path != output_path:
+                if needs_cleanup:
+                    shutil.move(merged_path, output_path)
+                else:
+                    shutil.copy2(merged_path, output_path)
+            print(f"Merged file saved to: {output_path}")
+        else:
+            # Shuffle the merged file
+            recursive_shuffle_parquet(
+                merged_path,
+                output_path,
+                window_size=window_size,
+                temp_dir=temp_dir,
+                seed=seed,
+                iterations=iterations,
+                write_every_iteration=write_every_iteration,
+            )
+
+            # Clean up merged temp file if created
+            if needs_cleanup and os.path.exists(merged_path):
+                try:
+                    os.remove(merged_path)
+                except Exception:
+                    pass
+
+    finally:
+        if cleanup_temp:
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Shuffle a Parquet file or a directory of Parquet files"
+        description="Merge and/or shuffle Parquet files using a batch-based approach",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Shuffle a single file (original behavior)
+  python randomize_parquet.py --input_path input.parquet --output_path output.parquet
+
+  # Merge multiple files and shuffle
+  python randomize_parquet.py --input_paths file1.parquet file2.parquet file3.parquet --output_path output.parquet
+
+  # Merge all parquet files in a directory and shuffle
+  python randomize_parquet.py --input_dir /path/to/parquet/files --output_path output.parquet
+
+  # Only merge files without shuffling
+  python randomize_parquet.py --input_dir /path/to/files --output_path merged.parquet --merge_only
+
+  # Merge and shuffle with multiple iterations
+  python randomize_parquet.py --input_dir /path/to/files --output_path output.parquet --iterations 3
+        """,
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--input_path", help="Path to the input Parquet file")
-    group.add_argument(
-        "--input_dir",
-        help="Path to a directory of Parquet files to concatenate and shuffle",
+
+    # Input options (mutually exclusive in practice, but we handle the logic)
+    input_group = parser.add_argument_group("Input options")
+    input_group.add_argument("--input_path", help="Path to a single input Parquet file")
+    input_group.add_argument(
+        "--input_paths",
+        nargs="+",
+        help="Paths to multiple input Parquet files to merge",
     )
+    input_group.add_argument(
+        "--input_dir", help="Directory containing Parquet files to merge"
+    )
+
+    # Output options
     parser.add_argument(
-        "--output_path", required=True, help="Path for the output shuffled Parquet file"
+        "--output_path", required=True, help="Path for the output Parquet file"
     )
+
+    # Processing options
     parser.add_argument(
         "--window-size",
         type=int,
-        default=50_000,
+        default=50000,
         help="Number of rows to process in each batch (default: 50000)",
     )
     parser.add_argument(
@@ -258,22 +462,49 @@ if __name__ == "__main__":
         default=1,
         help="Number of times to repeat the shuffling process (default: 1)",
     )
-    parser.add_argument("--write_every_iteration", action="store_true", default=False)
+    parser.add_argument(
+        "--write_every_iteration",
+        action="store_true",
+        default=False,
+        help="Save intermediate results after each shuffle iteration",
+    )
+
+    # Mode options
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--merge_only",
+        action="store_true",
+        default=False,
+        help="Only merge files without shuffling",
+    )
+    mode_group.add_argument(
+        "--shuffle_only",
+        action="store_true",
+        default=False,
+        help="Skip merging, only shuffle (requires --input_path)",
+    )
 
     args = parser.parse_args()
 
-    if args.input_dir:
-        concat_path = concatenate_parquet_files(args.input_dir, temp_dir=args.temp_dir)
-        input_path = concat_path
-    else:
-        input_path = args.input_path
+    # Validate arguments
+    if args.shuffle_only and not args.input_path:
+        parser.error("--shuffle_only requires --input_path")
 
-    recursive_shuffle_parquet(
-        input_path,
-        args.output_path,
+    if not args.input_path and not args.input_paths and not args.input_dir:
+        parser.error(
+            "Must provide at least one of: --input_path, --input_paths, or --input_dir"
+        )
+
+    merge_and_shuffle_parquet(
+        input_paths=args.input_paths,
+        input_dir=args.input_dir,
+        output_path=args.output_path,
         window_size=args.window_size,
         temp_dir=args.temp_dir,
         seed=args.seed,
         iterations=args.iterations,
         write_every_iteration=args.write_every_iteration,
+        merge_only=args.merge_only,
+        shuffle_only=args.shuffle_only,
+        input_path=args.input_path,
     )
