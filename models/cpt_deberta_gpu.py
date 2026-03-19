@@ -108,9 +108,13 @@ def prep_fn(args):
             flush=True,
         )
         base = Path(args.dataset_dir)
+        
+        parquet_path = base / "train" / "partitions"
+        train_parquets = os.listdir(parquet_path)
+        random.shuffle(train_parquets)
 
         data_files = {
-            "train": str(base / "train" / "*.parquet"),
+            "train": [str(parquet_path / f) for f in train_parquets],
             "validation": str(base / "validation" / "*.parquet"),
         }
 
@@ -278,7 +282,7 @@ def train_fn(index, args):
 
     # Set up data collator
     data_collator = DataCollatorForLanguageModeling(
-        tokenizer=args.tokenizer, mlm=True, mlm_probability=0.15
+        tokenizer=args.tokenizer, mlm=True, mlm_probability=args.mlm_proba
     )
 
     # For GPU training, assume a single process (non-distributed)
@@ -515,6 +519,7 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.001)
+    parser.add_argument("--mlm_proba", type=float, default=0.15)
     parser.add_argument("--max_grad_norm", type=float, default=10)
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--save_epoch_percentage", type=float, default=0.5)

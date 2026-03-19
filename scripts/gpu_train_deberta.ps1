@@ -27,10 +27,11 @@ $cmd = 'cd /d ' + $env:FULL_SCRIPT_DIR + ' && poetry run python ../models/cpt_de
        '--num_warmup_steps=50000 ' +
        '--num_cores=1 ' +
        '--max_seq_length=' + $env:MAX_SEQ_LEN + ' ' +
-       '--learning_rate=1e-5 ' +
+       '--learning_rate=2e-5 ' +
 	   '--max_steps_per_epoch=' + $env:MAX_STEPS_PER_EPOCH  + ' ' + 
        '--streaming_data ' +
-       '--weight_decay=0.0000001 ' +
+       '--weight_decay=0. ' +
+	   '--mlm_proba=0.2 ' +
        '--num_train_epochs=1 ' +
 	   '--bf16'
 	   #'--init_training'
