@@ -17,6 +17,7 @@ from tokenizers.processors import TemplateProcessing
 from tokenizers.normalizers import BertNormalizer
 from tokenizers.pre_tokenizers import WhitespaceSplit
 from tokenizers.models import WordPiece
+#from tokenizers import AddedToken
 
 import os
 import argparse
@@ -77,13 +78,19 @@ def read_jsonl(file_path):
         for line in content.splitlines():
             data = json.loads(line)
             if data is not None:
-                texts.append(data['text'])  # Adjust the key based on your JSON structure
+                try:
+                    texts.append(data['text'])  # Adjust the key based on your JSON structure
+                except KeyError:
+                    raise KeyError(f"'text' key not found in JSON object: {data.keys()}")   
     else:
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 data = json.loads(line)
                 if data is not None:
-                    texts.append(data['text'])  # Adjust the key based on your JSON structure
+                    try:
+                        texts.append(data['text'])  # Adjust the key based on your JSON structure
+                    except KeyError:
+                        raise KeyError(f"'text' key not found in JSON object: {data.keys()}")
     return texts
 
 def read_jsonl_iterator(file_path, chunk_size=1024*1024):
@@ -116,14 +123,20 @@ def read_jsonl_iterator(file_path, chunk_size=1024*1024):
         for line in text_file:
             d = json.loads(line)
             if d is not None:
-                yield d['text']
+                try:
+                    yield d['text']
+                except KeyError:
+                    raise KeyError(f"'text' key not found in JSON object: {d.keys()}")
 
     else:
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 d = json.loads(line)
                 if d is not None:
-                    yield d['text']
+                    try:
+                        yield d['text']
+                    except KeyError:
+                        raise KeyError(f"'text' key not found in JSON object: {d.keys()}")
 
 # Function to read TXT file and extract text data
 def read_txt(file_path):
@@ -186,10 +199,18 @@ def read_parquet(file_path):
         blob = bucket.blob(blob_name)
         content = blob.download_as_bytes()
         df = pd.read_parquet(io.BytesIO(content))
-        texts = df['text'].tolist()
+        txt_col = 'text' if 'text' in df.columns else 'tekst' if 'tekst' in df.columns else None
+        try:
+            texts = df[txt_col].tolist()
+        except KeyError:
+            raise KeyError(f"tekst/text column not found in Parquet file: {df.columns.tolist()}")
     else:
         df = pd.read_parquet(file_path)
-        texts = df['text'].tolist()
+        txt_col = 'text' if 'text' in df.columns else 'tekst' if 'tekst' in df.columns else None
+        try:
+            texts = df[txt_col].tolist()
+        except KeyError:
+            raise KeyError(f"tekst/text column not found in Parquet file: {df.columns.tolist()}")
     return texts
 
 def read_parquet_iterator(file_path, batch_size=10_000):
@@ -211,8 +232,11 @@ def read_parquet_iterator(file_path, batch_size=10_000):
         # Convert batch to pandas DataFrame
         batch_df = batch.to_pandas()
 
-        # Yield the 'text' field from each row in the batch
-        for text in batch_df['text']:
+        # Yield the 'text' field from each row in the batch 
+        txt_col = 'text' if 'text' in batch_df.columns else 'tekst' if 'tekst' in batch_df.columns else None
+        if txt_col is None:
+            raise KeyError(f"tekst/text column not found in Parquet file batch: {batch_df.columns.tolist()}")
+        for text in batch_df[txt_col]:
             yield text
 
 def combine_iterators(iterators: List[Iterator[str]])->Iterator[str]:
@@ -227,6 +251,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default='~/tokenizer', required=True)
     parser.add_argument("--vocab_size", type=int, default=50_368)
     parser.add_argument("--min_frequency", type=int, default=100)
+    parser.add_argument("--num_special_tokens", type=int, default=50)
     parser.add_argument("--iterative", action='store_true')
     parser.add_argument("--tokenizer_type", type=str, choices=['bbpe', 'sentencebpe', 'debertav2', 'bertwordpiece', 'modernbert', 'llama', 'longformer', 'bigbird'], default='bbpe')
     args = parser.parse_args()
@@ -279,8 +304,7 @@ def main():
         # Train the tokenizer
         print("Training tokenizer..")
         tokenizer.train_from_iterator(all_texts, vocab_size=args.vocab_size, min_frequency=args.min_frequency, special_tokens=[
-            "<s>", "</s>", "<pad>", "<unk>", "<mask>"
-        ])
+            "<s>", "</s>", "<pad>", "<unk>", "<mask>"]+[f"<|EX{str(l)}|>" for l in range(args.num_special_tokens)])
         print("Saving tokenizer..")
         tokenizer.save_model(os.path.join(save_dir))
         if args.tokenizer_type == 'longformer':
@@ -294,8 +318,7 @@ def main():
         # Train the tokenizer
         print("Training tokenizer..")
         tokenizer.train_from_iterator(all_texts, vocab_size=args.vocab_size, min_frequency=args.min_frequency, special_tokens=[
-            "<s>", "</s>", "<pad>", "<unk>", "<mask>"
-        ])
+            "<s>", "</s>", "<pad>", "<unk>", "<mask>"]+[f"<|EX{str(l)}|>" for l in range(args.num_special_tokens)])
         print("Saving tokenizer..")
         tokenizer.save_model(os.path.join(save_dir))
     elif args.tokenizer_type in  ['bertwordpiece', 'debertav2']:
@@ -304,8 +327,7 @@ def main():
         # Train the tokenizer
         print("Training tokenizer..")
         tokenizer.train_from_iterator(all_texts, vocab_size=args.vocab_size, min_frequency=args.min_frequency, special_tokens=[
-            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"
-        ])
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]+[f"[EX{str(l)}]" for l in range(args.num_special_tokens)])
         # Save the tokenizer files
         print("Saving tokenizer..")
         tokenizer.save_model(os.path.join(save_dir))
@@ -346,7 +368,7 @@ def main():
                 "|||IP_ADDRESS|||",
                 "|||EMAIL_ADDRESS|||",
                 "|||PHONE_NUMBER|||"
-        ])
+        ]+[f"[EX{str(l)}]" for l in range(args.num_special_tokens)])
         tokenizer.save(os.path.join(save_dir, "tokenizer.json"))
 
         # Wrap in PreTrainedTokenizerFast for ease of use:
@@ -377,6 +399,7 @@ def main():
             "</s>",   # End of sentence
             "<unk>",  # Unknown token
         ]
+        special_tokens += [f"<|EX{str(l)}|>" for l in range(args.num_special_tokens)]
 
         # Train the tokenizer
         print("Training tokenizer..")
