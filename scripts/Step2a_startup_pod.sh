@@ -26,21 +26,43 @@ if [ $grep_exit_code -eq 0 ]; then
 fi
 
 echo "Creating TPU ${TPU_NAME}..."
-if [ "${PRE_EMPTIBLE}" = true ]; then
-    gcloud compute tpus tpu-vm create "${TPU_NAME}" \
-      --zone="${ZONE}" \
-      --project="${PROJECT_ID}" \
-      --accelerator-type="${ACCELERATOR_TYPE}" \
-      --version "${RUNTIME_VERSION}" \
-      --preemptible \
-      --data-disk source=projects/${PROJECT_ID}/zones/${ZONE}/disks/${EXT_DISK_NAME},mode=${EXT_DISK_MODE}
-else
-    gcloud compute tpus tpu-vm create "${TPU_NAME}" \
-      --zone="${ZONE}" \
-      --project="${PROJECT_ID}" \
-      --accelerator-type="${ACCELERATOR_TYPE}" \
-      --version "${RUNTIME_VERSION}" \
-      --data-disk source=projects/${PROJECT_ID}/zones/${ZONE}/disks/${EXT_DISK_NAME},mode=${EXT_DISK_MODE}
-fi
+MAX_RETRIES=500
+RETRY_INTERVAL=30
+
+for attempt in $(seq 1 $MAX_RETRIES); do
+    echo "Attempt ${attempt}/${MAX_RETRIES}..."
+    set +e
+    if [ "${PRE_EMPTIBLE}" = true ]; then
+        gcloud compute tpus tpu-vm create "${TPU_NAME}" \
+          --zone="${ZONE}" \
+          --project="${PROJECT_ID}" \
+          --accelerator-type="${ACCELERATOR_TYPE}" \
+          --version "${RUNTIME_VERSION}" \
+          --preemptible \
+          --data-disk source=projects/${PROJECT_ID}/zones/${ZONE}/disks/${EXT_DISK_NAME},mode=${EXT_DISK_MODE}
+    else
+        gcloud compute tpus tpu-vm create "${TPU_NAME}" \
+          --zone="${ZONE}" \
+          --project="${PROJECT_ID}" \
+          --accelerator-type="${ACCELERATOR_TYPE}" \
+          --version "${RUNTIME_VERSION}" \
+          --data-disk source=projects/${PROJECT_ID}/zones/${ZONE}/disks/${EXT_DISK_NAME},mode=${EXT_DISK_MODE}
+    fi
+    create_exit_code=$?
+    set -e
+
+    if [ $create_exit_code -eq 0 ]; then
+        echo "TPU ${TPU_NAME} created successfully on attempt ${attempt}."
+        break
+    fi
+
+    if [ $attempt -eq $MAX_RETRIES ]; then
+        echo "Failed to create TPU ${TPU_NAME} after ${MAX_RETRIES} attempts."
+        exit 1
+    fi
+
+    echo "Creation failed. Retrying in ${RETRY_INTERVAL} seconds..."
+    sleep $RETRY_INTERVAL
+done
 
 gcloud compute tpus tpu-vm list --zone=${ZONE} --project=${PROJECT_ID}
