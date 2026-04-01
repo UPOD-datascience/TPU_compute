@@ -5,12 +5,13 @@ from tokenizers import (
         BertWordPieceTokenizer,
         )
 from transformers import (
-        DebertaV2TokenizerFast,
-        PreTrainedTokenizerFast,
-        LlamaTokenizerFast,
-        LongformerTokenizerFast,
-        RobertaTokenizerFast,
-        BigBirdTokenizerFast
+    DebertaV2Tokenizer,
+    DebertaV2TokenizerFast,
+    PreTrainedTokenizerFast,
+    LlamaTokenizerFast,
+    LongformerTokenizerFast,
+    RobertaTokenizerFast,
+    BigBirdTokenizerFast,
 )
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors
 from tokenizers.processors import TemplateProcessing
@@ -321,7 +322,7 @@ def main():
             "<s>", "</s>", "<pad>", "<unk>", "<mask>"]+[f"<|EX{str(l)}|>" for l in range(args.num_special_tokens)])
         print("Saving tokenizer..")
         tokenizer.save_model(os.path.join(save_dir))
-    elif args.tokenizer_type in  ['bertwordpiece', 'debertav2']:
+    elif args.tokenizer_type 'bertwordpiece':
         # Initialize a DeBERTa V2 tokenizer
         tokenizer = BertWordPieceTokenizer(lowercase=False)
         # Train the tokenizer
@@ -332,30 +333,75 @@ def main():
         print("Saving tokenizer..")
         tokenizer.save_model(os.path.join(save_dir))
 
-        if args.tokenizer_type == 'debertav2':
-            # Load the tokenizer into transformers as a fast tokenizer
-            slow_tokenizer = BertWordPieceTokenizer(os.path.join(save_dir, 'vocab.txt'),
-                                                                unk_token="[UNK]",
-                                                                pad_token="[PAD]",
-                                                                cls_token="[CLS]",
-                                                                sep_token="[SEP]",
-                                                                mask_token="[MASK]")
-            slow_tokenizer.save(os.path.join(save_dir, 'tokenizer.json'))
+    elif args.tokenizer_type == 'debertav2':
+        # Train a SentencePiece model, because DeBERTa-v2 expects SentencePiece-style tokenization
+        print("Preparing data for SentencePiece training..")
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8') as temp_file:
+            temp_filename = temp_file.name
+            for text in all_texts:
+                if text:
+                    temp_file.write(text.replace('\x00', ' ') + '\n')
 
-            tokenizer = DebertaV2TokenizerFast.from_pretrained(
-                save_dir,
-                tokenizer_file=os.path.join(save_dir,"tokenizer.json"),
-                vocab_file=os.path.join(save_dir,"vocab.txt"),
-                unk_token="[UNK]",
-                pad_token="[PAD]",
-                cls_token="[CLS]",
-                sep_token="[SEP]",
-                mask_token="[MASK]"
+        spm_model_prefix = os.path.join(save_dir, "spm")
+
+        special_tokens = [f"[EX{l}]" for l in range(args.num_special_tokens)]
+
+        print("Training SentencePiece model for DeBERTa-v2..")
+        spm.SentencePieceTrainer.train(
+            input=temp_filename,
+            model_prefix=spm_model_prefix,
+            vocab_size=args.vocab_size,
+            model_type="unigram",  # safer default for SentencePiece + DeBERTa-v2
+            character_coverage=1.0,
+            input_sentence_size=1_000_000,
+            shuffle_input_sentence=True,
+            num_threads=max(1, os.cpu_count() or 1),
+            pad_id=0,
+            unk_id=1,
+            bos_id=2,
+            eos_id=3,
+            pad_piece="[PAD]",
+            unk_piece="[UNK]",
+            bos_piece="[CLS]",
+            eos_piece="[SEP]",
+            user_defined_symbols=["[MASK]"] + special_tokens,
+            normalization_rule_name="nmt_nfkc",
+            max_sentencepiece_length=16,
+            byte_fallback=False,
+        )
+
+        os.unlink(temp_filename)
+
+        # Slow tokenizer: source of truth
+        print("Creating DebertaV2Tokenizer..")
+        slow_tokenizer = DebertaV2Tokenizer(
+            vocab_file=f"{spm_model_prefix}.model",
+            cls_token="[CLS]",
+            sep_token="[SEP]",
+            pad_token="[PAD]",
+            unk_token="[UNK]",
+            mask_token="[MASK]",
+            bos_token="[CLS]",
+            eos_token="[SEP]",
+            do_lower_case=False,  # set this explicitly and keep it consistent everywhere
+        )
+
+        # Add extra special tokens explicitly so HF metadata is correct
+        if special_tokens:
+            slow_tokenizer.add_special_tokens(
+                {"additional_special_tokens": special_tokens}
             )
 
-            # Now save the tokenizer properly for Hugging Face compatibility
-            print("Saving DeBertaV2tokenizer..")
-            tokenizer.save_pretrained(save_dir)
+        slow_tokenizer.save_pretrained(save_dir)
+
+        # Optional fast tokenizer
+        print("Creating DebertaV2TokenizerFast..")
+        fast_tokenizer = DebertaV2TokenizerFast.from_pretrained(
+            save_dir,
+            do_lower_case=False,
+            model_max_length=1024,
+        )
+        fast_tokenizer.save_pretrained(save_dir)
     elif args.tokenizer_type=='modernbert':
         # Initialize a DeBERTa V2 tokenizer
         tokenizer = BertWordPieceTokenizer(lowercase=False)
