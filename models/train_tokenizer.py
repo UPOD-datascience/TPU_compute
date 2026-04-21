@@ -48,22 +48,23 @@ if platform.system() == "Windows":
     except ImportError:
         pass
 
-def clean_text(text):
-    '''
-    - remove spurious repetitions of characters, punctuation whitespace and linebreaks
-    - remove spurious repetitions of words
-    '''
-    # TODO: Add more/improve cleaning steps as needed
-    re_spurious_chars = re.compile(r'([^\w])\1{3,}')
-    re_spurious_words = re.compile(r'(\b\w+\b)\1{4,}')
-    re_multispace = re.compile(r'\s{2,}')
+RE_SPURIOUS_CHARS = re.compile(r'([^\w])\1{3,}')
+RE_SPURIOUS_WORDS = re.compile(r'(\b[\w\-\s\;\:\,\.]+\b)\1{4,}')
+RE_MULTISPACE = re.compile(r'\s{2,}')
 
-    # replace spurious repetitions of characters, punctuation, whitespace and linebreaks with a single instance
-    text = re_spurious_chars.sub(r'\1', text)
-    text = re_spurious_words.sub(r'\1', text)
-    text = re_multispace.sub(' ', text)
+def apply_until_stable(pattern, repl, text, max_iter=20):
+    for _ in range(max_iter):
+        text, changed = pattern.subn(repl, text)
+        if changed == 0:
+            break
+    return text
+
+def clean_text(text, num_reps=20):
+    text = apply_until_stable(RE_SPURIOUS_WORDS, r'\1', text, num_reps)
+    text = RE_SPURIOUS_CHARS.sub(r'\1', text)
+    text = apply_until_stable(RE_SPURIOUS_WORDS, r'\1', text, num_reps)
+    text = RE_MULTISPACE.sub(' ', text)
     text = ftfy.fix_encoding(text)
-
     return text
 
 # Function to read JSONL file and extract text data
@@ -322,7 +323,7 @@ def main():
             "<s>", "</s>", "<pad>", "<unk>", "<mask>"]+[f"<|EX{str(l)}|>" for l in range(args.num_special_tokens)])
         print("Saving tokenizer..")
         tokenizer.save_model(os.path.join(save_dir))
-    elif args.tokenizer_type 'bertwordpiece':
+    elif args.tokenizer_type == 'bertwordpiece':
         # Initialize a DeBERTa V2 tokenizer
         tokenizer = BertWordPieceTokenizer(lowercase=False)
         # Train the tokenizer
@@ -365,7 +366,7 @@ def main():
             bos_piece="[CLS]",
             eos_piece="[SEP]",
             user_defined_symbols=["[MASK]"] + special_tokens,
-            normalization_rule_name="nmt_nfkc",
+            normalization_rule_name="identity",
             max_sentencepiece_length=16,
             byte_fallback=False,
         )

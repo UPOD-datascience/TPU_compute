@@ -32,6 +32,27 @@ import numpy as np
 from itertools import chain
 from functools import partial
 from pathlib import Path
+import re
+import ftfy
+
+RE_SPURIOUS_CHARS = re.compile(r'([^\w])\1{3,}')
+RE_SPURIOUS_WORDS = re.compile(r'(\b[\w\-\s\;\:\,\.]+\b)\1{4,}')
+RE_MULTISPACE = re.compile(r'\s{2,}')
+
+def apply_until_stable(pattern, repl, text, max_iter=20):
+    for _ in range(max_iter):
+        text, changed = pattern.subn(repl, text)
+        if changed == 0:
+            break
+    return text
+
+def clean_text(text, num_reps=20):
+    text = apply_until_stable(RE_SPURIOUS_WORDS, r'\1', text, num_reps)
+    text = RE_SPURIOUS_CHARS.sub(r'\1', text)
+    text = apply_until_stable(RE_SPURIOUS_WORDS, r'\1', text, num_reps)
+    text = RE_MULTISPACE.sub(' ', text)
+    text = ftfy.fix_encoding(text)
+    return text
 
 def prep_fn(args):
     def group_texts(examples, pad_token=0):
@@ -127,8 +148,9 @@ def prep_fn(args):
 
         def tokenize_function(examples):
             # here you can actually add a chunker to split the text into smaller parts, of max_len
+            cleaned_texts = [clean_text(t) for t in examples["text"]]
             return tokenizer(
-                examples["text"], truncation=False, max_length=args.max_seq_length
+                cleaned_texts, truncation=False, max_length=args.max_seq_length
             )
 
         opt_kwargs = (
@@ -165,25 +187,19 @@ def prep_fn(args):
 
 
 def get_optimizer(model, args):
-    """
-    Initializes AdamW optimizer with warm-up and linear decay.
-    Excludes weight decay for biases and LayerNorm weights.
-    """
-
     no_decay = ["bias", "LayerNorm.weight"]
+
     optimizer_grouped_parameters = [
         {
             "params": [
-                p
-                for n, p in model.named_parameters()
+                p for n, p in model.named_parameters()
                 if not any(nd in n for nd in no_decay)
             ],
             "weight_decay": args.weight_decay,
         },
         {
             "params": [
-                p
-                for n, p in model.named_parameters()
+                p for n, p in model.named_parameters()
                 if any(nd in n for nd in no_decay)
             ],
             "weight_decay": 0.0,
@@ -193,8 +209,9 @@ def get_optimizer(model, args):
     optimizer = torch.optim.AdamW(
         optimizer_grouped_parameters,
         lr=args.learning_rate,
-        weight_decay=args.weight_decay,
+        # removed global weight_decay
     )
+
     return optimizer
 
 
@@ -248,14 +265,19 @@ def train_fn(index, args):
     # Load pre-trained model
     if args.init_training:
         print(f"INITIAL TRAINING RUN FOR MedDeBERTa.nl!")
+        print(f"VOCAB SIZE: {args.tokenizer.vocab_size}")
         config = DebertaV2Config(
             vocab_size=args.tokenizer.vocab_size,
-            hidden_size=1024,
+            hidden_size=1152,
+            pooler_hidden_size=1152,
             num_hidden_layers=24,
-            num_attention_heads=32,
-            intermediate_size=4096,
+            num_attention_heads=24,
+            intermediate_size=4608,  #  4608
             max_position_embeddings=1024,
-
+            attention_head_size=48,
+            norm_rel_ebd="layer_norm", 
+            relative_attention=True,
+            pos_att_type=["c2p", "p2c"],
             # important: keep specials consistent with tokenizer
             pad_token_id=args.tokenizer.pad_token_id,
             bos_token_id=args.tokenizer.bos_token_id,
@@ -266,9 +288,20 @@ def train_fn(index, args):
         )
     
         model = AutoModelForMaskedLM.from_config(config)
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+
+        print("is_gradient_checkpointing:", getattr(model, "is_gradient_checkpointing", None))
+        if hasattr(model, "deberta") and hasattr(model.deberta, "encoder"):
+            print("encoder.gradient_checkpointing:", model.deberta.encoder.gradient_checkpointing)
+
+        model.config.use_cache = False
         model.to(device)
     else:
         model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
         model.to(device)
 
     if args.bf16:
@@ -344,7 +377,7 @@ def train_fn(index, args):
     )
 
     # Set up gradient scaler for mixed precision training
-    scaler = torch.cuda.amp.GradScaler(enabled=args.bf16)
+    scaler = torch.cuda.amp.GradScaler(enabled=False if args.bf16 else True)
 
     if index == 0:
         print("Starting training...", flush=True)
