@@ -300,7 +300,10 @@ def train_fn(index, args):
         model.to(device)
     else:
         model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+
         model.config.use_cache = False
         model.to(device)
 

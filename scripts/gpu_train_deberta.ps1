@@ -20,21 +20,21 @@ $cmd = 'cd /d ' + $env:FULL_SCRIPT_DIR + ' && poetry run python ../models/cpt_de
        '--output_dir=' + $env:OUTPUT_DIR + ' ' +
        '--model_name=' + $env:MODEL_NAME + ' ' +
        '--tokenizer_name_or_path=' + $env:TOKENIZER_PATH + ' ' +
-       '--per_device_train_batch_size=1 ' +
-       '--gradient_accumulation_steps=64 ' +
+       '--per_device_train_batch_size=2 ' +
+       '--gradient_accumulation_steps=512 ' +
        '--save_epoch_percentage=0.005 ' +
        '--logging_steps=500 ' +
-       '--num_warmup_steps=50000 ' +
+       '--num_warmup_steps=500000 ' +
        '--num_cores=1 ' +
        '--max_seq_length=' + $env:MAX_SEQ_LEN + ' ' +
-       '--learning_rate=2e-5 ' +
+       '--learning_rate=1e-3 ' +
 	   '--max_steps_per_epoch=' + $env:MAX_STEPS_PER_EPOCH  + ' ' + 
        '--streaming_data ' +
-       '--weight_decay=0. ' +
-	   '--mlm_proba=0.2 ' +
+       '--weight_decay=1e-5 ' +
+	   '--mlm_proba=0.25 ' +
        '--num_train_epochs=1 ' +
-	   '--bf16'
-	   #'--init_training'
+	   '--bf16 ' +
+	   '--init_training'
 	   
 
 Start-Process -NoNewWindow -FilePath "cmd.exe" -ArgumentList "/k", $cmd -Wait

@@ -335,13 +335,27 @@ def main():
         tokenizer.save_model(os.path.join(save_dir))
 
     elif args.tokenizer_type == 'debertav2':
+        newline_token = "[NL]"
+        
+        def normalize_text(text: str) -> str:
+            text = text.replace("\x00", "")
+            # Canonicalize Windows/Mac newlines to Unix newlines
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            # Collapse repeated newlines, including whitespace-only blank lines
+            text = re.sub(r"\n\s*\n+", "\n", text)
+            # Map remaining single newlines to explicit token
+            text = text.replace("\n", f" {newline_token} ")
+            # Optional: collapse excessive spaces introduced around [NL]
+            text = re.sub(r"[ \t]+", " ", text).strip()
+            return text
+            
         # Train a SentencePiece model, because DeBERTa-v2 expects SentencePiece-style tokenization
         print("Preparing data for SentencePiece training..")
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8') as temp_file:
             temp_filename = temp_file.name
             for text in all_texts:
                 if text:
-                    temp_file.write(text.replace('\x00', ' ') + '\n')
+                    temp_file.write(normalize_text(text) + '\n')
 
         spm_model_prefix = os.path.join(save_dir, "spm")
 
@@ -356,7 +370,7 @@ def main():
             character_coverage=1.0,
             input_sentence_size=1_000_000,
             shuffle_input_sentence=True,
-            num_threads=max(1, os.cpu_count() or 1),
+            num_threads=min(8, max(1, os.cpu_count() or 1)),
             pad_id=0,
             unk_id=1,
             bos_id=2,
@@ -365,10 +379,12 @@ def main():
             unk_piece="[UNK]",
             bos_piece="[CLS]",
             eos_piece="[SEP]",
-            user_defined_symbols=["[MASK]"] + special_tokens,
+            user_defined_symbols=["[MASK]"]+[newline_token] + special_tokens,
             normalization_rule_name="identity",
-            max_sentencepiece_length=16,
+            max_sentencepiece_length=24,
             byte_fallback=False,
+            train_extremely_large_corpus=False,
+            unk_surface="[UNK]"
         )
 
         os.unlink(temp_filename)
@@ -390,7 +406,7 @@ def main():
         # Add extra special tokens explicitly so HF metadata is correct
         if special_tokens:
             slow_tokenizer.add_special_tokens(
-                {"additional_special_tokens": special_tokens}
+                {"additional_special_tokens": special_tokens+[newline_token]}
             )
 
         slow_tokenizer.save_pretrained(save_dir)
