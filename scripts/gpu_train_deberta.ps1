@@ -14,7 +14,7 @@ if (-not (Test-Path $env:FULL_SCRIPT_DIR)) {
 
 Write-Output "Starting training..."
 
-$cmd = 'cd /d ' + $env:FULL_SCRIPT_DIR + ' && poetry run python ../models/cpt_deberta_gpu.py ' +
+$cmd = 'cd /d ' + $env:FULL_SCRIPT_DIR + ' && poetry run python ../models/cpt_deberta_gpu_stacked.py ' +
        '--dataset_dir=' + $env:DATASET_FOLDER + ' ' +
        '--tmp_dir=' + $env:TMP_DIR + ' ' +
        '--output_dir=' + $env:OUTPUT_DIR + ' ' +
@@ -24,17 +24,18 @@ $cmd = 'cd /d ' + $env:FULL_SCRIPT_DIR + ' && poetry run python ../models/cpt_de
        '--gradient_accumulation_steps=512 ' +
        '--save_epoch_percentage=0.005 ' +
        '--logging_steps=500 ' +
-       '--num_warmup_steps=500000 ' +
+       '--num_warmup_steps=10000 ' +
+       '--packing_batch_size=10000 ' +
        '--num_cores=1 ' +
        '--max_seq_length=' + $env:MAX_SEQ_LEN + ' ' +
-       '--learning_rate=1e-3 ' +
+       '--learning_rate=2e-5 ' +
 	   '--max_steps_per_epoch=' + $env:MAX_STEPS_PER_EPOCH  + ' ' + 
        '--streaming_data ' +
-       '--weight_decay=1e-5 ' +
-	   '--mlm_proba=0.25 ' +
+       '--weight_decay=1e-6 ' +
+	   '--mlm_proba=0.4 ' +
        '--num_train_epochs=1 ' +
-	   '--bf16 ' +
-	   '--init_training'
+	   '--bf16'# +
+	   #'--init_training'
 	   
 
 Start-Process -NoNewWindow -FilePath "cmd.exe" -ArgumentList "/k", $cmd -Wait

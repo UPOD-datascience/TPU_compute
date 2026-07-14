@@ -149,6 +149,7 @@ def prep_fn(args):
         def tokenize_function(examples):
             # here you can actually add a chunker to split the text into smaller parts, of max_len
             cleaned_texts = [clean_text(t) for t in examples["text"]]
+            
             return tokenizer(
                 cleaned_texts, truncation=False, max_length=args.max_seq_length
             )
