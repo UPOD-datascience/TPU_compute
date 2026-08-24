@@ -1,7 +1,3 @@
-"""
-This is the main script to continue pre-training a Roberta model on GPU.
-"""
-
 import argparse
 import torch
 
@@ -279,6 +275,7 @@ def train_fn(index, args):
             norm_rel_ebd="layer_norm", 
             relative_attention=True,
             pos_att_type=["c2p", "p2c"],
+            legacy=True,
             # important: keep specials consistent with tokenizer
             pad_token_id=args.tokenizer.pad_token_id,
             bos_token_id=args.tokenizer.bos_token_id,
@@ -300,10 +297,16 @@ def train_fn(index, args):
         model.config.use_cache = False
         model.to(device)
     else:
-        model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
+        config = DebertaV2Config.from_pretrained(args.model_name)
+        config.legacy = True
+
+        model = DebertaV2ForMaskedLM.from_pretrained(
+            args.model_name,
+            config=config,
+        )
         model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
 
         model.config.use_cache = False
         model.to(device)
@@ -550,7 +553,17 @@ def main():
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--pre_tokenized", action="store_true", default=False)
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
-    parser.add_argument("--max_seq_length", type=int, default=512)
+    parser.add_argument(
+        "--max_seq_length",
+        type=int,
+        default=512,
+        help=(
+            "Sequence length used to chunk/pad training examples. "
+            "Must be <= the model's max_position_embeddings (1024). "
+            "Use 512 for the main pretraining stage and 1024 for "
+            "long-context continuation."
+        ),
+    )
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--num_warmup_steps", type=int, default=1000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -576,6 +589,23 @@ def main():
     )
     # parser.add_argument("--wandb_key", type=str, required=True, help="Weights & Biases API key")
     args = parser.parse_args()
+
+    model_max_position_embeddings = 1024
+    if args.max_seq_length < 2:
+        raise ValueError(
+            f"--max_seq_length must be at least 2, got {args.max_seq_length}."
+        )
+    if args.max_seq_length > model_max_position_embeddings:
+        raise ValueError(
+            f"--max_seq_length={args.max_seq_length} exceeds the model's "
+            f"max_position_embeddings={model_max_position_embeddings}."
+        )
+
+    print(
+        f"Training sequence length: {args.max_seq_length} "
+        f"(architectural maximum: {model_max_position_embeddings})",
+        flush=True,
+    )
 
     # wandb.login(key=args.wandb_key)
 

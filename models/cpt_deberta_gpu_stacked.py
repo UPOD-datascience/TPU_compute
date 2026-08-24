@@ -64,6 +64,10 @@ RE_SPURIOUS_CHARS = re.compile(r"([^\w])\1{3,}")
 RE_SPURIOUS_WORDS = re.compile(r"(\b[\w\-\s\;\:\,\.]+\b)\1{4,}")
 RE_MULTISPACE = re.compile(r"\s{2,}")
 
+# Architectural context limit. --max_seq_length controls the shorter
+# training windows used during a particular pretraining stage.
+MODEL_MAX_POSITION_EMBEDDINGS = 1024
+
 
 def apply_until_stable(
     pattern: re.Pattern[str],
@@ -488,9 +492,10 @@ def build_model(
             num_hidden_layers=args.num_hidden_layers,
             num_attention_heads=args.num_attention_heads,
             intermediate_size=args.intermediate_size,
-            max_position_embeddings=args.max_seq_length,
+            max_position_embeddings=MODEL_MAX_POSITION_EMBEDDINGS,
             norm_rel_ebd="layer_norm",
             relative_attention=True,
+            legacy=False,
             pos_att_type=["c2p", "p2c"],
             pad_token_id=tokenizer.pad_token_id,
             bos_token_id=tokenizer.bos_token_id,
@@ -504,11 +509,17 @@ def build_model(
             f"Continuing MLM pretraining from {args.model_name}.",
             flush=True,
         )
-        model = DebertaV2ForMaskedLM.from_pretrained(args.model_name)
+        config = DebertaV2Config.from_pretrained(args.model_name)
+        config.legacy = False
+
+        model = DebertaV2ForMaskedLM.from_pretrained(
+            args.model_name,
+            config=config,
+        )
         model_max_positions = getattr(
             model.config,
             "max_position_embeddings",
-            args.max_seq_length,
+            MODEL_MAX_POSITION_EMBEDDINGS,
         )
         if model_max_positions < args.max_seq_length:
             raise ValueError(
@@ -1060,7 +1071,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    parser.add_argument("--max_seq_length", type=int, default=1024)
+    parser.add_argument(
+        "--max_seq_length",
+        type=int,
+        default=512,
+        help=(
+            "Packed sequence length used for this pretraining stage. "
+            "Must be <= 1024. Use 512 for the main pretraining stage and "
+            "1024 for long-context continuation."
+        ),
+    )
     parser.add_argument(
         "--packing_batch_size",
         type=int,
@@ -1142,8 +1162,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max_steps_per_epoch is required with --streaming_data.")
     if args.streaming_data and args.shuffle_buffer_size <= 0:
         parser.error("--shuffle_buffer_size must be positive.")
-    if args.max_seq_length <= 0:
-        parser.error("--max_seq_length must be positive.")
+    if args.max_seq_length < 2:
+        parser.error("--max_seq_length must be at least 2.")
+    if args.max_seq_length > MODEL_MAX_POSITION_EMBEDDINGS:
+        parser.error(
+            f"--max_seq_length={args.max_seq_length} exceeds the model's "
+            f"max_position_embeddings={MODEL_MAX_POSITION_EMBEDDINGS}."
+        )
     if args.packing_batch_size <= 0:
         parser.error("--packing_batch_size must be positive.")
     if args.per_device_train_batch_size <= 0:
@@ -1175,6 +1200,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     set_global_seed(args.seed)
+
+    print(
+        f"Training sequence length: {args.max_seq_length} "
+        f"(architectural maximum: {MODEL_MAX_POSITION_EMBEDDINGS})",
+        flush=True,
+    )
 
     if args.sharded_data:
         print(
