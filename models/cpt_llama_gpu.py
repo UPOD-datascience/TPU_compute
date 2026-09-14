@@ -619,8 +619,11 @@ def main():
         token=args.huggingface_token
     )
     args.tokenizer.model_max_length = args.max_seq_length
-    if args.tokenizer.pad_token is None:
-        args.tokenizer.pad_token = args.tokenizer.eos_token
+    tokenizer.pad_token = "<|finetune_right_pad_id|>"
+    
+    assert tokenizer.pad_token_id == 128004
+    assert tokenizer.eos_token_id == 128009
+    assert tokenizer.pad_token_id != tokenizer.eos_token_id
 
     # Ensure EOS token is properly set
     if args.tokenizer.eos_token is None:
