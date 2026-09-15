@@ -495,7 +495,7 @@ def train_fn(tokenized_dataset, device, args):
     for epoch in range(args.num_train_epochs):
         print(f"Starting epoch {epoch}")
         if args.streaming:
-            train_dataset = tokenized_dataset["train"]
+            train_dataset = train_dataloader.dataset
             if hasattr(train_dataset, "set_epoch"):
                 train_dataset.set_epoch(epoch)
 
