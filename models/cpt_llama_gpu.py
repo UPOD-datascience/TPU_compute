@@ -269,22 +269,49 @@ def group_texts(examples, max_seq_length, pad_token=0):
     return result
 
 def prep_fn(args):
-    """Prepare dataset for training"""
+    """Prepare dataset for training."""
     print("Starting dataset preparation")
 
-    # Load dataset
     dataset = load_dataset_from_args(args)
 
     print("Tokenizing dataset...")
-    tokenize_fn = partial(tokenize_function, tokenizer=args.tokenizer)
-    dataset = dataset.map(tokenize_fn, batched=True, 
-                          remove_columns=["text", "id", "source", 
-                                          "approx_token_counts_translated", 
-                                          "approx_token_counts_original"])
+    tokenize_fn = partial(
+        tokenize_function,
+        tokenizer=args.tokenizer,
+    )
+
+    candidate_remove = [
+        "text",
+        "id",
+        "source",
+        "approx_token_counts_translated",
+        "approx_token_counts_original",
+    ]
+
+    colnames = dataset["train"].column_names or []
+    safe_remove = [
+        column
+        for column in candidate_remove
+        if column in colnames
+    ]
+
+    dataset = dataset.map(
+        tokenize_fn,
+        batched=True,
+        remove_columns=safe_remove,
+    )
 
     print("Grouping texts...")
-    group_fn = partial(group_texts, max_seq_length=args.max_seq_length, pad_token=args.tokenizer.pad_token_id)
-    dataset = dataset.map(group_fn, batched=True)
+    group_fn = partial(
+        group_texts,
+        max_seq_length=args.max_seq_length,
+        pad_token=args.tokenizer.pad_token_id,
+    )
+
+    dataset = dataset.map(
+        group_fn,
+        batched=True,
+    )
 
     print("Dataset preparation complete")
     return dataset
@@ -395,7 +422,7 @@ def train_fn(tokenized_dataset, device, args):
         num_workers=2,
         pin_memory=True,
         drop_last=True,
-        shuffle=True
+        shuffle=not args.streaming,
     )
     # Validation dataloader
     validation_dataloader = torch.utils.data.DataLoader(
@@ -418,7 +445,16 @@ def train_fn(tokenized_dataset, device, args):
         weight_decay=args.weight_decay
     )
 
-    steps_per_epoch = len(train_dataloader)
+    if args.streaming:
+        steps_per_epoch = args.max_steps_per_epoch
+    
+        if steps_per_epoch is None or steps_per_epoch <= 0:
+            raise ValueError(
+                "--max_steps_per_epoch must be > 0 when --streaming is used"
+            )
+    else:
+        steps_per_epoch = len(train_dataloader)
+    
     total_steps = steps_per_epoch * args.num_train_epochs
     save_steps = int(steps_per_epoch * args.save_epoch_percentage)
 
@@ -458,12 +494,18 @@ def train_fn(tokenized_dataset, device, args):
 
     for epoch in range(args.num_train_epochs):
         print(f"Starting epoch {epoch}")
+        if args.streaming:
+            train_dataset = tokenized_dataset["train"]
+            if hasattr(train_dataset, "set_epoch"):
+                train_dataset.set_epoch(epoch)
 
         model.train()
         epoch_loss = 0.0
         num_batches = 0
 
         for step, batch in enumerate(safe_iter(train_dataloader)):
+            if args.streaming and step >= steps_per_epoch:
+                break
             # Move batch to device
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
@@ -656,7 +698,7 @@ def main():
 
     # Data processing arguments
     parser.add_argument("--keep_in_memory", action='store_true')
-    parser.add_argument("--max_steps_per_epoch", type=int, default=50_000_000)
+    parser.add_argument("--max_steps_per_epoch", type=int, default=1_000_000, help="Required with --streaming; optimizer steps per epoch.",)
 
     # System arguments
     parser.add_argument("--seed", type=int, default=42)
@@ -669,7 +711,22 @@ def main():
     parser.add_argument("--debug", action='store_true')
     parser.add_argument("--bf16", action='store_true', help="Use bfloat16 precision for training")
 
-    args = parser.parse_args()
+    parser.add_argument(
+    "--streaming",
+    action="store_true",
+    help=(
+        "Stream parquet files instead of materializing the complete dataset. "
+        "Training parquet files are randomized and examples are shuffled "
+        "using a bounded shuffle buffer."
+        ),
+    )
+
+    parser.add_argument(
+        "--shuffle_buffer_size",
+        type=int,
+        default=10_000,
+        help="Number of examples held in the streaming shuffle buffer.",
+        args = parser.parse_args()
 
 
     # Set seed
