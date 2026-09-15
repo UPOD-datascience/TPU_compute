@@ -15,6 +15,7 @@ import copy
 from time import sleep
 from functools import partial
 from itertools import chain
+import glob
 
 from transformers import (
     LlamaTokenizerFast,
@@ -107,15 +108,80 @@ def load_from_gcs(bucket_name, blob_name, local_path, device):
 
     return checkpoint
 
+def _parquet_files(path: str, seed: int) -> list[str]:
+    files = glob.glob(os.path.join(path, "*.parquet"))
 
+    if not files:
+        raise FileNotFoundError(f"No parquet files found in {path}")
+
+    files = sorted(files)
+
+    rng = random.Random(seed)
+    rng.shuffle(files)
+
+    return files
+    
 def load_dataset_from_args(args):
-    """Load dataset based on arguments"""
+    """Load either regular or streaming train/validation datasets."""
+
     print(f"Loading dataset from {args.dataset_dir}")
 
-    dataset = load_dataset(args.dataset_format, data_files={
-        "train": args.dataset_dir + f"/train/*.{args.dataset_format}",
-        "validation": args.dataset_dir + f"/validation/*.{args.dataset_format}"
-    }, streaming=False)
+    if not args.streaming:
+        return load_dataset(
+            args.dataset_format,
+            data_files={
+                "train": os.path.join(
+                    args.dataset_dir,
+                    "train",
+                    f"*.{args.dataset_format}",
+                ),
+                "validation": os.path.join(
+                    args.dataset_dir,
+                    "validation",
+                    f"*.{args.dataset_format}",
+                ),
+            },
+            streaming=False,
+        )
+
+    if args.dataset_format != "parquet":
+        raise ValueError(
+            "--streaming currently expects --dataset_format parquet"
+        )
+
+    train_files = _parquet_files(
+        os.path.join(args.dataset_dir, "train"),
+        seed=args.seed,
+    )
+
+    validation_files = _parquet_files(
+        os.path.join(args.dataset_dir, "validation"),
+        seed=args.seed + 1,
+    )
+
+    print(
+        f"Streaming {len(train_files)} train parquet files and "
+        f"{len(validation_files)} validation parquet files"
+    )
+
+    print("First train files:")
+    for filename in train_files[:5]:
+        print(f"  {filename}")
+
+    dataset = load_dataset(
+        "parquet",
+        data_files={
+            "train": train_files,
+            "validation": validation_files,
+        },
+        streaming=True,
+    )
+
+    # Buffered approximate shuffle of examples.
+    dataset["train"] = dataset["train"].shuffle(
+        seed=args.seed,
+        buffer_size=args.shuffle_buffer_size,
+    )
 
     return dataset
 
