@@ -726,7 +726,9 @@ def main():
         type=int,
         default=10_000,
         help="Number of examples held in the streaming shuffle buffer.",
-        args = parser.parse_args()
+    )
+        
+    args = parser.parse_args()
 
 
     # Set seed
