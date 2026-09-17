@@ -1,6 +1,6 @@
 # Base requirements for LoRA fine-tuning with TPUs
 torch>=2.0.0
-torch-xla>=2.0.0
+#torch-xla>=2.0.0
 transformers>=4.35.0
 datasets>=2.14.0
 tokenizers>=0.14.0
