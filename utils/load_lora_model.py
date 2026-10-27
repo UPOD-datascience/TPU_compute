@@ -15,6 +15,38 @@ import os
 from typing import Optional
 
 
+def _normalize_token_ids(token_ids):
+    if token_ids is None:
+        return []
+    if isinstance(token_ids, (list, tuple, set)):
+        return [int(t) for t in token_ids if t is not None]
+    return [int(token_ids)]
+
+
+def _resolve_eos_token_ids(tokenizer, model=None):
+    eos_ids = []
+    eos_ids.extend(_normalize_token_ids(getattr(tokenizer, "eos_token_id", None)))
+
+    vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
+    for token_name in ("<|eot_id|>", "<|end_of_text|>"):
+        token_id = vocab.get(token_name)
+        if token_id is not None:
+            eos_ids.append(int(token_id))
+
+    if model is not None:
+        eos_ids.extend(_normalize_token_ids(getattr(model.config, "eos_token_id", None)))
+        if getattr(model, "generation_config", None) is not None:
+            eos_ids.extend(
+                _normalize_token_ids(getattr(model.generation_config, "eos_token_id", None))
+            )
+
+    unique_eos_ids = []
+    for token_id in eos_ids:
+        if token_id not in unique_eos_ids:
+            unique_eos_ids.append(token_id)
+    return unique_eos_ids
+
+
 def load_lora_model(
     base_model_name: str,
     lora_adapter_path: str,
@@ -53,6 +85,14 @@ def load_lora_model(
         load_in_4bit=load_in_4bit,
         trust_remote_code=True
     )
+
+    eos_token_ids = _resolve_eos_token_ids(tokenizer, model=base_model)
+    if eos_token_ids:
+        eos_for_config = eos_token_ids[0] if len(eos_token_ids) == 1 else eos_token_ids
+        base_model.config.eos_token_id = eos_for_config
+        if getattr(base_model, "generation_config", None) is not None:
+            base_model.generation_config.eos_token_id = eos_for_config
+        print(f"Resolved EOS token ids: {eos_token_ids}")
     
     print(f"Loading LoRA adapters from: {lora_adapter_path}")
     
@@ -96,6 +136,9 @@ def generate_text(
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     
+    eos_token_ids = _resolve_eos_token_ids(tokenizer, model=model)
+    eos_for_generation = eos_token_ids[0] if len(eos_token_ids) == 1 else eos_token_ids
+
     # Generate
     with torch.no_grad():
         outputs = model.generate(
@@ -106,7 +149,7 @@ def generate_text(
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            eos_token_id=eos_for_generation,
         )
     
     # Decode output

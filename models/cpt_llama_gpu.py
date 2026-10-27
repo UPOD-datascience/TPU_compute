@@ -16,6 +16,10 @@ from time import sleep
 from functools import partial
 from itertools import chain
 import glob
+import re
+from tqdm import tqdm
+
+import pysbd
 
 from transformers import (
     LlamaTokenizerFast,
@@ -58,7 +62,28 @@ def shuffle_and_save_dataset(dataset, save_path):
 # Global debug flag to limit debug output
 _debug_tokenization = True
 
-def tokenize_function(examples, tokenizer):
+def _sentence_token_boundaries(text, offsets, segmenter):
+    """Map sentence/paragraph endings onto token positions without retokenizing text."""
+    # pysbd already locates sentences in the original text. Searching for their
+    # strings again can fail for repeated sentences or unusual whitespace.
+    character_boundaries = {span.end for span in segmenter.segment(text)}
+
+    for match in re.finditer(r"\n[ \t]*\n+", text):
+        character_boundaries.add(match.end())
+
+    boundaries = []
+    positions = sorted(character_boundaries)
+    position_index = 0
+    for token_index, (_, end) in enumerate(offsets):
+        if end == 0:  # Special tokens do not correspond to text characters.
+            continue
+        while position_index < len(positions) and end >= positions[position_index]:
+            boundaries.append(token_index + 1)
+            position_index += 1
+    return sorted(set(boundaries))
+
+
+def tokenize_function(examples, tokenizer, sentence_aware=False):
     global _debug_tokenization
 
     # Debug the input (only first batch)
@@ -67,7 +92,16 @@ def tokenize_function(examples, tokenizer):
         print(f"DEBUG tokenize: number of texts: {len(examples['text'])}")
 
     # Tokenize the text
-    tokenized = tokenizer(examples["text"], padding=False, truncation=False)
+    tokenized = tokenizer(
+        examples["text"], padding=False, truncation=False,
+        return_offsets_mapping=sentence_aware,
+    )
+    if sentence_aware:
+        segmenter = pysbd.Segmenter(language="en", clean=False, char_span=True)
+        tokenized["sentence_boundaries"] = [
+            _sentence_token_boundaries(text, offsets, segmenter)
+            for text, offsets in zip(examples["text"], tokenized.pop("offset_mapping"))
+        ]
 
     # Debug the output (only first batch)
     if _debug_tokenization:
@@ -78,14 +112,21 @@ def tokenize_function(examples, tokenizer):
             print(f"DEBUG tokenize: first sequence type: {type(first_seq)}")
             print(f"DEBUG tokenize: first sequence length: {len(first_seq)}")
 
-    # Add EOS token to the end of each sequence
+    # Ensure each sample ends with EOS (append only if missing).
+    eos_added = 0
     for i in range(len(tokenized["input_ids"])):
-        tokenized["input_ids"][i].append(tokenizer.eos_token_id)
-        if "attention_mask" in tokenized:
-            tokenized["attention_mask"][i].append(1)
+        seq = tokenized["input_ids"][i]
+        if (len(seq) == 0) or (seq[-1] != tokenizer.eos_token_id):
+            tokenized["input_ids"][i].append(tokenizer.eos_token_id)
+            if "attention_mask" in tokenized:
+                tokenized["attention_mask"][i].append(1)
+            eos_added += 1
 
     if _debug_tokenization:
-        print(f"DEBUG tokenize: after EOS, first sequence length: {len(tokenized['input_ids'][0])}")
+        if len(tokenized["input_ids"]) > 0:
+            print(f"DEBUG tokenize: after EOS, first sequence last token: {tokenized['input_ids'][0][-1]}")
+            print(f"DEBUG tokenize: after EOS, first sequence length: {len(tokenized['input_ids'][0])}")
+        print(f"DEBUG tokenize: eos_token_id={tokenizer.eos_token_id}, eos_added_in_batch={eos_added}/{len(tokenized['input_ids'])}")
         _debug_tokenization = False  # Disable further debug output
 
     return tokenized
@@ -120,16 +161,116 @@ def _parquet_files(path: str, seed: int) -> list[str]:
     rng.shuffle(files)
 
     return files
-    
+
+
+def _normalize_token_ids(token_ids):
+    if token_ids is None:
+        return []
+    if isinstance(token_ids, (list, tuple, set)):
+        return [int(t) for t in token_ids if t is not None]
+    return [int(token_ids)]
+
+
+def _resolve_eos_token_ids(tokenizer, model=None):
+    """Collect a stable set of EOS ids (tokenizer + model config + known Llama EOT/EOS)."""
+    eos_ids = []
+
+    eos_ids.extend(_normalize_token_ids(getattr(tokenizer, "eos_token_id", None)))
+
+    vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
+    for token_name in ("<|eot_id|>", "<|end_of_text|>"):
+        token_id = vocab.get(token_name)
+        if token_id is not None:
+            eos_ids.append(int(token_id))
+
+    if model is not None:
+        eos_ids.extend(_normalize_token_ids(getattr(model.config, "eos_token_id", None)))
+        if getattr(model, "generation_config", None) is not None:
+            eos_ids.extend(
+                _normalize_token_ids(getattr(model.generation_config, "eos_token_id", None))
+            )
+
+    # Deduplicate while preserving order
+    unique_eos_ids = []
+    for token_id in eos_ids:
+        if token_id not in unique_eos_ids:
+            unique_eos_ids.append(token_id)
+
+    return unique_eos_ids
+
+
+def compute_causal_lm_loss(outputs, labels, eos_token_ids=None, eos_loss_weight=1.0):
+    """Compute causal LM loss with optional EOS upweighting."""
+    if eos_loss_weight == 1.0 or not eos_token_ids:
+        return outputs.loss
+
+    logits = outputs.logits
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    vocab_size = shift_logits.size(-1)
+    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+    token_losses = loss_fct(
+        shift_logits.view(-1, vocab_size),
+        shift_labels.view(-1),
+    ).view_as(shift_labels)
+
+    valid_mask = shift_labels.ne(-100)
+    weights = torch.ones_like(token_losses)
+
+    eos_mask = torch.zeros_like(valid_mask)
+    for eos_id in eos_token_ids:
+        eos_mask = eos_mask | shift_labels.eq(int(eos_id))
+
+    weights = torch.where(
+        eos_mask,
+        torch.full_like(weights, float(eos_loss_weight)),
+        weights,
+    )
+
+    valid_mask_f = valid_mask.to(token_losses.dtype)
+    weighted_loss_sum = (token_losses * weights * valid_mask_f).sum()
+    weighted_token_count = (weights * valid_mask_f).sum().clamp(min=1.0)
+
+    return weighted_loss_sum / weighted_token_count
+
+def _validate_text_column(dataset):
+    """Ensure the train split has the required `text` column."""
+    train_split = dataset["train"]
+    colnames = getattr(train_split, "column_names", None)
+
+    if colnames:
+        if "text" not in colnames:
+            raise ValueError(
+                "Dataset is missing required 'text' column in train split. "
+                f"Found columns: {colnames}"
+            )
+        return
+
+    # Fallback for iterable datasets where column_names may be unavailable.
+    sample = None
+    if hasattr(train_split, "take"):
+        sample = next(iter(train_split.take(1)), None)
+
+    if sample is None or "text" not in sample:
+        raise ValueError(
+            "Dataset is missing required 'text' column in train split "
+            "and it could not be inferred from a sample."
+        )
+
+
 def load_dataset_from_args(args):
     """Load either regular or streaming train/validation datasets."""
 
     print(f"Loading dataset from {args.dataset_dir}")
 
+    text_only_columns = ["text"] if args.dataset_format == "parquet" else None
+    if text_only_columns is not None:
+        print("Parquet mode: loading only the 'text' column")
+
     if not args.streaming:
-        return load_dataset(
-            args.dataset_format,
-            data_files={
+        load_kwargs = {
+            "data_files": {
                 "train": os.path.join(
                     args.dataset_dir,
                     "train",
@@ -141,8 +282,15 @@ def load_dataset_from_args(args):
                     f"*.{args.dataset_format}",
                 ),
             },
-            streaming=False,
-        )
+            "streaming": False,
+        }
+
+        if text_only_columns is not None:
+            load_kwargs["columns"] = text_only_columns
+
+        dataset = load_dataset(args.dataset_format, **load_kwargs)
+        _validate_text_column(dataset)
+        return dataset
 
     if args.dataset_format != "parquet":
         raise ValueError(
@@ -150,7 +298,7 @@ def load_dataset_from_args(args):
         )
 
     train_files = _parquet_files(
-        os.path.join(args.dataset_dir, "train"),
+        os.path.join(args.dataset_dir, "train", "partitions"),
         seed=args.seed,
     )
 
@@ -175,7 +323,10 @@ def load_dataset_from_args(args):
             "validation": validation_files,
         },
         streaming=True,
+        columns=["text"],
     )
+
+    _validate_text_column(dataset)
 
     # Buffered approximate shuffle of examples.
     dataset["train"] = dataset["train"].shuffle(
@@ -187,6 +338,13 @@ def load_dataset_from_args(args):
 
 # Global debug flag for group_texts
 _debug_group_texts = True
+def keep_min_tokens(example, min_tokens):
+    input_ids = example.get("input_ids")
+    if input_ids is None:
+        return False
+    return len(input_ids) >= min_tokens
+
+
 def group_texts(examples, max_seq_length, pad_token=0):
     """
     Group already tokenized texts into chunks of max_seq_length while respecting sample boundaries.
@@ -229,38 +387,31 @@ def group_texts(examples, max_seq_length, pad_token=0):
             elif not isinstance(current_example[k], list):
                 current_example[k] = list(current_example[k])
 
-        # Calculate how many chunks we need for this example
         example_length = len(current_example['input_ids'])
-        num_chunks = (example_length + max_seq_length - 1) // max_seq_length  # Ceiling division
+        boundaries = examples.get('sentence_boundaries', [])[i] if 'sentence_boundaries' in examples else []
+        start = 0
+        boundary_index = 0
+        while start < example_length:
+            limit = min(start + max_seq_length, example_length)
+            end = limit
+            if limit < example_length:
+                while boundary_index < len(boundaries) and boundaries[boundary_index] <= start:
+                    boundary_index += 1
+                next_index = boundary_index
+                while next_index < len(boundaries) and boundaries[next_index] <= limit:
+                    next_index += 1
+                if next_index > boundary_index:
+                    end = boundaries[next_index - 1]
+                # No complete sentence fits: split the oversized sentence at the limit.
+                boundary_index = next_index
 
-        # Split each feature into chunks
-        for k, tokens in current_example.items():
-            # Create chunks of max_seq_length
-            chunks = []
-            for j in range(0, example_length, max_seq_length):
-                chunk = tokens[j:min(j + max_seq_length, example_length)]
-
-                # Pad if necessary
+            for k, tokens in current_example.items():
+                chunk = tokens[start:end]
                 if len(chunk) < max_seq_length:
-                    if k == 'attention_mask':
-                        # Pad attention mask with 0s
-                        padding = [0] * (max_seq_length - len(chunk))
-                    else:
-                        # Pad input_ids with pad_token
-                        padding = [pad_token] * (max_seq_length - len(chunk))
+                    padding = [0 if k == 'attention_mask' else pad_token] * (max_seq_length - len(chunk))
                     chunk = chunk + padding
-
-                chunks.append(chunk)
-
-            # If we don't have enough chunks (unlikely but possible with different length features)
-            while len(chunks) < num_chunks:
-                if k == 'attention_mask':
-                    chunks.append([0] * max_seq_length)
-                else:
-                    chunks.append([pad_token] * max_seq_length)
-
-            # Add the chunks to the result
-            result[k].extend(chunks)
+                result[k].append(chunk)
+            start = end
 
     # Add labels for causal LM
     if "input_ids" in result:
@@ -278,6 +429,7 @@ def prep_fn(args):
     tokenize_fn = partial(
         tokenize_function,
         tokenizer=args.tokenizer,
+        sentence_aware=args.sentence_aware_chunking,
     )
 
     candidate_remove = [
@@ -301,6 +453,30 @@ def prep_fn(args):
         remove_columns=safe_remove,
     )
 
+    if args.min_tokens_per_sample > 1:
+        print(f"Filtering samples with fewer than {args.min_tokens_per_sample} tokens...")
+        filter_fn = partial(
+            keep_min_tokens,
+            min_tokens=args.min_tokens_per_sample,
+        )
+
+        if not args.streaming:
+            train_before = len(dataset["train"])
+            validation_before = len(dataset["validation"])
+
+        dataset = dataset.filter(filter_fn)
+
+        if not args.streaming:
+            train_after = len(dataset["train"])
+            validation_after = len(dataset["validation"])
+            print(
+                "Filtered dataset sizes -> "
+                f"train: {train_before} -> {train_after}, "
+                f"validation: {validation_before} -> {validation_after}"
+            )
+        else:
+            print("Streaming mode: min-token filtering will be applied lazily during iteration")
+
     print("Grouping texts...")
     group_fn = partial(
         group_texts,
@@ -311,6 +487,7 @@ def prep_fn(args):
     dataset = dataset.map(
         group_fn,
         batched=True,
+        remove_columns=["sentence_boundaries"] if args.sentence_aware_chunking else None,
     )
 
     print("Dataset preparation complete")
@@ -331,6 +508,9 @@ def safe_iter(dataloader):
 def train_fn(tokenized_dataset, device, args):
     """Main training function"""
     print("Starting train_fn...")
+
+    if args.eos_loss_weight <= 0:
+        raise ValueError("--eos_loss_weight must be > 0")
 
     # Initialize wandb
     # wandb.login(key=args.wandb_key)
@@ -397,6 +577,27 @@ def train_fn(tokenized_dataset, device, args):
             low_cpu_mem_usage=True
         )
     model.config.pad_token_id = args.tokenizer.pad_token_id
+    eos_token_ids = _resolve_eos_token_ids(args.tokenizer, model=model)
+    if not eos_token_ids:
+        eos_token_ids = [int(args.tokenizer.eos_token_id)]
+
+    eos_for_config = eos_token_ids[0] if len(eos_token_ids) == 1 else eos_token_ids
+    model.config.eos_token_id = eos_for_config
+
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.pad_token_id = args.tokenizer.pad_token_id
+        model.generation_config.eos_token_id = eos_for_config
+
+    print(
+        f"Model special token ids -> pad: {model.config.pad_token_id}, "
+        f"eos: {model.config.eos_token_id}"
+    )
+    print(
+        f"EOS loss weighting -> eos_ids: {eos_token_ids}, "
+        f"eos_loss_weight: {args.eos_loss_weight}"
+    )
+    if args.eos_loss_weight != 1.0:
+        print("Note: loss/perplexity logs are on weighted loss when EOS weighting is enabled")
     print(f"Moving model to device {device}")
     if args.bf16:
         model = model.to(device, dtype=torch.bfloat16)
@@ -447,14 +648,14 @@ def train_fn(tokenized_dataset, device, args):
 
     if args.streaming:
         steps_per_epoch = args.max_steps_per_epoch
-    
+
         if steps_per_epoch is None or steps_per_epoch <= 0:
             raise ValueError(
                 "--max_steps_per_epoch must be > 0 when --streaming is used"
             )
     else:
         steps_per_epoch = len(train_dataloader)
-    
+
     total_steps = steps_per_epoch * args.num_train_epochs
     save_steps = int(steps_per_epoch * args.save_epoch_percentage)
 
@@ -503,7 +704,7 @@ def train_fn(tokenized_dataset, device, args):
         epoch_loss = 0.0
         num_batches = 0
 
-        for step, batch in enumerate(safe_iter(train_dataloader)):
+        for step, batch in tqdm(enumerate(safe_iter(train_dataloader)), total=steps_per_epoch):
             if args.streaming and step >= steps_per_epoch:
                 break
             # Move batch to device
@@ -513,10 +714,20 @@ def train_fn(tokenized_dataset, device, args):
             if args.bf16:
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                     outputs = model(**batch)
-                    loss = outputs.loss
+                    loss = compute_causal_lm_loss(
+                        outputs,
+                        labels=batch["labels"],
+                        eos_token_ids=eos_token_ids,
+                        eos_loss_weight=args.eos_loss_weight,
+                    )
             else:
                 outputs = model(**batch)
-                loss = outputs.loss
+                loss = compute_causal_lm_loss(
+                    outputs,
+                    labels=batch["labels"],
+                    eos_token_ids=eos_token_ids,
+                    eos_loss_weight=args.eos_loss_weight,
+                )
 
             nan = torch.isnan(loss)
             if nan:
@@ -529,7 +740,7 @@ def train_fn(tokenized_dataset, device, args):
 
             # Gradient clipping
             if args.max_grad_norm > 0:
-                print(f"Clipping grad norm to {args.max_grad_norm}")
+                #print(f"Clipping grad norm to {args.max_grad_norm}")
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             # Update parameters
@@ -566,19 +777,19 @@ def train_fn(tokenized_dataset, device, args):
             # Debug mode - only run a few steps
             if args.debug and step >= 10:
                 break
-                
+
             if (step % save_steps == 0) and (step > 0):
                 print("Running validation...")
-                val_results = evaluate(model, validation_dataloader, device, args)
+                val_results = evaluate(model, validation_dataloader, device, args, eos_token_ids)
                 print(f"Validation Loss: {val_results['eval_loss']:.4f}, Perplexity: {val_results['perplexity']:.4f}")
-                
+
                 print("Saving model...")
                 model_cpu = copy.deepcopy(model).to("cpu")
                 model_cpu.save_pretrained(args.output_dir, save_serialization=True)
 
         # Evaluation at end of epoch
         print("Running validation...")
-        val_results = evaluate(model, validation_dataloader, device, args)
+        val_results = evaluate(model, validation_dataloader, device, args, eos_token_ids)
         print(f"Validation Loss: {val_results['eval_loss']:.4f}, Perplexity: {val_results['perplexity']:.4f}")
 
         # if wandb.run is not None:
@@ -618,7 +829,7 @@ def train_fn(tokenized_dataset, device, args):
     #wandb.finish()
 
 
-def evaluate(model, validation_dataloader, device, args):
+def evaluate(model, validation_dataloader, device, args, eos_token_ids):
     """Evaluate the model"""
     model.eval()
     total_loss = 0.0
@@ -631,10 +842,20 @@ def evaluate(model, validation_dataloader, device, args):
             if args.bf16:
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                     outputs = model(**batch)
-                    loss = outputs.loss
+                    loss = compute_causal_lm_loss(
+                        outputs,
+                        labels=batch["labels"],
+                        eos_token_ids=eos_token_ids,
+                        eos_loss_weight=args.eos_loss_weight,
+                    )
             else:
                 outputs = model(**batch)
-                loss = outputs.loss
+                loss = compute_causal_lm_loss(
+                    outputs,
+                    labels=batch["labels"],
+                    eos_token_ids=eos_token_ids,
+                    eos_loss_weight=args.eos_loss_weight,
+                )
 
             total_loss += loss.item() * batch['input_ids'].size(0)
             total_samples += batch['input_ids'].size(0)
@@ -679,6 +900,10 @@ def main():
     parser.add_argument("--tokenizer_name_or_path", type=str, required=True)
     parser.add_argument("--checkpoint_path", type=str, default="")
     parser.add_argument("--max_seq_length", type=int, required=True)
+    parser.add_argument(
+        "--sentence_aware_chunking", action="store_true",
+        help="End chunks at sentence/paragraph boundaries when possible; split oversized sentences.",
+    )
 
     # Training arguments
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
@@ -691,6 +916,12 @@ def main():
     parser.add_argument("--num_cycles", type=float, default=10)
     parser.add_argument("--eta_min", type=float, default=1e-6)
     parser.add_argument("--max_grad_norm", type=float, default=21.0)
+    parser.add_argument(
+        "--eos_loss_weight",
+        type=float,
+        default=1.0,
+        help="Optional loss weight applied to EOS-token targets (>1 upweights EOS).",
+    )
 
     # Logging and checkpointing
     parser.add_argument("--logging_steps", type=int, default=1000)
@@ -698,7 +929,13 @@ def main():
 
     # Data processing arguments
     parser.add_argument("--keep_in_memory", action='store_true')
-    parser.add_argument("--max_steps_per_epoch", type=int, default=1_000_000, help="Required with --streaming; optimizer steps per epoch.",)
+    parser.add_argument(
+        "--min_tokens_per_sample",
+        type=int,
+        default=16,
+        help="Minimum number of tokens per sample before chunking (after EOS append).",
+    )
+    parser.add_argument("--max_steps_per_epoch", type=int, default=250_000, help="Required with --streaming; optimizer steps per epoch.",)
 
     # System arguments
     parser.add_argument("--seed", type=int, default=42)
@@ -727,9 +964,13 @@ def main():
         default=10_000,
         help="Number of examples held in the streaming shuffle buffer.",
     )
-        
+
     args = parser.parse_args()
 
+    if args.max_seq_length < 1:
+        raise ValueError("--max_seq_length must be >= 1")
+    if args.min_tokens_per_sample < 1:
+        raise ValueError("--min_tokens_per_sample must be >= 1")
 
     # Set seed
     torch.manual_seed(args.seed)
@@ -745,7 +986,7 @@ def main():
     )
     args.tokenizer.model_max_length = args.max_seq_length
     args.tokenizer.pad_token = "<|finetune_right_pad_id|>"
-    
+
     assert args.tokenizer.pad_token_id == 128004
     assert args.tokenizer.eos_token_id == 128009
     assert args.tokenizer.pad_token_id != args.tokenizer.eos_token_id
