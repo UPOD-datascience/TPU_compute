@@ -218,7 +218,7 @@ class _CombinedOptimizer(torch.optim.Optimizer):
 
 
 def get_optimizer(model, args):
-    if args.optimizer == "adamw":
+    if args.optimizer in ["adamw", "adam"]:
         no_decay = ["bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
             {
