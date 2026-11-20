@@ -199,6 +199,99 @@ def _resolve_eos_token_ids(tokenizer, model=None):
     return unique_eos_ids
 
 
+class _CombinedOptimizer(torch.optim.Optimizer):
+    """Expose multiple optimizers as one scheduler-compatible optimizer."""
+
+    def __init__(self, optimizers):
+        self.optimizers = optimizers
+        parameter_groups = [
+            group for optimizer in optimizers for group in optimizer.param_groups
+        ]
+        super().__init__(parameter_groups, defaults={})
+        self.param_groups = parameter_groups
+
+    def step(self, closure=None):
+        loss = None
+        for index, optimizer in enumerate(self.optimizers):
+            loss = optimizer.step(closure if index == 0 else None)
+        return loss
+
+    def zero_grad(self, set_to_none=True):
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        return {"optimizers": [optimizer.state_dict() for optimizer in self.optimizers]}
+
+    def load_state_dict(self, state_dict):
+        optimizer_states = state_dict["optimizers"]
+        if len(optimizer_states) != len(self.optimizers):
+            raise ValueError("Optimizer state does not match the configured optimizers.")
+        for optimizer, optimizer_state in zip(self.optimizers, optimizer_states):
+            optimizer.load_state_dict(optimizer_state)
+
+
+def get_optimizer(model, args):
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+
+    muon_class = getattr(torch.optim, "Muon", None)
+    if muon_class is None:
+        raise RuntimeError(
+            "Muon requires a PyTorch version that provides torch.optim.Muon "
+            "(PyTorch 2.9 or newer). Upgrade PyTorch or use --optimizer adamw."
+        )
+
+    no_decay_terms = ("bias", "norm.weight")
+    adamw_only_terms = ("embed_tokens", "embedding", "lm_head")
+    adamw_groups = {True: [], False: []}
+    muon_groups = {True: [], False: []}
+
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        name_lower = name.lower()
+        decay = not any(term in name_lower for term in no_decay_terms)
+        use_muon = parameter.ndim == 2 and not any(
+            term in name_lower for term in adamw_only_terms
+        )
+        (muon_groups if use_muon else adamw_groups)[decay].append(parameter)
+
+    def make_parameter_groups(groups):
+        return [
+            {"params": groups[decay], "weight_decay": args.weight_decay if decay else 0.0}
+            for decay in (True, False)
+            if groups[decay]
+        ]
+
+    optimizers = []
+    adamw_parameters = make_parameter_groups(adamw_groups)
+    if adamw_parameters:
+        optimizers.append(
+            torch.optim.AdamW(adamw_parameters, lr=args.learning_rate)
+        )
+
+    muon_parameters = make_parameter_groups(muon_groups)
+    if muon_parameters:
+        optimizers.append(
+            muon_class(
+                muon_parameters,
+                lr=args.learning_rate,
+                momentum=args.muon_momentum,
+            )
+        )
+
+    if len(optimizers) == 1:
+        return optimizers[0]
+    if not optimizers:
+        raise ValueError("The model has no trainable parameters to optimize.")
+    return _CombinedOptimizer(optimizers)
+
+
 def compute_causal_lm_loss(outputs, labels, eos_token_ids=None, eos_loss_weight=1.0):
     """Compute causal LM loss with optional EOS upweighting."""
     if eos_loss_weight == 1.0 or not eos_token_ids:
@@ -640,11 +733,7 @@ def train_fn(tokenized_dataset, device, args):
     print("DataLoader created")
 
     # Set up optimizer and scheduler
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay
-    )
+    optimizer = get_optimizer(model, args)
 
     if args.streaming:
         steps_per_epoch = args.max_steps_per_epoch
@@ -912,6 +1001,13 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0001)
+    parser.add_argument(
+        "--optimizer",
+        choices=("adamw", "muon"),
+        default="adamw",
+        help="Optimizer to use; Muon uses AdamW for embeddings and non-matrix parameters.",
+    )
+    parser.add_argument("--muon_momentum", type=float, default=0.95)
     parser.add_argument("--lr_schedule", type=str, choices=["linear", "cosine"], default="cosine")
     parser.add_argument("--num_cycles", type=float, default=10)
     parser.add_argument("--eta_min", type=float, default=1e-6)

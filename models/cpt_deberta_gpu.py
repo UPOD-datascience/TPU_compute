@@ -1,5 +1,7 @@
 import argparse
 import torch
+from torch.utils.data import IterableDataset
+
 
 from transformers import (
     AutoModel,
@@ -8,6 +10,7 @@ from transformers import (
     DebertaV2Config,
     DebertaV2ForMaskedLM,
     DataCollatorForLanguageModeling,
+    DataCollatorForTokenClassification
 )
 from transformers import Trainer, TrainingArguments
 from transformers import get_linear_schedule_with_warmup
@@ -49,6 +52,23 @@ def clean_text(text, num_reps=20):
     text = RE_MULTISPACE.sub(' ', text)
     text = ftfy.fix_encoding(text)
     return text
+
+
+def limit_validation_documents(dataset, args):
+    """Choose a reproducible validation subset before tokenization or packing."""
+    limit = args.max_validation_documents
+    if limit == 0:
+        return dataset
+
+    if args.streaming_data:
+        return dataset.shuffle(
+            seed=args.seed,
+            buffer_size=max(args.shuffle_buffer_size, limit),
+        ).take(limit)
+
+    count = min(len(dataset), limit)
+    return dataset.shuffle(seed=args.seed).select(range(count))
+
 
 def prep_fn(args):
     def group_texts(examples, pad_token=0):
@@ -118,14 +138,17 @@ def prep_fn(args):
             streaming=args.streaming_data,
             keep_in_memory=args.keep_in_memory,
         )
-        
+        tokenized_dataset["validation"] = limit_validation_documents(
+            tokenized_dataset["validation"], args
+        )
+
     else:
         print(
             f"Tokenizing dataset... with streaming: {args.streaming_data} and keep_in_memory: {args.keep_in_memory}",
             flush=True,
         )
         base = Path(args.dataset_dir)
-        
+
         parquet_path = base / "train" / "partitions"
         train_parquets = os.listdir(parquet_path)
         random.shuffle(train_parquets)
@@ -140,12 +163,15 @@ def prep_fn(args):
             data_files=data_files,
             streaming=args.streaming_data,
             keep_in_memory=args.keep_in_memory,
-)
+        )
+        dataset["validation"] = limit_validation_documents(
+            dataset["validation"], args
+        )
 
         def tokenize_function(examples):
             # here you can actually add a chunker to split the text into smaller parts, of max_len
             cleaned_texts = [clean_text(t) for t in examples["text"]]
-            
+
             return tokenizer(
                 cleaned_texts, truncation=False, max_length=args.max_seq_length
             )
@@ -215,6 +241,38 @@ class _CombinedOptimizer(torch.optim.Optimizer):
             raise ValueError("Optimizer state does not match the configured optimizers.")
         for optimizer, optimizer_state in zip(self.optimizers, optimizer_states):
             optimizer.load_state_dict(optimizer_state)
+
+class FractionalPPPLDataset(IterableDataset):
+    def __init__(self, dataset, tokenizer, fraction=0.05, seed=42):
+        assert 0 < fraction <= 1
+        self.dataset = dataset
+        self.mask_token_id = tokenizer.mask_token_id
+        self.special_ids = set(tokenizer.all_special_ids)
+        self.fraction = fraction
+        self.seed = seed
+
+    def __iter__(self):
+        for i, example in enumerate(self.dataset):
+            ids = example["input_ids"]
+            attention = example.get("attention_mask", [1] * len(ids))
+            eligible = [
+                p for p, (token, attn) in enumerate(zip(ids, attention))
+                if attn and token not in self.special_ids
+            ]
+            if not eligible:
+                continue
+
+            n = min(len(eligible), max(1, round(len(eligible) * self.fraction)))
+            for pos in random.Random(self.seed + i).sample(eligible, n):
+                masked_ids = list(ids)
+                labels = [-100] * len(ids)
+                labels[pos] = ids[pos]
+                masked_ids[pos] = self.mask_token_id
+                yield {
+                    "input_ids": masked_ids,
+                    "attention_mask": list(attention),
+                    "labels": labels,
+                }
 
 
 def get_optimizer(model, args):
@@ -296,7 +354,7 @@ def get_optimizer(model, args):
 def evaluate(model, dataloader, device, bf16=False):
     model.eval()
     total_loss = 0.0
-    total_steps = 0
+    total_targets = 0
 
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
@@ -310,11 +368,13 @@ def evaluate(model, dataloader, device, bf16=False):
                 outputs = model(
                     input_ids=input_ids, attention_mask=attention_mask, labels=labels
                 )
-        loss = outputs.loss
-        total_loss += loss.item()
-        total_steps += 1
+        targets = (labels != -100).sum().item()
+        total_loss += outputs.loss.item() * targets
+        total_targets += targets
 
-    global_avg_loss = total_loss / total_steps
+    if total_targets == 0:
+        raise ValueError("Validation contains no eligible tokens for PPPL scoring.")
+    global_avg_loss = total_loss / total_targets
     ppl = math.exp(global_avg_loss)
     model.train()  # Switch back to train mode
     return ppl, global_avg_loss
@@ -353,7 +413,7 @@ def train_fn(index, args):
             intermediate_size=4608,  #  4608
             max_position_embeddings=1024,
             attention_head_size=48,
-            norm_rel_ebd="layer_norm", 
+            norm_rel_ebd="layer_norm",
             relative_attention=True,
             pos_att_type=["c2p", "p2c"],
             legacy=True,
@@ -365,7 +425,7 @@ def train_fn(index, args):
             sep_token_id=args.tokenizer.sep_token_id,
 
         )
-    
+
         model = AutoModelForMaskedLM.from_config(config)
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -406,6 +466,12 @@ def train_fn(index, args):
         tokenizer=args.tokenizer, mlm=True, mlm_probability=args.mlm_proba
     )
 
+    eval_collator = DataCollatorForTokenClassification(
+        tokenizer=args.tokenizer,
+        padding=True,
+        label_pad_token_id=-100,
+    )
+
     # For GPU training, assume a single process (non-distributed)
     sampler_rank = 0
     sampler_replicas = 1
@@ -438,10 +504,17 @@ def train_fn(index, args):
             shuffle=True,
         )
 
+    pppl_dataset = FractionalPPPLDataset(
+                args.tokenized_datasets["validation"],
+                args.tokenizer,
+                fraction=0.05,
+                seed=42,
+                )
     validation_dataloader = torch.utils.data.DataLoader(
-        args.tokenized_datasets["validation"],
+        #args.tokenized_datasets["validation"],
+        pppl_dataset,
         batch_size=args.per_device_train_batch_size,
-        collate_fn=data_collator,
+        collate_fn=eval_collator,
     )
 
     del args.tokenized_datasets
@@ -475,6 +548,15 @@ def train_fn(index, args):
         print(f"Saving model every: {save_steps}", flush=True)
         print(f"Mixed precision (BF16): {args.bf16}", flush=True)
 
+    baseline_ppl, baseline_loss = evaluate(
+        model, validation_loader, device, args.bf16
+    )
+    print(
+        f"Baseline Validation Perplexity: {baseline_ppl:.3f}, "
+        f"loss: {baseline_loss:.6f}",
+        flush=True,
+    )
+
     # Training loop
     total_step = 0
     for epoch in range(args.num_train_epochs):
@@ -484,6 +566,10 @@ def train_fn(index, args):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(train_loader):
+            # if streaming and step > max_steps_per_epochs then break
+            if args.streaming_data and step > args.max_steps_per_epoch:
+                break
+
             # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
 
@@ -670,6 +756,12 @@ def main():
     parser.add_argument("--sharded_data", action="store_true")
     parser.add_argument("--max_steps_per_epoch", type=int, default=None)
     parser.add_argument("--shuffle_buffer_size", type=int, default=25_000)
+    parser.add_argument(
+        "--max_validation_documents",
+        type=int,
+        default=1000,
+        help="Maximum source documents used for validation; set to 0 for no cap.",
+    )
     parser.add_argument("--init_training", action="store_true", default=False)
     parser.add_argument("--model_name", type=str, default="UMCU/CardioDeberta.nl")
     parser.add_argument(
@@ -706,6 +798,8 @@ def main():
         raise ValueError(
             "shuffle_buffer_size is required when streaming_data is set to True."
         )
+    if args.max_validation_documents < 0:
+        raise ValueError("--max_validation_documents must be non-negative.")
 
     # Set the same seed for reproducibility
     torch.manual_seed(args.seed)

@@ -291,6 +291,22 @@ def make_pretokenized_repack_function(
     return repack
 
 
+def limit_validation_documents(dataset: Any, args: argparse.Namespace) -> Any:
+    """Choose a reproducible validation subset before tokenization or packing."""
+    limit = args.max_validation_documents
+    if limit == 0:
+        return dataset
+
+    if args.streaming_data:
+        return dataset.shuffle(
+            seed=args.validation_mask_seed,
+            buffer_size=max(args.shuffle_buffer_size, limit),
+        ).take(limit)
+
+    count = min(len(dataset), limit)
+    return dataset.shuffle(seed=args.validation_mask_seed).select(range(count))
+
+
 def process_split(
     split_dataset: Any,
     transform: Any,
@@ -391,6 +407,10 @@ def prepare_datasets(
             tokenizer=tokenizer,
             max_seq_length=args.max_seq_length,
         )
+
+    raw_datasets["validation"] = limit_validation_documents(
+        raw_datasets["validation"], args
+    )
 
     packed_datasets = {
         split_name: process_split(
@@ -1133,6 +1153,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--validation_mask_seed", type=int, default=1042)
+    parser.add_argument(
+        "--max_validation_documents",
+        type=int,
+        default=1000,
+        help="Maximum source documents used for validation; set to 0 for no cap.",
+    )
     parser.add_argument("--num_cores", type=int, default=1)
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument("--shuffle_buffer_size", type=int, default=25_000)
@@ -1162,6 +1188,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max_steps_per_epoch is required with --streaming_data.")
     if args.streaming_data and args.shuffle_buffer_size <= 0:
         parser.error("--shuffle_buffer_size must be positive.")
+    if args.max_validation_documents < 0:
+        parser.error("--max_validation_documents must be non-negative.")
     if args.max_seq_length < 2:
         parser.error("--max_seq_length must be at least 2.")
     if args.max_seq_length > MODEL_MAX_POSITION_EMBEDDINGS:

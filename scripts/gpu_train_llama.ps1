@@ -36,7 +36,7 @@ $cmd = 'cd /d ' + $env:FULL_SCRIPT_DIR + ' && poetry run python ../models/cpt_ll
 	   '--max_grad_norm=25.0 ' +
 	   '--max_steps_per_epoch=250_000 ' +
 	   '--sentence_aware_chunking ' +
-	   '--eos_loss_weight=2 ' +
+	   '--eos_loss_weight=10 ' +
 	   '--bf16 '
 
 Start-Process -NoNewWindow -FilePath "cmd.exe" -ArgumentList "/k", $cmd -Wait

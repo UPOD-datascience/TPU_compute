@@ -14,6 +14,11 @@ if (-not (Test-Path $env:FULL_SCRIPT_DIR)) {
 
 Write-Output "Starting training..."
 
+$maxValidationDocuments = $env:MAX_VALIDATION_DOCUMENTS
+if ([string]::IsNullOrWhiteSpace($maxValidationDocuments)) {
+    $maxValidationDocuments = "1000"
+}
+
 $cmd = 'cd /d ' + $env:FULL_SCRIPT_DIR + ' && poetry run python ../models/cpt_deberta_gpu.py ' +
        '--dataset_dir=' + $env:DATASET_FOLDER + ' ' +
        '--tmp_dir=' + $env:TMP_DIR + ' ' +
@@ -21,20 +26,21 @@ $cmd = 'cd /d ' + $env:FULL_SCRIPT_DIR + ' && poetry run python ../models/cpt_de
        '--model_name=' + $env:MODEL_NAME + ' ' +
        '--tokenizer_name_or_path=' + $env:TOKENIZER_PATH + ' ' +
        '--per_device_train_batch_size=4 ' +
+       '--max_validation_documents=' + $maxValidationDocuments + ' ' +
        '--gradient_accumulation_steps=256 ' +
-       '--save_epoch_percentage=0.005 ' +
+       '--save_epoch_percentage=0.50 ' +
        '--logging_steps=500 ' +
-       '--num_warmup_steps=50000 ' +
+       '--num_warmup_steps=10000 ' +
        #'--packing_batch_size=1000 ' +
        '--num_cores=1 ' +
-       '--learning_rate=5e-4 ' +
+       '--learning_rate=2e-5 ' +
 	   '--max_steps_per_epoch=' + $env:MAX_STEPS_PER_EPOCH  + ' ' + 
        '--streaming_data ' +
        '--weight_decay=1e-4 ' +
-	   '--mlm_proba=0.15 ' +
+	   '--mlm_proba=0.2 ' +
        '--optimizer=muon ' +
        '--num_train_epochs=1 ' +
-       '--max_seq_length=256 ' +
+       '--max_seq_length=1024 ' +
 	   '--bf16'# +
 	   #'--init_training'
 	   
